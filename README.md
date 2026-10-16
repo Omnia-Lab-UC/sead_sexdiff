@@ -157,12 +157,16 @@ The raw donor objects live once on the cluster; workstations only pull the deriv
 git clone -b mtg-astrocyte-pseudobulks https://github.com/Omnia-Lab-UC/sead_sexdiff.git /home1/tgonza/sead_sexdiff  # the cluster has no GitHub SSH key
 cd /home1/tgonza/sead_sexdiff && ~/.local/bin/uv sync --locked
 
-# submit (download --omic both, then pseudobulk --omic both)
+# download on the login node (compute nodes have no internet access)
+export SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data
 mkdir -p results/pseudobulk/logs
+nohup .venv/bin/sead-sexdiff download --omic both --no-progress > results/pseudobulk/logs/download.log 2>&1 < /dev/null &
+
+# when the download log reports 0 failed, submit pseudobulk --omic both
 sbatch scripts/pseudobulk.sbatch
 ```
 
-`scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. Resubmitting is safe: complete downloads and cached donors are skipped. Do not submit to the `full` partition: its node n14 has glibc 2.17 and cannot load the wheels `uv sync` installs on the login node (glibc 2.34); `512x1024` and `gpus` nodes match the login node.
+`scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. It stops early unless all 84 RNA and 86 ATAC objects are present. Resubmitting the download or the job is safe: complete downloads and cached donors are skipped. Do not submit to the `full` partition: its node n14 has glibc 2.17 and cannot load the wheels `uv sync` installs on the login node (glibc 2.34); `512x1024` and `gpus` nodes match the login node.
 
 On a workstation, pull the outputs (the per-donor cache is excluded unless `--with-cache`; extra arguments go to rsync):
 

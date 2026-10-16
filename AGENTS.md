@@ -104,7 +104,8 @@ when behavior or defaults change.
   key). Partition `512x1024`, no scratch. Avoid the `full` partition: node n14
   has glibc 2.17 and cannot import the numpy wheels installed from the login
   node (glibc 2.34).
-- `scripts/pseudobulk.sbatch` runs `download --omic both` then
+- Compute nodes have no internet access: run `download --omic both` on the
+  login node (nohup), then `scripts/pseudobulk.sbatch` runs
   `pseudobulk --omic both` as one sequential job; resubmitting resumes.
 - Workstations pull only `results/pseudobulk/` with
   `scripts/sync_pseudobulk.sh`; never copy raw donor objects around.
