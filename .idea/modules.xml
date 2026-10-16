@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/sead_sexdiff.iml" filepath="$PROJECT_DIR$/.idea/sead_sexdiff.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/sead-sexdiff.iml" filepath="$PROJECT_DIR$/.idea/sead-sexdiff.iml" />
     </modules>
   </component>
 </project>
