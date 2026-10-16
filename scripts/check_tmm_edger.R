@@ -21,9 +21,16 @@ omics <- if (length(args) >= 3) args[3:length(args)] else c("rna", "atac")
 tol_factor <- 1e-8
 tol_logcpm <- 1e-10
 
+# scan() instead of read.csv(): the ATAC matrices have ~130k columns
 read_matrix <- function(path) {
-  df <- read.csv(path, row.names = 1, check.names = FALSE)
-  as.matrix(df)
+  con <- file(path, "r")
+  header <- strsplit(readLines(con, n = 1), ",", fixed = TRUE)[[1]]
+  vals <- scan(con, what = character(), sep = ",", quiet = TRUE)
+  close(con)
+  m <- matrix(vals, ncol = length(header), byrow = TRUE)
+  out <- matrix(as.numeric(m[, -1]), nrow = nrow(m))
+  dimnames(out) <- list(m[, 1], header[-1])
+  out
 }
 
 ok <- TRUE
