@@ -31,6 +31,10 @@ The system SHALL require that `sex` takes exactly two distinct values across the
 - **WHEN** a donor is labelled `Female` in the RNA object and `Male` in the ATAC object
 - **THEN** the run stops with an error naming the donor and both values
 
+#### Scenario: Single sex label in a partial run
+- **WHEN** a partial run (donor limit, donor list, a single omic, or fewer files than the full release) yields only one sex label
+- **THEN** the run records a warning in the manifest instead of failing; more than two labels, or fewer than two in a full run, still stop the run
+
 ### Requirement: Cohort flags require both omics
 The system SHALL set `cohort_30` true when `n_rna >= 30` and `n_atac >= 30`, and `cohort_50` true when `n_rna >= 50` and `n_atac >= 50`. Thresholds SHALL be recorded in the manifest.
 
