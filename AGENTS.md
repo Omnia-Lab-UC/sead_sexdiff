@@ -100,7 +100,10 @@ when behavior or defaults change.
 
 - Raw data is canonical on the cluster at `/home1/tgonza/sead_sexdiff/data`
   (repo clone at `/home1/tgonza/sead_sexdiff`, `uv sync --locked` on the login
-  node; uv in `~/.local/bin`). Partition `512x1024`, no scratch.
+  node; uv in `~/.local/bin`; clone over HTTPS, the cluster has no GitHub SSH
+  key). Partition `512x1024`, no scratch. Avoid the `full` partition: node n14
+  has glibc 2.17 and cannot import the numpy wheels installed from the login
+  node (glibc 2.34).
 - `scripts/pseudobulk.sbatch` runs `download --omic both` then
   `pseudobulk --omic both` as one sequential job; resubmitting resumes.
 - Workstations pull only `results/pseudobulk/` with

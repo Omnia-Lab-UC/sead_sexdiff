@@ -32,9 +32,9 @@
 
 ## 6. Cluster execution and sync
 
-- [ ] 6.1 Write `scripts/pseudobulk.sbatch` (partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, runs `download --omic both` then `pseudobulk --omic both`, logs under `results/pseudobulk/logs/`); verify with `sbatch --test-only` on the cluster
+- [x] 6.1 Write `scripts/pseudobulk.sbatch` (partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, runs `download --omic both` then `pseudobulk --omic both`, logs under `results/pseudobulk/logs/`); verify with `sbatch --test-only` on the cluster
 - [ ] 6.2 Write `scripts/sync_pseudobulk.sh` (rsync of `results/pseudobulk/` from the cluster, excluding `per_donor/` by default with a flag to include it); verify a dry run (`-n`) lists the expected files
-- [ ] 6.3 Clone the repo on `ing` at `/home1/tgonza/sead_sexdiff`, run `uv sync --locked` there (uv may fetch Python 3.12), and verify `uv run sead-sexdiff pseudobulk --help` works on the login node
+- [x] 6.3 Clone the repo on `ing` at `/home1/tgonza/sead_sexdiff`, run `uv sync --locked` there (uv may fetch Python 3.12), and verify `uv run sead-sexdiff pseudobulk --help` works on the login node
 
 ## 7. Documentation
 

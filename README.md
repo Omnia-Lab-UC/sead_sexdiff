@@ -154,7 +154,7 @@ The raw donor objects live once on the cluster; workstations only pull the deriv
 
 ```
 # once, on the login node
-git clone git@github.com:Omnia-Lab-UC/sead_sexdiff.git /home1/tgonza/sead_sexdiff
+git clone -b mtg-astrocyte-pseudobulks https://github.com/Omnia-Lab-UC/sead_sexdiff.git /home1/tgonza/sead_sexdiff  # the cluster has no GitHub SSH key
 cd /home1/tgonza/sead_sexdiff && ~/.local/bin/uv sync --locked
 
 # submit (download --omic both, then pseudobulk --omic both)
@@ -162,7 +162,7 @@ mkdir -p results/pseudobulk/logs
 sbatch scripts/pseudobulk.sbatch
 ```
 
-`scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. Resubmitting is safe: complete downloads and cached donors are skipped.
+`scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. Resubmitting is safe: complete downloads and cached donors are skipped. Do not submit to the `full` partition: its node n14 has glibc 2.17 and cannot load the wheels `uv sync` installs on the login node (glibc 2.34); `512x1024` and `gpus` nodes match the login node.
 
 On a workstation, pull the outputs (the per-donor cache is excluded unless `--with-cache`; extra arguments go to rsync):
 
