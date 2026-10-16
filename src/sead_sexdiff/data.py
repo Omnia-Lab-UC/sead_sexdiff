@@ -24,8 +24,13 @@ Notes
 
 from __future__ import annotations
 
+import gc
+import os
+import re
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List
 import json
@@ -44,6 +49,57 @@ from pydeseq2.ds import DeseqStats
 
 
 DEFAULT_BUCKET = "sea-ad-single-cell-profiling"
+DATA_ROOT_ENV = "SEAD_DATA_ROOT"
+DOWNLOAD_MANIFEST_NAME = "download_manifest.json"
+
+# MTG per-donor object prefixes, one per omic
+MTG_PREFIXES: dict[str, str] = {
+    "rna": "MTG/RNAseq/donors_objects/",
+    "atac": "MTG/ATACseq/donor_objects/",
+}
+
+
+def resolve_data_root(explicit: str | Path | None = None) -> Path:
+    """Resolve the local data root.
+
+    Parameters
+    ----------
+    explicit:
+        Root given on the command line or by the caller. Takes precedence.
+
+    Returns
+    -------
+    pathlib.Path
+        ``explicit`` if given, else ``$SEAD_DATA_ROOT`` if set and non-empty,
+        else ``data`` relative to the current working directory.
+    """
+    if explicit is not None and str(explicit) != "":
+        return Path(explicit)
+    env = os.environ.get(DATA_ROOT_ENV)
+    if env:
+        return Path(env)
+    return Path("data")
+
+
+class DownloadResult(list):
+    """List of downloaded paths, with the rest of the download report attached.
+
+    Attributes
+    ----------
+    skipped:
+        Local paths already present at the remote size, not transferred.
+    failed:
+        S3 keys that were missing or failed to download.
+    bytes_downloaded:
+        Total bytes transferred.
+    manifest_path:
+        Path of the updated ``download_manifest.json``, or ``None``.
+    """
+
+    skipped: list[Path]
+    failed: list[str]
+    bytes_downloaded: int
+    manifest_path: Path | None
 
 
 def _ensure_parent_dir(path: Path) -> None:
@@ -77,9 +133,9 @@ def download_data(
     bucket: str = DEFAULT_BUCKET,
     suffixes: Iterable[str] | None = (".csv", ".html"),
     files: Iterable[str] | None = None,
-    dest_root: str | Path = "data",
+    dest_root: str | Path | None = None,
     show_progress: bool = True,
-) -> List[Path]:
+) -> DownloadResult:
     """Download public SEA-AD data from S3 via boto3.
 
     Parameters
@@ -104,12 +160,14 @@ def download_data(
         attempted.
     dest_root:
         Local root directory where files will be saved. The S3 key structure is
-        preserved under this directory.
+        preserved under this directory. ``None`` resolves through
+        :func:`resolve_data_root` (``$SEAD_DATA_ROOT``, else ``data``).
 
     Returns
     -------
-    List[pathlib.Path]
-        A list of local file paths that were downloaded.
+    DownloadResult
+        A list of local file paths that were downloaded, carrying the skipped
+        paths, failed keys, bytes transferred and manifest path as attributes.
 
     Notes
     -----
@@ -119,6 +177,9 @@ def download_data(
     - This function uses unsigned S3 requests, which is appropriate for public
       buckets. If the bucket ever becomes private, authentication would be
       required and this approach would need updating.
+    - Files already present locally at the remote size are skipped. Every
+      downloaded or present file is recorded (key, size, ETag, timestamp) in
+      ``<dest_root>/<prefix>/download_manifest.json``.
     """
 
     # Normalize inputs
@@ -126,13 +187,13 @@ def download_data(
         # Keep behavior consistent with folder-like prefixes
         prefix = prefix + "/"
 
-    dest_root = Path(dest_root)
+    dest_root = resolve_data_root(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
 
     # Create an anonymous S3 client (no credentials needed for public buckets)
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
-    downloaded: List[Path] = []
+    downloaded = DownloadResult()
 
     # Internal progress tracker
     class _Progress:
@@ -165,14 +226,7 @@ def download_data(
             return f"{m:02d}:{s:02d}"
 
         def _human(self, n: int) -> str:
-            # Simple human-readable bytes
-            units = ["B", "KB", "MB", "GB", "TB"]
-            size = float(n)
-            for u in units:
-                if size < 1024 or u == units[-1]:
-                    return f"{size:.1f}{u}"
-                size /= 1024
-            return f"{n}B"
+            return _human_bytes(n)
 
         def _print_line(self, end: str = "\n"):
             elapsed = max(1e-6, time.time() - self.start)
@@ -197,113 +251,145 @@ def download_data(
                     self.seen = max(self.seen, self.total)
                 self._print_line(end="\n")
 
-    # Build a queue of downloads with known sizes when possible
-    download_queue: list[tuple[str, Path, int | None]] = []  # (key, local_path, size)
+    # Build a queue of downloads: (key, local_path, remote_size, etag)
+    download_queue: list[tuple[str, Path, int | None, str | None]] = []
+    # Files present locally at the remote size: (key, local_path, size, etag)
+    present: list[tuple[str, Path, int, str | None]] = []
+    failed: list[str] = []
 
-    # Always consider Changelog.html
+    seen: set[str] = set()
+
+    def _consider(key: str, size: int | None, etag: str | None) -> None:
+        if key in seen:
+            return
+        seen.add(key)
+        local_path = dest_root / key
+        try:
+            if size is not None and local_path.exists() and local_path.stat().st_size == size:
+                present.append((key, local_path, size, etag))
+                return
+        except OSError:
+            pass
+        download_queue.append((key, local_path, size, etag))
+
+    def _head(key: str) -> tuple[int | None, str | None] | None:
+        """Return (size, etag) for a key, or None when the object is absent."""
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+        except Exception:
+            return None
+        size = int(head.get("ContentLength", -1))
+        return (size if size >= 0 else None), head.get("ETag")
+
+    # Always consider Changelog.html, silently skipping it when absent
     changelog_key = f"{prefix}Changelog.html"
-    try:
-        local_changelog = dest_root / changelog_key
-        remote_size: int | None = None
-        try:
-            head = s3.head_object(Bucket=bucket, Key=changelog_key)
-            remote_size = int(head.get("ContentLength", -1))
-            if remote_size < 0:
-                remote_size = None
-        except Exception:
-            remote_size = None
+    changelog = _head(changelog_key)
+    if changelog is not None:
+        _consider(changelog_key, *changelog)
 
-        # Skip if up-to-date
-        try:
-            if local_changelog.exists() and remote_size is not None:
-                if local_changelog.stat().st_size == remote_size:
-                    pass  # do not enqueue
-                else:
-                    download_queue.append((changelog_key, local_changelog, remote_size))
-            else:
-                download_queue.append((changelog_key, local_changelog, remote_size))
-        except Exception:
-            download_queue.append((changelog_key, local_changelog, remote_size))
-    except Exception:
-        # ignore issues with changelog discovery
-        pass
-
-    # If specific files are requested, prepare those and process early return
     if files:
+        # Only the requested files (plus the changelog) are considered
         for f in files:
             if not f:
                 continue
             rel = str(f).lstrip("/")
             key = rel if rel.startswith(prefix) else f"{prefix}{rel}"
-            local_path = dest_root / key
-
-            remote_size: int | None = None
-            try:
-                head = s3.head_object(Bucket=bucket, Key=key)
-                rs = int(head.get("ContentLength", -1))
-                remote_size = rs if rs >= 0 else None
-            except Exception:
-                remote_size = None
-
-            # Skip re-download if size matches
-            try:
-                if local_path.exists() and remote_size is not None:
-                    if local_path.stat().st_size == remote_size:
-                        continue
-            except Exception:
-                pass
-
-            download_queue.append((key, local_path, remote_size))
-
-        # Execute downloads with progress
-        total_bytes = sum(sz for _, _, sz in download_queue if isinstance(sz, int)) or None
-        prog = _Progress(total_bytes)
-        for key, local_path, _sz in download_queue:
-            try:
-                _ensure_parent_dir(local_path)
-                s3.download_file(bucket, key, str(local_path), Callback=prog.cb)
-                downloaded.append(local_path)
-            except Exception:
+            head = _head(key)
+            if head is None:
+                print(f"[download] Not found in s3://{bucket}: {key}")
+                failed.append(key)
                 continue
-        prog.finish()
-        return downloaded
-
-    # List all objects under the prefix and download those matching the suffixes
-    paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-
-    for page in pages:
-        contents = page.get("Contents") or []
-        for obj in contents:
-            key = obj.get("Key")
-            if not key or key.endswith("/"):
-                continue
-            if not _matches_suffixes(key, suffixes):
-                continue
-            local_path = dest_root / key
-            # Decide whether to download and capture size
-            remote_size = obj.get("Size")
-            try:
-                if local_path.exists() and isinstance(remote_size, int):
-                    if local_path.stat().st_size == remote_size:
-                        continue
-            except OSError:
-                pass
-            download_queue.append((key, local_path, remote_size if isinstance(remote_size, int) else None))
+            _consider(key, *head)
+    else:
+        # List all objects under the prefix and keep those matching the suffixes
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents") or []:
+                key = obj.get("Key")
+                if not key or key.endswith("/") or key == changelog_key:
+                    continue
+                if not _matches_suffixes(key, suffixes):
+                    continue
+                size = obj.get("Size")
+                _consider(key, size if isinstance(size, int) else None, obj.get("ETag"))
 
     # Execute queued downloads with progress
-    total_bytes = sum(sz for _, _, sz in download_queue if isinstance(sz, int)) or None
+    total_bytes = sum(sz for _, _, sz, _ in download_queue if isinstance(sz, int)) or None
     prog = _Progress(total_bytes)
-    for key, local_path, _sz in download_queue:
+    fetched: list[tuple[str, Path, int, str | None]] = []
+    for key, local_path, _sz, etag in download_queue:
         try:
             _ensure_parent_dir(local_path)
             s3.download_file(bucket, key, str(local_path), Callback=prog.cb)
-            downloaded.append(local_path)
-        except Exception:
+        except Exception as exc:
+            print(f"[download] Failed: {key} ({exc})")
+            failed.append(key)
             continue
-    prog.finish()
+        downloaded.append(local_path)
+        fetched.append((key, local_path, local_path.stat().st_size, etag))
+    if download_queue:
+        prog.finish()
 
+    downloaded.skipped = [p for _, p, _, _ in present]
+    downloaded.failed = failed
+    downloaded.bytes_downloaded = sum(sz for _, _, sz, _ in fetched)
+    downloaded.manifest_path = _update_download_manifest(
+        dest_root / prefix, bucket, fetched=fetched, present=present
+    )
+    print(
+        f"[download] {len(downloaded)} downloaded, {len(downloaded.skipped)} skipped, "
+        f"{len(failed)} failed, {_human_bytes(downloaded.bytes_downloaded)} transferred"
+    )
     return downloaded
+
+
+def _human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+def _update_download_manifest(
+    prefix_dir: Path,
+    bucket: str,
+    *,
+    fetched: list[tuple[str, Path, int, str | None]],
+    present: list[tuple[str, Path, int, str | None]],
+) -> Path | None:
+    """Merge downloaded and already-present files into ``download_manifest.json``.
+
+    Entries are keyed by S3 key. A freshly downloaded file gets the current
+    timestamp; a skipped file keeps the timestamp of its previous entry, or
+    its local modification time when it has none.
+    """
+    if not fetched and not present:
+        return None
+    path = prefix_dir / DOWNLOAD_MANIFEST_NAME
+    entries: dict[str, dict] = {}
+    if path.exists():
+        try:
+            entries = {e["key"]: e for e in json.loads(path.read_text())["files"]}
+        except (ValueError, KeyError, TypeError):
+            entries = {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for key, _local, size, etag in fetched:
+        entries[key] = {"key": key, "size": size, "etag": etag, "downloaded_at": now}
+    for key, local, size, etag in present:
+        prev = entries.get(key, {})
+        if prev.get("size") == size and prev.get("downloaded_at"):
+            stamp = prev["downloaded_at"]
+        else:
+            stamp = datetime.fromtimestamp(local.stat().st_mtime, timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        entries[key] = {"key": key, "size": size, "etag": etag or prev.get("etag"), "downloaded_at": stamp}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"bucket": bucket, "updated_at": now, "files": [entries[k] for k in sorted(entries)]}
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
 
 
 def subset_adata(file_path: str | Path, *, subclass_label: str = "Microglia-PVM"):
@@ -918,6 +1004,717 @@ def differential_expression(
 
     return outputs
 
+# ---------------------------------------------------------------------------
+# MTG astrocyte donor pseudobulks (RNA + ATAC)
+# ---------------------------------------------------------------------------
+
+ADNC_COLUMN = "Overall AD neuropathological Change"
+
+_ASTRO_SUPERTYPES = ["Astro_1", "Astro_2", "Astro_3", "Astro_4", "Astro_5", "Astro_6-SEAAD"]
+_SHARED_SUBCLASSES = [
+    "L2/3 IT", "L4 IT", "L5 IT", "L6 IT", "L6 IT Car3", "L5 ET", "L5/6 NP", "L6 CT",
+    "L6b", "Lamp5", "Lamp5 Lhx6", "Pax6", "Sncg", "Vip", "Sst", "Sst Chodl", "Pvalb",
+    "Chandelier", "OPC", "Oligodendrocyte", "Endothelial",
+]
+
+# Taxonomy mapping per release, keyed by the date in the file name
+# (``..._final-nuclei.<date>.h5ad``). Labels confirmed by the spike in
+# ``openspec/changes/mtg-astrocyte-donor-pseudobulks/spike.md``. Every
+# ``Subclass`` value of a donor object must be listed (astrocyte or other) and
+# every astrocyte ``Supertype`` must be mapped, otherwise the run fails.
+TAXONOMY: dict[str, dict] = {
+    "2026-06-22": {
+        "omic": "rna",
+        "astrocyte_subclass": ["Astrocyte"],
+        "other_subclasses": _SHARED_SUBCLASSES + ["Immune", "VLMC & Perivascular"],
+        "supertypes": {s: s for s in _ASTRO_SUPERTYPES},
+    },
+    "2024-12-06": {
+        "omic": "atac",
+        "astrocyte_subclass": ["Astrocyte"],
+        "other_subclasses": _SHARED_SUBCLASSES + ["Microglia-PVM", "VLMC"],
+        "supertypes": {s: s for s in _ASTRO_SUPERTYPES},
+    },
+}
+
+# Raw count matrix per omic (h5ad element path)
+MATRIX_SOURCE: dict[str, str] = {"rna": "layers/UMIs", "atac": "X"}
+RNA_MIN_GENES = 200
+ADNC_STAGES: dict[str, str] = {"Not AD": "0", "Low": "0", "Intermediate": "1", "High": "2"}
+COHORT_THRESHOLDS: dict[str, int] = {"cohort_30": 30, "cohort_50": 50}
+EXPECTED_DONORS: dict[str, int] = {"rna": 84, "atac": 86}
+PREREGISTERED_COHORTS: dict[str, dict] = {
+    "cohort_30": {"n": 80, "Female": [11, 10, 28], "Male": [9, 10, 12]},
+    "cohort_50": {"n": 74},
+}
+STAGES = ["0", "1", "2"]
+
+_RELEASE_RE = re.compile(r"_final-nuclei\.(\d{4}-\d{2}-\d{2})\.h5ad$")
+
+
+def release_of(path: str | Path) -> str:
+    """Return the release date parsed from a donor object file name."""
+    m = _RELEASE_RE.search(Path(path).name)
+    if m is None:
+        raise ValueError(f"{Path(path).name}: cannot parse release date from file name")
+    return m.group(1)
+
+
+def donor_id_of(path: str | Path) -> str:
+    """Return the donor ID encoded in a donor object file name."""
+    return Path(path).name.split("_SEAAD_")[0]
+
+
+def taxonomy_for(path: str | Path) -> dict:
+    """Return the taxonomy mapping of the release a donor object belongs to."""
+    release = release_of(path)
+    if release not in TAXONOMY:
+        raise ValueError(f"{Path(path).name}: no taxonomy mapping for release {release}")
+    return TAXONOMY[release]
+
+
+def validate_taxonomy(
+    path: str | Path, subclasses: Iterable[str], astro_supertypes: Iterable[str]
+) -> None:
+    """Fail on any ``Subclass`` or astrocyte ``Supertype`` label absent from the mapping.
+
+    Parameters
+    ----------
+    path:
+        Donor object, used for the release and the error message.
+    subclasses:
+        All ``Subclass`` values of the object.
+    astro_supertypes:
+        ``Supertype`` values of the astrocyte nuclei.
+    """
+    tax = taxonomy_for(path)
+    known = set(tax["astrocyte_subclass"]) | set(tax["other_subclasses"])
+    for label in sorted(set(map(str, subclasses)) - known):
+        raise ValueError(
+            f"{Path(path).name}: Subclass label {label!r} is not in the taxonomy "
+            f"mapping for release {release_of(path)}"
+        )
+    for label in sorted(set(map(str, astro_supertypes)) - set(tax["supertypes"])):
+        raise ValueError(
+            f"{Path(path).name}: astrocyte Supertype label {label!r} is not in the "
+            f"taxonomy mapping for release {release_of(path)}"
+        )
+
+
+def _single_value(values: pd.Series, path: Path, column: str) -> str:
+    uniq = pd.unique(values.astype(str))
+    if len(uniq) != 1:
+        raise ValueError(f"{path.name}: expected one value in obs[{column!r}], found {list(uniq)}")
+    return str(uniq[0])
+
+
+def _read_obs_columns(f, columns: list[str], path: Path) -> pd.DataFrame:
+    from anndata.io import read_elem
+
+    group = f["obs"]
+    missing = [c for c in columns if c not in group]
+    if missing:
+        raise KeyError(f"{path.name}: obs lacks column(s) {missing}")
+    return pd.DataFrame({c: read_elem(group[c]) for c in columns})
+
+
+def _read_rows(elem, rows: np.ndarray):
+    """Read selected rows of an h5ad matrix element as a CSR matrix."""
+    import h5py
+    import scipy.sparse as sp
+    from anndata.io import sparse_dataset
+
+    if isinstance(elem, h5py.Dataset):
+        n_features = elem.shape[1]
+        if rows.size == 0:
+            return sp.csr_matrix((0, n_features), dtype=elem.dtype)
+        return sp.csr_matrix(elem[rows])
+    ds = sparse_dataset(elem)
+    if rows.size == 0:
+        return sp.csr_matrix((0, ds.shape[1]), dtype=ds.dtype)
+    return sp.csr_matrix(ds[rows])
+
+
+def _check_counts(m, path: Path, source: str) -> None:
+    d = m.data
+    if d.size and (not np.all(np.isfinite(d)) or d.min() < 0 or np.any(d != np.round(d))):
+        raise ValueError(
+            f"{path.name}: matrix {source!r} contains non-integer or negative values"
+        )
+
+
+def _check_features(names: np.ndarray, reference: np.ndarray, path: Path) -> None:
+    """Require the same ordered feature set as the reference."""
+    if len(names) == len(reference) and np.array_equal(names, reference):
+        return
+    if len(names) == len(reference):
+        n_diff = int(np.sum(names != reference))
+    else:
+        n_diff = len(set(names) ^ set(reference)) or abs(len(names) - len(reference))
+    raise ValueError(
+        f"{path.name}: feature set differs from the reference ({n_diff} differing "
+        f"features; {len(names)} vs {len(reference)} features)"
+    )
+
+
+def _features_hash(names: Iterable[str]) -> str:
+    import hashlib
+
+    return hashlib.sha256("\n".join(map(str, names)).encode()).hexdigest()
+
+
+def pseudobulk_donor(
+    path: str | Path,
+    omic: str,
+    *,
+    min_genes: int = RNA_MIN_GENES,
+    reference_features: np.ndarray | None = None,
+) -> dict:
+    """Sum raw counts over the astrocyte nuclei of one donor object.
+
+    Parameters
+    ----------
+    path:
+        Donor ``.h5ad`` object (one donor per file).
+    omic:
+        ``"rna"`` (sums ``layers/UMIs``) or ``"atac"`` (sums ``X``).
+    min_genes:
+        RNA only: astrocyte nuclei with fewer detected genes are dropped
+        before summing. ATAC applies no nucleus QC.
+    reference_features:
+        Ordered feature names every donor of the omic must match. ``None``
+        skips the check (first donor).
+
+    Returns
+    -------
+    dict
+        ``donor_id``, ``omic``, ``release``, ``sex``, ``adnc``, ``excluded``
+        (``True`` for ``Reference`` donors), ``n_astro`` (before QC),
+        ``n_nuclei`` (summed), ``supertype_counts`` (canonical → count, all
+        mapped supertypes), ``row`` (1 × features int64 CSR, ``None`` when
+        excluded) and ``var`` (feature annotations).
+
+    Notes
+    -----
+    Only ``obs`` columns, ``var`` and the astrocyte rows of the count matrix
+    are read, so the normalized RNA ``X`` is never loaded.
+    """
+    import h5py
+    import scipy.sparse as sp
+    from anndata.io import read_elem
+
+    path = Path(path)
+    if omic not in MATRIX_SOURCE:
+        raise ValueError(f"Unknown omic {omic!r}")
+    tax = taxonomy_for(path)
+    if tax["omic"] != omic:
+        raise ValueError(f"{path.name}: release {release_of(path)} is {tax['omic']}, not {omic}")
+    source = MATRIX_SOURCE[omic]
+
+    with h5py.File(path, "r") as f:
+        obs = _read_obs_columns(
+            f, ["Donor ID", "Sex", ADNC_COLUMN, "Subclass", "Supertype"], path
+        )
+        donor = _single_value(obs["Donor ID"], path, "Donor ID")
+        sex = _single_value(obs["Sex"], path, "Sex")
+        adnc = _single_value(obs[ADNC_COLUMN], path, ADNC_COLUMN)
+
+        subclass = obs["Subclass"].astype(str).to_numpy()
+        rows = np.flatnonzero(np.isin(subclass, tax["astrocyte_subclass"]))
+        supertype_raw = obs["Supertype"].astype(str).to_numpy()[rows]
+        validate_taxonomy(path, subclass, supertype_raw)
+
+        var = read_elem(f["var"])
+        if reference_features is not None:
+            _check_features(var.index.to_numpy(), reference_features, path)
+
+        record = {
+            "donor_id": donor,
+            "omic": omic,
+            "release": release_of(path),
+            "sex": sex,
+            "adnc": adnc,
+            "excluded": adnc == "Reference",
+            "n_astro": int(rows.size),
+            "n_nuclei": 0,
+            "supertype_counts": {c: 0 for c in tax["supertypes"].values()},
+            "row": None,
+            "var": var,
+        }
+        if record["excluded"]:
+            return record
+
+        if source not in f:
+            raise KeyError(f"{path.name}: count matrix {source!r} not found")
+        m = _read_rows(f[source], rows)
+
+    _check_counts(m, path, source)
+    m = m.astype(np.int64)
+    if omic == "rna":
+        n_genes = np.asarray((m > 0).sum(axis=1)).ravel()
+        keep = n_genes >= min_genes
+        m = m[keep]
+        supertype_raw = supertype_raw[keep]
+
+    record["n_nuclei"] = int(m.shape[0])
+    record["row"] = sp.csr_matrix(np.asarray(m.sum(axis=0), dtype=np.int64))
+    for raw, n in zip(*np.unique(supertype_raw, return_counts=True)):
+        record["supertype_counts"][tax["supertypes"][str(raw)]] += int(n)
+    del m
+    gc.collect()
+    return record
+
+
+# --- per-donor cache -------------------------------------------------------
+
+def _save_cache(path: Path, record: dict, features_hash: str, source_key: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = record["row"]
+    supertypes = list(record["supertype_counts"])
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez_compressed(
+        tmp,
+        row_data=row.data if row is not None else np.zeros(0, np.int64),
+        row_indices=row.indices if row is not None else np.zeros(0, np.int32),
+        n_features=np.int64(row.shape[1] if row is not None else -1),
+        donor_id=record["donor_id"],
+        omic=record["omic"],
+        release=record["release"],
+        sex=record["sex"],
+        adnc=record["adnc"],
+        excluded=record["excluded"],
+        n_astro=record["n_astro"],
+        n_nuclei=record["n_nuclei"],
+        supertypes=np.array(supertypes, dtype=str),
+        supertype_counts=np.array([record["supertype_counts"][s] for s in supertypes], np.int64),
+        features_hash=features_hash,
+        source_key=source_key,
+    )
+    os.replace(tmp, path)
+
+
+def _load_cache(path: Path) -> dict:
+    import scipy.sparse as sp
+
+    with np.load(path, allow_pickle=False) as z:
+        rec = {k: z[k].item() for k in (
+            "donor_id", "omic", "release", "sex", "adnc", "excluded", "n_astro",
+            "n_nuclei", "features_hash", "source_key", "n_features",
+        )}
+        rec["supertype_counts"] = {
+            str(s): int(n) for s, n in zip(z["supertypes"], z["supertype_counts"])
+        }
+        rec["row"] = None
+        if not rec["excluded"]:
+            data, idx = z["row_data"], z["row_indices"]
+            rec["row"] = sp.csr_matrix(
+                (data, idx, np.array([0, len(data)])), shape=(1, rec["n_features"])
+            )
+    return rec
+
+
+# --- donor table and cohorts ----------------------------------------------
+
+def recode_adnc(adnc: pd.Series, donor_ids: pd.Series) -> pd.Series:
+    """Recode ADNC into the string stages ``0`` (Not AD, Low), ``1``, ``2``.
+
+    Raises
+    ------
+    ValueError
+        On any value outside ``ADNC_STAGES``, naming the donor and the value.
+    """
+    for donor, value in zip(donor_ids, adnc):
+        if value not in ADNC_STAGES:
+            raise ValueError(f"Donor {donor}: unexpected ADNC value {value!r}")
+    return adnc.map(ADNC_STAGES)
+
+
+def build_donor_table(meta: pd.DataFrame) -> tuple[pd.DataFrame, list[dict]]:
+    """Build the donor table from per-donor, per-omic metadata.
+
+    Parameters
+    ----------
+    meta:
+        One row per donor × omic with columns ``donor_id``, ``omic``,
+        ``sex``, ``adnc`` and ``n_nuclei``.
+
+    Returns
+    -------
+    (pandas.DataFrame, list[dict])
+        The table (``donor_id``, ``sex``, ``adnc_raw``, ``stage``, ``n_rna``,
+        ``n_atac``, ``cohort_30``, ``cohort_50``), one row per non-Reference
+        donor present in either omic, and the excluded Reference donors.
+
+    Notes
+    -----
+    Sex and ADNC must agree between omics for donors present in both.
+    Cohort flags require the threshold in **both** omics.
+    """
+    for donor, grp in meta.groupby("donor_id", sort=True):
+        for col in ("sex", "adnc"):
+            vals = dict(zip(grp["omic"], grp[col]))
+            if len(set(vals.values())) > 1:
+                raise ValueError(f"Donor {donor}: {col} disagrees between omics {vals}")
+
+    first = meta.sort_values(["donor_id", "omic"]).drop_duplicates("donor_id")
+    excluded = [
+        {"donor_id": d, "omics": sorted(meta.loc[meta.donor_id == d, "omic"]), "reason": "ADNC Reference"}
+        for d in first.loc[first.adnc == "Reference", "donor_id"]
+    ]
+    first = first[first.adnc != "Reference"]
+
+    counts = meta.pivot_table(index="donor_id", columns="omic", values="n_nuclei", aggfunc="sum")
+    table = pd.DataFrame({
+        "donor_id": first["donor_id"].to_numpy(),
+        "sex": first["sex"].to_numpy(),
+        "adnc_raw": first["adnc"].to_numpy(),
+    })
+    table["stage"] = recode_adnc(table["adnc_raw"], table["donor_id"]).to_numpy()
+    for omic in ("rna", "atac"):
+        col = counts[omic] if omic in counts else pd.Series(dtype=float)
+        table[f"n_{omic}"] = table["donor_id"].map(col).fillna(0).astype(int).to_numpy()
+    for name, thr in COHORT_THRESHOLDS.items():
+        table[name] = (table["n_rna"] >= thr) & (table["n_atac"] >= thr)
+    return table.reset_index(drop=True), excluded
+
+
+def check_sex_labels(table: pd.DataFrame, *, strict: bool = True) -> list[str]:
+    """Require exactly two sex labels; return warnings when not strict."""
+    labels = sorted(table["sex"].unique())
+    if len(labels) == 2:
+        return []
+    msg = f"Expected exactly two sex labels, found {labels}"
+    if strict or len(labels) > 2:
+        raise ValueError(msg)
+    return [msg]
+
+
+def summarize_cohorts(table: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Count donors per sex × stage in each cohort.
+
+    Returns
+    -------
+    (pandas.DataFrame, dict)
+        Summary with columns ``cohort``, ``sex``, ``stage_0``, ``stage_1``,
+        ``stage_2``, ``total`` (plus an ``all`` row per cohort), and per
+        cohort ``n``, ``cells``, ``empty_cells`` and ``analysable`` (two sexes
+        and no empty sex × stage cell).
+    """
+    sexes = sorted(table["sex"].unique())
+    rows, info = [], {}
+    for cohort in COHORT_THRESHOLDS:
+        sub = table[table[cohort]]
+        cells = {
+            sex: [int(((sub.sex == sex) & (sub.stage == st)).sum()) for st in STAGES]
+            for sex in sexes
+        }
+        for sex, n in cells.items():
+            rows.append({"cohort": cohort, "sex": sex, **{f"stage_{st}": v for st, v in zip(STAGES, n)}, "total": sum(n)})
+        tot = [sum(cells[s][i] for s in sexes) for i in range(len(STAGES))]
+        rows.append({"cohort": cohort, "sex": "all", **{f"stage_{st}": v for st, v in zip(STAGES, tot)}, "total": len(sub)})
+        empty = [f"{sex}/stage {st}" for sex in sexes for st, v in zip(STAGES, cells[sex]) if v == 0]
+        info[cohort] = {
+            "n": int(len(sub)),
+            "cells": cells,
+            "empty_cells": empty,
+            "analysable": len(sexes) == 2 and not empty,
+        }
+    return pd.DataFrame(rows), info
+
+
+def compare_preregistered(info: dict) -> list[str]:
+    """List deviations of the observed cohorts from the preregistered counts."""
+    findings = []
+    for cohort, expected in PREREGISTERED_COHORTS.items():
+        obs = info.get(cohort, {})
+        if obs.get("n") != expected["n"]:
+            findings.append(f"{cohort}: n = {obs.get('n')}, preregistered {expected['n']}")
+        for sex in ("Female", "Male"):
+            if sex in expected and obs.get("cells", {}).get(sex) != expected[sex]:
+                findings.append(
+                    f"{cohort}: {sex} by stage = {obs.get('cells', {}).get(sex)}, "
+                    f"preregistered {expected[sex]}"
+                )
+    return findings
+
+
+# --- run -------------------------------------------------------------------
+
+def _git_revision() -> dict:
+    here = Path(__file__).resolve().parent
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=here, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=here, capture_output=True, text=True, check=True,
+        ).stdout.strip() != ""
+        return {"commit": rev, "dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
+def _software_versions() -> dict:
+    from importlib.metadata import PackageNotFoundError, version
+
+    out = {"python": sys.version.split()[0]}
+    for pkg in ("sead-sexdiff", "anndata", "numpy", "scipy", "pandas", "h5py", "boto3"):
+        try:
+            out[pkg] = version(pkg)
+        except PackageNotFoundError:
+            out[pkg] = None
+    return out
+
+
+def _select_donors(
+    available: dict[str, dict[str, Path]],
+    *,
+    limit: int | None,
+    donors: list[str] | None,
+) -> dict[str, list[str]]:
+    """Pick donors per omic: an explicit list, then the first ``limit``.
+
+    With ``limit``, donors are taken in sorted order among those present in
+    every requested omic, so a dry run covers the same donors in each.
+    """
+    universe = sorted(set().union(*available.values()))
+    if donors:
+        unknown = sorted(set(donors) - set(universe))
+        if unknown:
+            raise ValueError(f"Donor(s) not found under the data root: {unknown}")
+        universe = [d for d in universe if d in set(donors)]
+    if limit is not None:
+        common = [d for d in universe if all(d in a for a in available.values())]
+        universe = common[:limit]
+    return {o: [d for d in universe if d in a] for o, a in available.items()}
+
+
+def run_pseudobulk(
+    *,
+    omic: str = "both",
+    data_root: str | Path | None = None,
+    out_dir: str | Path = "results/pseudobulk",
+    limit: int | None = None,
+    donors: list[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Build donor-level astrocyte pseudobulks, the donor table and the manifest.
+
+    Parameters
+    ----------
+    omic:
+        ``"rna"``, ``"atac"`` or ``"both"``.
+    data_root:
+        Data root (resolved with :func:`resolve_data_root`). Donor objects
+        are read from ``<root>/<MTG_PREFIXES[omic]>``.
+    out_dir:
+        Output directory (default ``results/pseudobulk``).
+    limit:
+        Process only the first ``limit`` donors (sorted, present in every
+        requested omic). Marks the run partial.
+    donors:
+        Process only these donor IDs. Marks the run partial.
+    force:
+        Recompute cached donors and the reference feature set.
+
+    Returns
+    -------
+    dict
+        Paths of the written outputs plus ``cohort_info`` and ``findings``.
+
+    Notes
+    -----
+    Donor objects are read one at a time and each result is cached under
+    ``<out_dir>/per_donor/<omic>/<donor>.npz``; a rerun skips cached donors.
+    Outputs: ``rna_counts.h5ad``, ``atac_counts.h5ad`` (donors × features,
+    int64 CSR), ``donor_table.csv``, ``supertype_composition.csv``,
+    ``cohort_summary.csv`` and ``manifest.json``.
+    """
+    import scipy.sparse as sp
+
+    root = resolve_data_root(data_root)
+    out_dir = Path(out_dir)
+    omics = ["rna", "atac"] if omic == "both" else [omic]
+    print(f"[pseudobulk] Data root: {root.resolve()}")
+    print(f"[pseudobulk] Output directory: {out_dir}")
+
+    available: dict[str, dict[str, Path]] = {}
+    for o in omics:
+        folder = root / MTG_PREFIXES[o]
+        files = sorted(folder.glob("*_final-nuclei.*.h5ad"))
+        if not files:
+            raise FileNotFoundError(f"No donor objects for {o} in {folder}")
+        available[o] = {donor_id_of(p): p for p in files}
+    selected = _select_donors(available, limit=limit, donors=donors)
+    partial = bool(limit is not None or donors) or any(
+        len(available[o]) != EXPECTED_DONORS[o] for o in omics
+    ) or len(omics) < 2
+
+    records: dict[str, list[dict]] = {}
+    references: dict[str, pd.DataFrame] = {}
+    for o in omics:
+        cache_dir = out_dir / "per_donor" / o
+        ref_path = cache_dir / "_var.h5ad"
+        ref_var = None
+        if ref_path.exists() and not force:
+            ref_var = ad.read_h5ad(ref_path).var
+        records[o] = []
+        n = len(selected[o])
+        for i, donor in enumerate(selected[o], 1):
+            path = available[o][donor]
+            cache = cache_dir / f"{donor}.npz"
+            tag = f"[pseudobulk] {o} {i}/{n} {donor}:"
+            if cache.exists() and not force:
+                rec = _load_cache(cache)
+                print(f"{tag} cached ({rec['n_nuclei']} nuclei)")
+            else:
+                raw = pseudobulk_donor(
+                    path, o,
+                    reference_features=None if ref_var is None else ref_var.index.to_numpy(),
+                )
+                if raw["donor_id"] != donor:
+                    raise ValueError(f"{path.name}: obs Donor ID {raw['donor_id']} differs from file name")
+                if ref_var is None:
+                    ref_var = raw["var"]
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    ad.AnnData(var=ref_var).write_h5ad(ref_path)
+                key = path.relative_to(root).as_posix()
+                _save_cache(cache, raw, _features_hash(ref_var.index), key)
+                rec = _load_cache(cache)
+                if rec["excluded"]:
+                    print(f"{tag} excluded (ADNC Reference)")
+                else:
+                    print(f"{tag} {rec['n_astro']} astrocytes, {rec['n_nuclei']} summed")
+                del raw
+                gc.collect()
+            records[o].append(rec)
+        if ref_var is None:
+            raise FileNotFoundError(f"No reference feature set for {o} in {ref_path}")
+        ref_hash = _features_hash(ref_var.index)
+        for rec in records[o]:
+            if rec["features_hash"] != ref_hash:
+                raise ValueError(
+                    f"{cache_dir / (rec['donor_id'] + '.npz')}: cached feature set differs "
+                    "from the reference; rerun with --force"
+                )
+        references[o] = ref_var
+
+    meta = pd.DataFrame([
+        {"donor_id": r["donor_id"], "omic": o, "sex": r["sex"], "adnc": r["adnc"], "n_nuclei": r["n_nuclei"]}
+        for o in omics for r in records[o]
+    ])
+    table, excluded = build_donor_table(meta)
+    warnings = check_sex_labels(table, strict=not partial)
+    summary, cohort_info = summarize_cohorts(table)
+    findings = compare_preregistered(cohort_info) if not partial else []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, Path] = {}
+    table_idx = table.set_index("donor_id")
+    composition = []
+    for o in omics:
+        kept = [r for r in records[o] if not r["excluded"]]
+        X = sp.vstack([r["row"] for r in kept], format="csr").astype(np.int64)
+        if X.nnz and X.data.min() < 0:
+            raise ValueError(f"{o}: assembled matrix has negative values")
+        obs = table_idx.loc[[r["donor_id"] for r in kept]].copy()
+        obs.index.name = "donor_id"
+        adata = ad.AnnData(X=X, obs=obs, var=references[o])
+        path = out_dir / f"{o}_counts.h5ad"
+        adata.write_h5ad(path, compression="gzip")
+        outputs[f"{o}_counts"] = path
+        for r in kept:
+            for st, n_st in r["supertype_counts"].items():
+                composition.append({"donor_id": r["donor_id"], "omic": o, "supertype": st, "n_nuclei": n_st})
+        del adata, X
+        gc.collect()
+
+    comp = pd.DataFrame(composition, columns=["donor_id", "omic", "supertype", "n_nuclei"])
+    totals = comp.groupby(["omic", "donor_id"])["n_nuclei"].sum()
+    for (o, donor), tot in totals.items():
+        if tot != table_idx.loc[donor, f"n_{o}"]:
+            raise AssertionError(f"Composition total for {donor} ({o}) differs from donor table")
+
+    outputs["donor_table"] = out_dir / "donor_table.csv"
+    table.to_csv(outputs["donor_table"], index=False)
+    outputs["supertype_composition"] = out_dir / "supertype_composition.csv"
+    comp.to_csv(outputs["supertype_composition"], index=False)
+    outputs["cohort_summary"] = out_dir / "cohort_summary.csv"
+    summary.to_csv(outputs["cohort_summary"], index=False)
+
+    def _release_files(o: str) -> list[dict]:
+        dl_manifest = root / MTG_PREFIXES[o] / DOWNLOAD_MANIFEST_NAME
+        entries = {}
+        if dl_manifest.exists():
+            entries = {e["key"]: e for e in json.loads(dl_manifest.read_text())["files"]}
+        out = []
+        for donor in selected[o]:
+            p = available[o][donor]
+            key = p.relative_to(root).as_posix()
+            e = entries.get(key, {})
+            out.append({
+                "key": key,
+                "size": p.stat().st_size,
+                "etag": e.get("etag"),
+                "in_download_manifest": bool(e) and e.get("size") == p.stat().st_size,
+            })
+        return out
+
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "partial": partial,
+        "selection": {"omics": omics, "limit": limit, "donors": donors, "force": force},
+        "git": _git_revision(),
+        "software": _software_versions(),
+        "data_root": str(root.resolve()),
+        "releases": {
+            o: {
+                "prefix": MTG_PREFIXES[o],
+                "release": sorted({r["release"] for r in records[o]}),
+                "n_available": len(available[o]),
+                "n_expected": EXPECTED_DONORS[o],
+                "n_processed": len(records[o]),
+                "n_features": int(references[o].shape[0]),
+                "files": _release_files(o),
+            }
+            for o in omics
+        },
+        "taxonomy": TAXONOMY,
+        "qc": {
+            "rna": {"min_genes": RNA_MIN_GENES, "applied_to": "astrocyte nuclei before summing"},
+            "atac": {"min_genes": None, "note": "release final-nuclei QC only"},
+            "nuclei_removed_by_qc": {
+                o: int(sum(r["n_astro"] - r["n_nuclei"] for r in records[o] if not r["excluded"]))
+                for o in omics
+            },
+        },
+        "matrix_source": {o: MATRIX_SOURCE[o] for o in omics},
+        "adnc_stages": ADNC_STAGES,
+        "excluded_donors": excluded,
+        "n_excluded_donors": len(excluded),
+        "cohort_thresholds": COHORT_THRESHOLDS,
+        "cohorts": cohort_info,
+        "preregistered_cohorts": PREREGISTERED_COHORTS,
+        "findings": findings,
+        "warnings": warnings,
+        "outputs": {k: v.name for k, v in outputs.items()},
+    }
+    outputs["manifest"] = out_dir / "manifest.json"
+    outputs["manifest"].write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print("[pseudobulk] Cohort summary (donors per sex x stage):")
+    print(summary.to_string(index=False))
+    for cohort, info in cohort_info.items():
+        if not info["analysable"]:
+            print(f"[pseudobulk] WARNING: {cohort} is not analysable (empty cells: {info['empty_cells']})")
+    for msg in warnings + findings:
+        print(f"[pseudobulk] WARNING: {msg}")
+    if partial:
+        print("[pseudobulk] Partial run: preregistered cohort comparison skipped")
+    return {**outputs, "cohort_info": cohort_info, "findings": findings}
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -927,4 +1724,11 @@ __all__ = [
     "prep_anndata",
     "pseudobulk_and_filter",
     "differential_expression",
+    "resolve_data_root",
+    "MTG_PREFIXES",
+    "TAXONOMY",
+    "pseudobulk_donor",
+    "build_donor_table",
+    "summarize_cohorts",
+    "run_pseudobulk",
 ]

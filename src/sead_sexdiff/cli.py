@@ -13,6 +13,10 @@ from typing import Iterable, List
 from .data import (
     download_data,
     DEFAULT_BUCKET,
+    DATA_ROOT_ENV,
+    MTG_PREFIXES,
+    resolve_data_root,
+    run_pseudobulk,
     write_subset_from_folder,
     pseudobulk_and_filter,
     differential_expression,
@@ -105,10 +109,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dl.add_argument(
+        "--omic",
+        choices=["rna", "atac", "both"],
+        default=None,
+        help=(
+            "Download the MTG per-donor objects for this omic "
+            f"(rna: {MTG_PREFIXES['rna']}, atac: {MTG_PREFIXES['atac']}). "
+            "Overrides --prefix and downloads every file under the prefix unless "
+            "--suffix or --file is given. Without it, --prefix is used as before."
+        ),
+    )
+    dl.add_argument(
         "--dest-root",
-        default="data",
+        default=None,
         type=Path,
-        help="Local destination root directory (default: %(default)s)",
+        help=f"Local data root directory (default: ${DATA_ROOT_ENV}, else data)",
     )
     dl.add_argument(
         "--no-progress",
@@ -206,6 +221,55 @@ def build_parser() -> argparse.ArgumentParser:
             "If omitted, the default contrast (0,0,0,0,0,0,0,1) is used."
         ),
     )
+
+    # pseudobulk command: MTG astrocyte donor-level RNA + ATAC pseudobulks
+    sub_pb = sub.add_parser(
+        "pseudobulk",
+        help="Build donor-level astrocyte pseudobulks from the MTG donor objects",
+        description=(
+            "Read the MTG RNA and/or ATAC donor objects one at a time, sum raw "
+            "counts over astrocyte nuclei per donor, and write count matrices, "
+            "the donor table with cohort flags, supertype composition, a cohort "
+            "summary and a run manifest."
+        ),
+    )
+    sub_pb.add_argument(
+        "--omic",
+        choices=["rna", "atac", "both"],
+        default="both",
+        help="Omic(s) to process (default: %(default)s)",
+    )
+    sub_pb.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
+    )
+    sub_pb.add_argument(
+        "--out-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Output directory (default: %(default)s)",
+    )
+    sub_pb.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Process only the first N donors (sorted, present in every selected "
+            "omic); marks the run partial"
+        ),
+    )
+    sub_pb.add_argument(
+        "--donors",
+        default=None,
+        help="Comma-separated donor IDs to process; marks the run partial",
+    )
+    sub_pb.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute donors already in the per-donor cache",
+    )
     return parser
 
 
@@ -216,17 +280,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "download":
         suffixes = _parse_suffixes(args.suffixes)
         files = _parse_suffixes(args.files)
-        paths: List[Path] = download_data(
-            prefix=args.prefix,
-            bucket=args.bucket,
-            suffixes=suffixes,
-            files=files,
-            dest_root=args.dest_root,
-            show_progress=not args.no_progress,
-        )
-        for p in paths:
-            print(p)
-        return 0
+        root = resolve_data_root(args.dest_root)
+        print(f"[download] Data root: {root.resolve()}")
+        if args.omic is None:
+            prefixes = [args.prefix]
+            if suffixes is None:
+                suffixes = [".csv", ".html"]
+        else:
+            omics = ["rna", "atac"] if args.omic == "both" else [args.omic]
+            prefixes = [MTG_PREFIXES[o] for o in omics]
+        n_down = n_skip = n_failed = 0
+        for prefix in prefixes:
+            prefix_files = files
+            if files and len(prefixes) > 1:
+                # With --omic both, route each file to the omic named in it
+                token = "RNAseq" if prefix == MTG_PREFIXES["rna"] else "ATACseq"
+                other = "ATACseq" if token == "RNAseq" else "RNAseq"
+                prefix_files = [f for f in files if token in f or other not in f]
+                if not prefix_files:
+                    continue
+            print(f"[download] Prefix: {prefix}")
+            paths = download_data(
+                prefix=prefix,
+                bucket=args.bucket,
+                suffixes=suffixes,
+                files=prefix_files,
+                dest_root=root,
+                show_progress=not args.no_progress,
+            )
+            for p in paths:
+                print(p)
+            if paths.manifest_path is not None:
+                print(f"[download] Manifest: {paths.manifest_path}")
+            n_down += len(paths)
+            n_skip += len(paths.skipped)
+            n_failed += len(paths.failed)
+        if len(prefixes) > 1:
+            print(f"[download] Total: {n_down} downloaded, {n_skip} skipped, {n_failed} failed")
+        return 1 if n_failed else 0
 
     if args.command == "subset":
         compression = None if (str(args.compression).lower() in {"none", "no", "false", "0"}) else args.compression
@@ -286,6 +377,23 @@ def main(argv: list[str] | None = None) -> int:
                 if pdf_p:
                     print(f"[de] {st} volcano: {pdf_p}")
         print("[de] Done.")
+        return 0
+
+    if args.command == "pseudobulk":
+        donors = _parse_suffixes([args.donors]) if args.donors else None
+        print("[pseudobulk] Building astrocyte donor pseudobulks...")
+        outputs = run_pseudobulk(
+            omic=args.omic,
+            data_root=args.data_root,
+            out_dir=args.out_dir,
+            limit=args.limit,
+            donors=donors,
+            force=args.force,
+        )
+        for name in ("rna_counts", "atac_counts", "donor_table", "supertype_composition", "cohort_summary", "manifest"):
+            if name in outputs:
+                print(f"[pseudobulk] Wrote {outputs[name]}")
+        print("[pseudobulk] Done.")
         return 0
 
     parser.error("Unknown command")
