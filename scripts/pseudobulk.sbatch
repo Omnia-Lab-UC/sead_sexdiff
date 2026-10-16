@@ -30,6 +30,7 @@ mkdir -p results/pseudobulk/logs
 
 export SEAD_DATA_ROOT="${SEAD_DATA_ROOT:-/home1/tgonza/sead_sexdiff/data}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export PYTHONUNBUFFERED=1  # per-donor progress reaches the log as it happens
 
 cli=.venv/bin/sead-sexdiff
 if [ ! -x "$cli" ]; then
