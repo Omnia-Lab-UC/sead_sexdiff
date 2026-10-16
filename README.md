@@ -8,9 +8,11 @@ Project layout:
 .
 ├── data/            # place raw/input data here (ignored by package build)
 ├── results/         # analysis outputs, figures, tables, etc.
+├── scripts/         # cluster sbatch wrapper and output sync helper
 ├── src/
 │   └── sead_sexdiff/
-│       └── __init__.py
+│       ├── cli.py
+│       └── data.py
 ├── pyproject.toml   # project configuration (uv/pip compatible)
 ├── LICENSE
 └── README.md
@@ -73,7 +75,102 @@ sead-sexdiff download --file public_datasets/SEA-AD-cell-annotation.2024-08-27.c
 sead-sexdiff download --dest-root ./data --bucket sea-ad-single-cell-profiling
 ```
 
-The command prints the local paths of files it downloaded. It uses anonymous S3 access for the public SEA-AD bucket and always attempts to fetch `Changelog.html` under the chosen prefix.
+The command prints the resolved data root and the local paths of files it downloaded. It uses anonymous S3 access for the public SEA-AD bucket and fetches `Changelog.html` under the chosen prefix when one exists.
+
+- Files already present locally at the remote size are skipped; a truncated file is re-downloaded. Each run reports downloaded / skipped / failed counts and bytes transferred, exits non-zero if any file failed, and updates `<root>/<prefix>/download_manifest.json` (S3 key, size, ETag, timestamp per file).
+
+### Data root
+
+Every command that reads or writes raw data resolves the data root as: the explicit flag (`download --dest-root`, `pseudobulk --data-root`), then the `SEAD_DATA_ROOT` environment variable, then `data/` in the current directory. Local paths mirror the S3 keys under that root. Set it once per machine, e.g. in `.envrc` or in the sbatch script:
+
+```
+export SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data
+```
+
+(The legacy `subset` command still takes an explicit `--folder`.)
+
+## MTG astrocyte donor pseudobulks (RNA + ATAC)
+
+Donor-level astrocyte pseudobulks from the SEA-AD middle temporal gyrus (MTG) releases, for the MOTCO case study.
+
+### Download the MTG donor objects
+
+`--omic` selects the MTG per-donor object prefix and downloads every file under it (~33 GB RNA, ~18 GB ATAC):
+
+| `--omic` | prefix | donors | release |
+|---|---|---|---|
+| `rna` | `MTG/RNAseq/donors_objects/` | 84 | 2026-06-22 |
+| `atac` | `MTG/ATACseq/donor_objects/` | 86 | 2024-12-06 |
+| `both` | both of the above | | |
+
+```
+sead-sexdiff download --omic both
+# a single donor (with --omic both, each --file goes to the omic named in it)
+sead-sexdiff download --omic atac --file H19.33.004_SEAAD_MTG_ATACseq_final-nuclei.2024-12-06.h5ad
+```
+
+Without `--omic`, `--prefix` and its default (`PFC/RNAseq/`, CSV and HTML files) behave as before.
+
+### Build the pseudobulks
+
+```
+sead-sexdiff pseudobulk --omic both               # full run
+sead-sexdiff pseudobulk --omic both --limit 2     # dry run on 2 donors present in both omics
+sead-sexdiff pseudobulk --donors H19.33.004,H21.33.020
+sead-sexdiff pseudobulk --force                   # recompute cached donors
+```
+
+Options: `--omic {rna,atac,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`), `--limit N`, `--donors id,...`, `--force`.
+
+What it does, per donor object (one file in memory at a time):
+
+- Excludes donors whose ADNC is `Reference`.
+- Selects astrocytes through the per-release taxonomy mapping `TAXONOMY` in `src/sead_sexdiff/data.py` (`Subclass == "Astrocyte"`, supertypes `Astro_1`–`Astro_5`, `Astro_6-SEAAD`). Any `Subclass` or astrocyte `Supertype` label not in the mapping stops the run.
+- RNA: sums the raw `UMIs` layer over astrocyte nuclei with ≥ 200 detected genes. ATAC: sums the raw peak counts in `X` over all astrocyte nuclei (release `final-nuclei` QC only). Both matrices are checked to be non-negative integers; no feature filtering or normalization.
+- Requires the same ordered feature set across donors of an omic.
+- Caches the result in `results/pseudobulk/per_donor/<omic>/<donor>.npz`; a rerun skips cached donors.
+
+Outputs in `results/pseudobulk/`:
+
+| file | content |
+|---|---|
+| `rna_counts.h5ad` | donors × 36,601 genes, int64 CSR raw UMI sums; `obs` = donor table, `var` = gene annotations |
+| `atac_counts.h5ad` | donors × 218,882 peaks, int64 CSR raw count sums; `obs` = donor table |
+| `donor_table.csv` | `donor_id`, `sex`, `adnc_raw`, `stage`, `n_rna`, `n_atac`, `cohort_30`, `cohort_50` (one row per non-Reference donor in either omic) |
+| `supertype_composition.csv` | `donor_id`, `omic`, `supertype`, `n_nuclei` (nuclei summed per donor × supertype) |
+| `cohort_summary.csv` | donors per sex × stage for each cohort, with totals |
+| `manifest.json` | release files (key, size, ETag), taxonomy mapping, QC, matrix source, excluded donors, thresholds, cohort counts vs preregistered, partial flag, software versions, git revision |
+
+Donor table rules (scientific choices; change only deliberately):
+
+- `stage`: `Not AD` and `Low` → `0`, `Intermediate` → `1`, `High` → `2`. Other values are an error.
+- Sex and ADNC must agree between the RNA and ATAC objects of a donor; sex must have exactly two labels (a warning only in partial runs).
+- `cohort_30` / `cohort_50`: ≥ 30 / ≥ 50 astrocyte nuclei in **both** omics.
+- A full run compares the cohorts with the preregistered counts (≥ 30: n = 80, F 11/10/28, M 9/10/12 over stages 0/1/2; ≥ 50: n = 74) and records any deviation under `findings` in the manifest. A cohort with an empty sex × stage cell is flagged as not analysable.
+
+### Cluster workflow (`cluster.ing.uc.cl`)
+
+The raw donor objects live once on the cluster; workstations only pull the derived outputs (~100 MB).
+
+```
+# once, on the login node
+git clone git@github.com:Omnia-Lab-UC/sead_sexdiff.git /home1/tgonza/sead_sexdiff
+cd /home1/tgonza/sead_sexdiff && ~/.local/bin/uv sync --locked
+
+# submit (download --omic both, then pseudobulk --omic both)
+mkdir -p results/pseudobulk/logs
+sbatch scripts/pseudobulk.sbatch
+```
+
+`scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. Resubmitting is safe: complete downloads and cached donors are skipped.
+
+On a workstation, pull the outputs (the per-donor cache is excluded unless `--with-cache`; extra arguments go to rsync):
+
+```
+scripts/sync_pseudobulk.sh -n          # dry run
+scripts/sync_pseudobulk.sh
+scripts/sync_pseudobulk.sh --with-cache
+```
 
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
@@ -166,6 +263,21 @@ downloaded_paths = download_data(
     prefix="PFC/RNAseq/donor_objects/",
     suffixes=None,  # None => download all files under the prefix
 )
+# a list of downloaded paths, with .skipped, .failed, .bytes_downloaded, .manifest_path
+```
+
+- MTG astrocyte pseudobulks (one donor, or the full run):
+
+```python
+from sead_sexdiff.data import pseudobulk_donor, run_pseudobulk
+
+rec = pseudobulk_donor(
+    "data/MTG/RNAseq/donors_objects/H19.33.004_SEAAD_MTG_RNAseq_final-nuclei.2026-06-22.h5ad",
+    "rna",
+)
+rec["row"], rec["n_nuclei"], rec["supertype_counts"]
+
+outputs = run_pseudobulk(omic="both", limit=2)
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:
