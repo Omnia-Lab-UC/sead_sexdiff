@@ -33,7 +33,7 @@
 ## 6. Cluster execution and sync
 
 - [x] 6.1 Write `scripts/pseudobulk.sbatch` (partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, runs `pseudobulk --omic both` after a login-node `download --omic both` (compute nodes are offline), logs under `results/pseudobulk/logs/`); verify with `sbatch --test-only` on the cluster
-- [ ] 6.2 Write `scripts/sync_pseudobulk.sh` (rsync of `results/pseudobulk/` from the cluster, excluding `per_donor/` by default with a flag to include it); verify a dry run (`-n`) lists the expected files
+- [x] 6.2 Write `scripts/sync_pseudobulk.sh` (rsync of `results/pseudobulk/` from the cluster, excluding `per_donor/` by default with a flag to include it); verify a dry run (`-n`) lists the expected files
 - [x] 6.3 Clone the repo on `ing` at `/home1/tgonza/sead_sexdiff`, run `uv sync --locked` there (uv may fetch Python 3.12), and verify `uv run sead-sexdiff pseudobulk --help` works on the login node
 
 ## 7. Documentation
@@ -44,5 +44,5 @@
 ## 8. Verification runs
 
 - [x] 8.1 Two-donor dry run on a workstation (`pseudobulk --omic both --limit 2`) and verify all outputs exist, the manifest is marked partial, and the composition totals match the donor table
-- [ ] 8.2 Full run on the cluster via `scripts/pseudobulk.sbatch`; verify 84 RNA and 86 ATAC donors processed, zero errors in the log, and the ≥30 cohort summary reports n = 80 (F 11/10/28, M 9/10/12) and the ≥50 cohort n = 74, with any deviation recorded in the manifest and reported to the user
-- [ ] 8.3 Sync outputs to the workstation with `scripts/sync_pseudobulk.sh` and verify `rna_counts.h5ad` and `atac_counts.h5ad` load, have the expected shapes, and total under ~150 MB
+- [x] 8.2 Full run on the cluster via `scripts/pseudobulk.sbatch`; verify 84 RNA and 86 ATAC donors processed, zero errors in the log, and the ≥30 cohort summary reports n = 80 (F 11/10/28, M 9/10/12) and the ≥50 cohort n = 74, with any deviation recorded in the manifest and reported to the user
+- [x] 8.3 Sync outputs to the workstation with `scripts/sync_pseudobulk.sh` and verify `rna_counts.h5ad` and `atac_counts.h5ad` load, have the expected shapes, and total under ~150 MB
