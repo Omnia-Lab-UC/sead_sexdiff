@@ -16,6 +16,9 @@ from .data import (
     DATA_ROOT_ENV,
     MTG_PREFIXES,
     resolve_data_root,
+    EXPORT_COHORTS,
+    run_covariates,
+    run_export,
     run_pseudobulk,
     write_subset_from_folder,
     pseudobulk_and_filter,
@@ -270,6 +273,82 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Recompute donors already in the per-donor cache",
     )
+
+    # covariates command: donor-level covariates from the MTG donor objects
+    sub_cov = sub.add_parser(
+        "covariates",
+        help="Write the donor covariate table from the MTG donor object metadata",
+        description=(
+            "Read Age at Death, PMI, RIN and education from the obs of every MTG "
+            "donor object (no matrices), code them numerically, cross-check RNA "
+            "against ATAC, and write donor_covariates.csv plus "
+            "covariates_manifest.json. Needs the raw donor objects (cluster)."
+        ),
+    )
+    sub_cov.add_argument(
+        "--omic",
+        choices=["rna", "both"],
+        default="both",
+        help="Read RNA only, or RNA plus the ATAC cross-check (default: %(default)s)",
+    )
+    sub_cov.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
+    )
+    sub_cov.add_argument(
+        "--out-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Output directory (default: %(default)s)",
+    )
+
+    # export command: MOTCO-ready blocks per cohort
+    sub_ex = sub.add_parser(
+        "export",
+        help="Preprocess the pseudobulks into MOTCO input blocks per cohort",
+        description=(
+            "Per cohort and omic: restrict to the cohort, drop chrX/Y/M, keep "
+            "features with CPM >= 1 in >= k donors (k = smallest sex x stage "
+            "cell), TMM log2-CPM (prior count 2), keep the 5,000 most variable "
+            "features. Writes rna.csv, atac.csv, metadata.csv, covariates.csv, "
+            "features_<omic>.csv and manifest.json. Reads only the pseudobulk "
+            "outputs plus the GENCODE annotation (downloaded once)."
+        ),
+    )
+    sub_ex.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Directory with the pseudobulk and covariates outputs (default: %(default)s)",
+    )
+    sub_ex.add_argument(
+        "--out-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_ex.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to export (default: %(default)s)",
+    )
+    sub_ex.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=(
+            "Data root holding <root>/annotation/ for the GENCODE GTF "
+            f"(default: ${DATA_ROOT_ENV}, else data)"
+        ),
+    )
+    sub_ex.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing cohort directories",
+    )
     return parser
 
 
@@ -394,6 +473,26 @@ def main(argv: list[str] | None = None) -> int:
             if name in outputs:
                 print(f"[pseudobulk] Wrote {outputs[name]}")
         print("[pseudobulk] Done.")
+        return 0
+
+    if args.command == "covariates":
+        print("[covariates] Reading donor covariates...")
+        outputs = run_covariates(omic=args.omic, data_root=args.data_root, out_dir=args.out_dir)
+        for name in ("covariates", "manifest"):
+            print(f"[covariates] Wrote {outputs[name]}")
+        print("[covariates] Done.")
+        return 0
+
+    if args.command == "export":
+        print("[export] Exporting MOTCO input blocks...")
+        run_export(
+            pseudobulk_dir=args.pseudobulk_dir,
+            out_dir=args.out_dir,
+            cohort=args.cohort,
+            data_root=args.data_root,
+            force=args.force,
+        )
+        print("[export] Done.")
         return 0
 
     parser.error("Unknown command")

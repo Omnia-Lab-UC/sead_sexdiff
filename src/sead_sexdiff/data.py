@@ -1715,6 +1715,953 @@ def run_pseudobulk(
     return {**outputs, "cohort_info": cohort_info, "findings": findings}
 
 
+# ---------------------------------------------------------------------------
+# MTG donor covariates (donor object metadata only)
+# ---------------------------------------------------------------------------
+
+# Source ``obs`` column → coded column of ``donor_covariates.csv``
+COVARIATE_COLUMNS: dict[str, str] = {
+    "Age at Death": "age_at_death",
+    "PMI": "pmi",
+    "RIN": "rin",
+    "Years of education": "years_education",
+    "Highest level of education": "education_level",
+}
+COVARIATE_NUMERIC = ["Age at Death", "PMI", "RIN", "Years of education"]
+# Columns read per omic (``RIN`` exists only in the RNA objects)
+COVARIATE_OMIC_COLUMNS: dict[str, list[str]] = {
+    "rna": list(COVARIATE_COLUMNS),
+    "atac": [c for c in COVARIATE_COLUMNS if c != "RIN"],
+}
+COVARIATE_CROSS_CHECK = ["Age at Death", "PMI", "Years of education", "Highest level of education"]
+COVARIATE_RTOL = 1e-9
+
+_CAPPED_RE = re.compile(r"^(\d+(?:\.\d+)?)\+$")
+# String forms of a missing value as read from ``obs`` (NaN → ``"nan"``)
+_MISSING_STRINGS = {"", "nan", "none", "<na>"}
+
+
+def read_donor_covariates(path: str | Path, omic: str) -> dict[str, str]:
+    """Read the donor-level covariate columns of one donor object.
+
+    Parameters
+    ----------
+    path:
+        Donor ``.h5ad`` object.
+    omic:
+        ``"rna"`` or ``"atac"``; selects the columns in ``COVARIATE_OMIC_COLUMNS``.
+
+    Returns
+    -------
+    dict
+        ``Donor ID`` and each covariate column → its single value, as a string.
+
+    Notes
+    -----
+    Only the listed ``obs`` columns are read; ``X`` and the layers are never
+    opened. A column holding more than one value fails with an error naming
+    the file and the column.
+    """
+    import h5py
+
+    path = Path(path)
+    columns = ["Donor ID"] + COVARIATE_OMIC_COLUMNS[omic]
+    with h5py.File(path, "r") as f:
+        obs = _read_obs_columns(f, columns, path)
+    return {c: _single_value(obs[c], path, c) for c in columns}
+
+
+def code_numeric(value: str, *, allow_cap: bool = False) -> tuple[float, bool]:
+    """Code one raw covariate value as a float.
+
+    Parameters
+    ----------
+    value:
+        Raw value as read from ``obs``.
+    allow_cap:
+        Accept the ``N+`` form (ages reported as ``90+``) and code it as ``N``.
+
+    Returns
+    -------
+    (float, bool)
+        The value (NaN when missing or non-numeric) and whether it was capped.
+    """
+    s = str(value).strip()
+    if allow_cap:
+        m = _CAPPED_RE.match(s)
+        if m:
+            return float(m.group(1)), True
+    try:
+        x = float(s)
+    except ValueError:
+        return float("nan"), False
+    return (x if np.isfinite(x) else float("nan")), False
+
+
+def _code_string(value: str) -> str | None:
+    s = str(value).strip()
+    return None if s.lower() in _MISSING_STRINGS else s
+
+
+def code_covariates(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], int]:
+    """Code raw RNA covariates into the ``donor_covariates.csv`` table.
+
+    Parameters
+    ----------
+    raw:
+        One row per donor with ``donor_id`` and the source columns of
+        ``COVARIATE_COLUMNS`` as strings.
+
+    Returns
+    -------
+    (pandas.DataFrame, list[dict], int)
+        The table (``donor_id``, ``age_at_death``, ``age_capped``, ``pmi``,
+        ``rin``, ``years_education``, ``education_level``) sorted by donor,
+        the missing values (``donor_id``, ``column``, ``raw``) and the number
+        of capped ages.
+
+    Notes
+    -----
+    Nothing is imputed: a value that does not parse is left missing and listed.
+    """
+    rows, missing = [], []
+    for rec in raw.sort_values("donor_id").to_dict("records"):
+        row = {"donor_id": rec["donor_id"]}
+        for src, name in COVARIATE_COLUMNS.items():
+            if src in COVARIATE_NUMERIC:
+                x, capped = code_numeric(rec[src], allow_cap=src == "Age at Death")
+                row[name] = x
+                if src == "Age at Death":
+                    row["age_capped"] = capped
+                if np.isnan(x):
+                    missing.append({"donor_id": rec["donor_id"], "column": name, "raw": rec[src]})
+            else:
+                s = _code_string(rec[src])
+                row[name] = s
+                if s is None:
+                    missing.append({"donor_id": rec["donor_id"], "column": name, "raw": rec[src]})
+        rows.append(row)
+    columns = ["donor_id", "age_at_death", "age_capped", "pmi", "rin", "years_education", "education_level"]
+    table = pd.DataFrame(rows, columns=columns)
+    return table, missing, int(table["age_capped"].sum())
+
+
+def cross_check_covariates(rna_raw: pd.DataFrame, atac_raw: pd.DataFrame) -> list[dict]:
+    """Compare the covariates shared by the RNA and ATAC objects of each donor.
+
+    Parameters
+    ----------
+    rna_raw, atac_raw:
+        Raw covariates per donor (``donor_id`` plus source columns, strings).
+
+    Returns
+    -------
+    list[dict]
+        One finding per disagreement: ``donor_id``, ``column``, ``rna``,
+        ``atac`` (raw values). The RNA value is the one used.
+
+    Notes
+    -----
+    Numeric columns are compared after coding (relative tolerance
+    ``COVARIATE_RTOL``, capped flag included), since the ATAC objects store
+    some of them as strings. Two missing values agree.
+    """
+    atac = atac_raw.set_index("donor_id")
+    findings = []
+    for rec in rna_raw.sort_values("donor_id").to_dict("records"):
+        donor = rec["donor_id"]
+        if donor not in atac.index:
+            continue
+        for col in COVARIATE_CROSS_CHECK:
+            a_val = atac.loc[donor, col]
+            if col in COVARIATE_NUMERIC:
+                cap = col == "Age at Death"
+                (x, cx), (y, cy) = code_numeric(rec[col], allow_cap=cap), code_numeric(a_val, allow_cap=cap)
+                same = cx == cy and (
+                    (np.isnan(x) and np.isnan(y))
+                    or bool(np.isclose(x, y, rtol=COVARIATE_RTOL, atol=0.0))
+                )
+            else:
+                same = _code_string(rec[col]) == _code_string(a_val)
+            if not same:
+                findings.append({"donor_id": donor, "column": col, "rna": rec[col], "atac": a_val})
+    return findings
+
+
+def run_covariates(
+    *,
+    omic: str = "both",
+    data_root: str | Path | None = None,
+    out_dir: str | Path = "results/pseudobulk",
+) -> dict:
+    """Write the donor covariate table and its manifest.
+
+    Parameters
+    ----------
+    omic:
+        ``"both"`` (RNA values, cross-checked against ATAC) or ``"rna"``
+        (no cross-check).
+    data_root:
+        Data root (resolved with :func:`resolve_data_root`).
+    out_dir:
+        Output directory (default ``results/pseudobulk``).
+
+    Returns
+    -------
+    dict
+        Paths ``covariates`` and ``manifest`` plus ``findings``.
+
+    Notes
+    -----
+    Outputs: ``donor_covariates.csv`` (one row per donor with an RNA object)
+    and ``covariates_manifest.json``.
+    """
+    if omic not in ("rna", "both"):
+        raise ValueError(f"omic must be 'rna' or 'both', not {omic!r}")
+    root = resolve_data_root(data_root)
+    out_dir = Path(out_dir)
+    omics = ["rna", "atac"] if omic == "both" else ["rna"]
+    print(f"[covariates] Data root: {root.resolve()}")
+    print(f"[covariates] Output directory: {out_dir}")
+
+    raw: dict[str, pd.DataFrame] = {}
+    files: dict[str, list[str]] = {}
+    for o in omics:
+        folder = root / MTG_PREFIXES[o]
+        paths = sorted(folder.glob("*_final-nuclei.*.h5ad"))
+        if not paths:
+            raise FileNotFoundError(f"No donor objects for {o} in {folder}")
+        recs = []
+        for i, p in enumerate(paths, 1):
+            rec = read_donor_covariates(p, o)
+            if rec["Donor ID"] != donor_id_of(p):
+                raise ValueError(f"{p.name}: obs Donor ID {rec['Donor ID']} differs from file name")
+            rec["donor_id"] = rec.pop("Donor ID")
+            recs.append(rec)
+            print(f"[covariates] {o} {i}/{len(paths)} {rec['donor_id']}")
+        raw[o] = pd.DataFrame(recs)
+        files[o] = [p.relative_to(root).as_posix() for p in paths]
+
+    table, missing, n_capped = code_covariates(raw["rna"])
+    if "atac" in raw:
+        findings = cross_check_covariates(raw["rna"], raw["atac"])
+        rna_ids, atac_ids = set(raw["rna"].donor_id), set(raw["atac"].donor_id)
+        cross_check = {
+            "done": True,
+            "columns": COVARIATE_CROSS_CHECK,
+            "rtol": COVARIATE_RTOL,
+            "n_compared": len(rna_ids & atac_ids),
+            "rna_only_donors": sorted(rna_ids - atac_ids),
+            "atac_only_donors": sorted(atac_ids - rna_ids),
+        }
+    else:
+        findings = []
+        cross_check = {"done": False, "note": "RNA-only run: no cross-omic check was done"}
+    warnings = [
+        f"{o}: {len(files[o])} donor objects read, expected {EXPECTED_DONORS[o]}"
+        for o in omics if len(files[o]) != EXPECTED_DONORS[o]
+    ]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {"covariates": out_dir / "donor_covariates.csv", "manifest": out_dir / "covariates_manifest.json"}
+    table.to_csv(outputs["covariates"], index=False)
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "partial": bool(warnings) or len(omics) < 2,
+        "git": _git_revision(),
+        "software": _software_versions(),
+        "data_root": str(root.resolve()),
+        "value_source": "rna",
+        "columns": {src: {"coded": name, "omics": [o for o in ("rna", "atac") if src in COVARIATE_OMIC_COLUMNS[o]]}
+                    for src, name in COVARIATE_COLUMNS.items()},
+        "coding": {
+            "numeric": [COVARIATE_COLUMNS[c] for c in COVARIATE_NUMERIC],
+            "string": ["education_level"],
+            "age_cap": "'N+' (regex ^(\\d+(?:\\.\\d+)?)\\+$ after strip) is coded N with age_capped = true",
+            "missing": "empty, nan, Unknown or any value float() cannot parse is left missing; nothing is imputed",
+            "single_value": "each column must hold exactly one value per donor object",
+        },
+        "objects_read": {o: {"n": len(files[o]), "n_expected": EXPECTED_DONORS[o], "files": files[o]} for o in omics},
+        "n_donors": int(len(table)),
+        "n_age_capped": n_capped,
+        "missing": missing,
+        "cross_check": cross_check,
+        "findings": findings,
+        "warnings": warnings,
+        "outputs": {k: v.name for k, v in outputs.items()},
+    }
+    outputs["manifest"].write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print(f"[covariates] {len(table)} donors, {n_capped} capped ages, {len(missing)} missing values")
+    for m in missing:
+        print(f"[covariates] Missing {m['column']} for {m['donor_id']} (raw {m['raw']!r})")
+    for f in findings:
+        print(f"[covariates] FINDING: {f['donor_id']} {f['column']}: RNA {f['rna']!r}, ATAC {f['atac']!r}")
+    for w in warnings:
+        print(f"[covariates] WARNING: {w}")
+    if not cross_check["done"]:
+        print(f"[covariates] {cross_check['note']}")
+    return {**outputs, "findings": findings}
+
+
+# ---------------------------------------------------------------------------
+# MOTCO input export (per-cohort preprocessing of the pseudobulks)
+# ---------------------------------------------------------------------------
+
+EXPORT_EXCLUDED_CHROMOSOMES = ("chrX", "chrY", "chrM")
+EXPORT_MIN_CPM = 1.0
+EXPORT_PRIOR_COUNT = 2.0
+EXPORT_TOP_N = 5000
+EXPORT_COHORTS = ("cohort_30", "cohort_50")
+STAGE_LABELS: dict[str, str] = {"0": "Not AD + Low", "1": "Intermediate", "2": "High"}
+# edgeR calcNormFactors(method = "TMM") defaults
+TMM_LOGRATIO_TRIM = 0.3
+TMM_SUM_TRIM = 0.05
+EXPORT_FLOAT_FORMAT = "%.10g"
+
+# GENCODE v32 = the annotation of the 10x GRCh38-2020-A reference (Cell Ranger 6.0)
+GENCODE_RELEASE = "32"
+GENCODE_URL = (
+    "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/"
+    "gencode.v32.basic.annotation.gtf.gz"
+)
+ANNOTATION_DIR = "annotation"
+UNMAPPED_CHROMOSOME = "unmapped"
+
+_PEAK_RE = re.compile(r"^(chr[0-9A-Za-z_]+):(\d+)-(\d+)$")
+_GENE_ID_RE = re.compile(r'gene_id "([^"]+)"')
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_gtf_gene_chromosomes(path: str | Path) -> dict[str, str]:
+    """Map version-stripped Ensembl gene ids to chromosomes from a GTF.
+
+    Parameters
+    ----------
+    path:
+        GENCODE GTF (gzip or plain).
+
+    Returns
+    -------
+    dict
+        ``gene_id`` (without ``.N`` version) → ``seqname``, from ``gene`` lines.
+
+    Notes
+    -----
+    GENCODE lists the pseudoautosomal genes twice, the chrY copy with a
+    ``_PAR_Y`` suffix; those copies are skipped so PAR genes map to chrX.
+    """
+    import gzip
+
+    path = Path(path)
+    opener = gzip.open if path.suffix == ".gz" else open
+    mapping: dict[str, str] = {}
+    with opener(path, "rt") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t", 8)
+            if len(fields) < 9 or fields[2] != "gene":
+                continue
+            m = _GENE_ID_RE.search(fields[8])
+            if m is None:
+                raise ValueError(f"{path.name}: gene line without gene_id: {line[:80]!r}")
+            gid = m.group(1)
+            if gid.endswith("_PAR_Y"):
+                continue
+            base = gid.split(".")[0]
+            if mapping.get(base, fields[0]) != fields[0]:
+                raise ValueError(f"{path.name}: gene {base} on {mapping[base]} and {fields[0]}")
+            mapping[base] = fields[0]
+    return mapping
+
+
+def resolve_gene_annotation(data_root: str | Path | None = None) -> tuple[dict[str, str], dict]:
+    """Return the GENCODE gene → chromosome map, downloading the GTF once.
+
+    Parameters
+    ----------
+    data_root:
+        Data root (resolved with :func:`resolve_data_root`). The GTF lives at
+        ``<root>/annotation/gencode.v32.basic.annotation.gtf.gz``.
+
+    Returns
+    -------
+    (dict, dict)
+        The map from :func:`parse_gtf_gene_chromosomes` and its provenance
+        (``source_url``, ``release``, ``file``, ``sha256``, ``n_genes``,
+        ``downloaded``).
+    """
+    import urllib.request
+
+    root = resolve_data_root(data_root)
+    path = root / ANNOTATION_DIR / GENCODE_URL.rsplit("/", 1)[1]
+    downloaded = False
+    if not path.exists():
+        print(f"[export] Downloading {GENCODE_URL}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".part")
+        urllib.request.urlretrieve(GENCODE_URL, tmp)
+        os.replace(tmp, path)
+        downloaded = True
+    mapping = parse_gtf_gene_chromosomes(path)
+    info = {
+        "source_url": GENCODE_URL,
+        "release": f"GENCODE v{GENCODE_RELEASE} basic",
+        "file": str(path.resolve()),
+        "sha256": _sha256_file(path),
+        "n_genes": len(mapping),
+        "downloaded": downloaded,
+    }
+    return mapping, info
+
+
+def rna_chromosomes(gene_ids: Iterable[str], mapping: dict[str, str]) -> np.ndarray:
+    """Chromosome per gene (``"unmapped"`` when absent from the annotation)."""
+    return np.array(
+        [mapping.get(str(g).split(".")[0], UNMAPPED_CHROMOSOME) for g in gene_ids], dtype=object
+    )
+
+
+def atac_chromosomes(names: Iterable[str]) -> np.ndarray:
+    """Chromosome per peak, parsed from ``chrN:start-end`` names.
+
+    Raises
+    ------
+    ValueError
+        On any name that does not parse, naming the first one.
+    """
+    names = [str(n) for n in names]
+    out, bad = [], []
+    for n in names:
+        m = _PEAK_RE.match(n)
+        if m is None:
+            bad.append(n)
+            out.append(None)
+        else:
+            out.append(m.group(1))
+    if bad:
+        raise ValueError(f"{len(bad)} peak name(s) do not parse as chrN:start-end, e.g. {bad[0]!r}")
+    return np.array(out, dtype=object)
+
+
+def _tmm_pair(
+    obs: np.ndarray, ref: np.ndarray, n_o: float, n_r: float,
+    *, logratio_trim: float, sum_trim: float,
+) -> float:
+    """edgeR ``.calcFactorTMM`` for one sample against the reference."""
+    from scipy.stats import rankdata
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_r = np.log2((obs / n_o) / (ref / n_r))
+        abs_e = (np.log2(obs / n_o) + np.log2(ref / n_r)) / 2
+        v = (n_o - obs) / n_o / obs + (n_r - ref) / n_r / ref
+    fin = np.isfinite(log_r) & np.isfinite(abs_e) & (abs_e > -1e10)
+    log_r, abs_e, v = log_r[fin], abs_e[fin], v[fin]
+    if log_r.size == 0:
+        return 1.0
+    if np.max(np.abs(log_r)) < 1e-6:
+        return 1.0
+    n = log_r.size
+    lo_l = np.floor(n * logratio_trim) + 1
+    hi_l = n + 1 - lo_l
+    lo_s = np.floor(n * sum_trim) + 1
+    hi_s = n + 1 - lo_s
+    r_l, r_a = rankdata(log_r), rankdata(abs_e)
+    keep = (r_l >= lo_l) & (r_l <= hi_l) & (r_a >= lo_s) & (r_a <= hi_s)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = 1 / v[keep]
+        num, den = log_r[keep] * w, w
+        ok = np.isfinite(num) & np.isfinite(den)
+        f = np.sum(num[ok]) / np.sum(den[ok])
+    if not np.isfinite(f):
+        f = 0.0
+    return float(2.0 ** f)
+
+
+def tmm_factors(
+    counts: np.ndarray,
+    *,
+    lib_size: np.ndarray | None = None,
+    logratio_trim: float = TMM_LOGRATIO_TRIM,
+    sum_trim: float = TMM_SUM_TRIM,
+) -> np.ndarray:
+    """TMM normalization factors, following edgeR ``calcNormFactors(method = "TMM")``.
+
+    Parameters
+    ----------
+    counts:
+        Samples × features count matrix.
+    lib_size:
+        Library size per sample (default: row sums of ``counts``).
+    logratio_trim, sum_trim:
+        Trimming fractions for the M and A values (edgeR defaults 0.3, 0.05).
+
+    Returns
+    -------
+    numpy.ndarray
+        One factor per sample, rescaled to a geometric mean of 1.
+
+    Notes
+    -----
+    The reference sample is the one whose upper-quartile factor is closest to
+    the mean; M values are precision-weighted (delta method). Features with
+    zero counts in every sample are dropped first, as in edgeR.
+    """
+    x = np.asarray(counts, dtype=float)
+    lib = x.sum(axis=1) if lib_size is None else np.asarray(lib_size, dtype=float)
+    x = x[:, (x > 0).any(axis=0)]
+    n = x.shape[0]
+    if x.shape[1] == 0 or n == 1:
+        return np.ones(n)
+    f75 = np.quantile(x, 0.75, axis=1) / lib
+    if np.median(f75) < 1e-20:
+        ref = int(np.argmax(np.sqrt(x).sum(axis=1)))
+    else:
+        ref = int(np.argmin(np.abs(f75 - f75.mean())))
+    f = np.array([
+        _tmm_pair(x[i], x[ref], lib[i], lib[ref], logratio_trim=logratio_trim, sum_trim=sum_trim)
+        for i in range(n)
+    ])
+    return f / np.exp(np.mean(np.log(f)))
+
+
+def log_cpm(counts: np.ndarray, lib_size: np.ndarray, *, prior_count: float = EXPORT_PRIOR_COUNT) -> np.ndarray:
+    """log2-CPM with edgeR ``cpm(y, log = TRUE, prior.count)`` semantics.
+
+    Parameters
+    ----------
+    counts:
+        Samples × features count matrix.
+    lib_size:
+        Effective library size per sample (total count × TMM factor).
+    prior_count:
+        Average prior count; each sample gets ``prior_count · L / mean(L)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``log2((count + p) / (L + 2p) · 1e6)``, samples × features.
+    """
+    x = np.asarray(counts, dtype=float)
+    lib = np.asarray(lib_size, dtype=float)
+    prior = prior_count * lib / lib.mean()
+    adj = np.log(lib + 2 * prior)
+    return (np.log(x + prior[:, None]) - adj[:, None] + np.log(1e6)) / np.log(2)
+
+
+def smallest_cell(table: pd.DataFrame) -> tuple[int, str, dict]:
+    """Size and name of the smallest sex × stage cell of a cohort's donors."""
+    cells = {
+        f"{sex}/stage {st}": int(((table.sex == sex) & (table.stage == st)).sum())
+        for sex in sorted(table.sex.unique()) for st in STAGES
+    }
+    name = min(cells, key=lambda c: (cells[c], c))
+    return cells[name], name, cells
+
+
+def preprocess_block(
+    counts: np.ndarray,
+    names: np.ndarray,
+    chromosomes: np.ndarray,
+    *,
+    k: int,
+    min_cpm: float = EXPORT_MIN_CPM,
+    prior_count: float = EXPORT_PRIOR_COUNT,
+    top_n: int = EXPORT_TOP_N,
+    excluded_chromosomes: Iterable[str] = EXPORT_EXCLUDED_CHROMOSOMES,
+) -> dict:
+    """Preprocess one omic block of one cohort (steps 2–6 of the export).
+
+    Parameters
+    ----------
+    counts:
+        Cohort donors × features raw counts (step 1 already applied).
+    names, chromosomes:
+        Feature names and chromosome per feature.
+    k:
+        Minimum number of donors with CPM ≥ ``min_cpm`` (smallest sex × stage cell).
+    min_cpm, prior_count, top_n, excluded_chromosomes:
+        Thresholds; defaults are the module constants.
+
+    Returns
+    -------
+    dict
+        ``values`` (donors × kept features, log2-CPM, input feature order),
+        ``kept`` (names), ``status`` and ``variance`` per input feature,
+        ``steps`` (feature counts after each step), ``removed_by_chromosome``,
+        ``lib_size_filter``, ``lib_size``, ``tmm_factors``,
+        ``mean_log_cpm_range`` of the kept features, ``findings``, and the
+        filtered ``filtered_counts`` / ``filtered_log_cpm`` / ``filtered_names``.
+
+    Notes
+    -----
+    Labels are never used: ``k`` is the only cohort-derived input.
+    """
+    counts = np.asarray(counts, dtype=float)
+    names = np.asarray(names, dtype=str)
+    chromosomes = np.asarray(chromosomes, dtype=object)
+    n_feat = counts.shape[1]
+    excluded = tuple(excluded_chromosomes)
+    status = np.full(n_feat, "kept", dtype=object)
+    variance = np.full(n_feat, np.nan)
+    findings: list[str] = []
+
+    # (2) sex chromosomes
+    on_sex = np.isin(chromosomes, excluded)
+    status[on_sex] = "sex_chromosome"
+    removed_by_chrom = {c: int((chromosomes == c).sum()) for c in excluded}
+    idx2 = np.flatnonzero(~on_sex)
+
+    # (3) abundance: CPM over the post-chromosome library sizes
+    c2 = counts[:, idx2]
+    lib_filter = c2.sum(axis=1)
+    cpm = c2 / lib_filter[:, None] * 1e6
+    passes = (cpm >= min_cpm).sum(axis=0) >= k
+    status[idx2[~passes]] = "abundance"
+    idx3 = idx2[passes]
+
+    # (4) TMM on the filtered counts, (5) log2-CPM
+    c3 = counts[:, idx3]
+    lib = c3.sum(axis=1)
+    factors = tmm_factors(c3, lib_size=lib)
+    lcpm = log_cpm(c3, lib * factors, prior_count=prior_count)
+
+    # (6) top-N by population variance, ties by name; output keeps input order
+    var3 = lcpm.var(axis=0, ddof=0)
+    variance[idx3] = var3
+    order = np.lexsort((names[idx3], -var3))
+    if idx3.size < top_n:
+        findings.append(f"only {idx3.size} features pass the abundance filter (< N = {top_n}); all are kept")
+    sel = np.sort(order[:top_n])
+    dropped = np.setdiff1d(np.arange(idx3.size), sel)
+    status[idx3[dropped]] = "variance"
+    values = lcpm[:, sel]
+    if not np.all(np.isfinite(values)):
+        raise ValueError("log2-CPM contains non-finite values")
+
+    mean_lcpm = values.mean(axis=0) if values.size else np.array([np.nan])
+    return {
+        "values": values,
+        "kept": names[idx3[sel]],
+        "status": status,
+        "variance": variance,
+        "steps": {
+            "input": int(n_feat),
+            "after_sex_chromosome": int(idx2.size),
+            "after_abundance": int(idx3.size),
+            "after_variance": int(sel.size),
+        },
+        "removed_by_chromosome": removed_by_chrom,
+        "lib_size_filter": lib_filter,
+        "lib_size": lib,
+        "tmm_factors": factors,
+        "mean_log_cpm_range": [float(np.min(mean_lcpm)), float(np.max(mean_lcpm))],
+        "findings": findings,
+        "filtered_counts": c3,
+        "filtered_log_cpm": lcpm,
+        "filtered_names": names[idx3],
+    }
+
+
+_EXPORT_INPUTS = {
+    "rna_counts.h5ad": "pseudobulk",
+    "atac_counts.h5ad": "pseudobulk",
+    "donor_table.csv": "pseudobulk",
+    "manifest.json": "pseudobulk",
+    "donor_covariates.csv": "covariates",
+}
+
+
+def check_export_inputs(pseudobulk_dir: str | Path, cohorts: Iterable[str]) -> dict:
+    """Validate the pseudobulk directory before exporting; return its manifest.
+
+    Raises
+    ------
+    FileNotFoundError
+        A required file is missing (naming the command that produces it).
+    ValueError
+        The pseudobulk run is partial, or a cohort is unknown or not analysable.
+    """
+    pb = Path(pseudobulk_dir)
+    for name, command in _EXPORT_INPUTS.items():
+        if not (pb / name).exists():
+            raise FileNotFoundError(
+                f"{pb / name} is missing; run `sead-sexdiff {command}` (and sync) to produce it"
+            )
+    manifest = json.loads((pb / "manifest.json").read_text())
+    if manifest.get("partial", True):
+        raise ValueError(f"{pb / 'manifest.json'}: the pseudobulk run is partial; export needs a full run")
+    for cohort in cohorts:
+        info = manifest.get("cohorts", {}).get(cohort)
+        if info is None:
+            raise ValueError(f"{pb / 'manifest.json'}: no cohort {cohort!r}")
+        if not info.get("analysable", False):
+            raise ValueError(
+                f"Cohort {cohort} is marked not analysable in {pb / 'manifest.json'} "
+                f"(empty cells: {info.get('empty_cells')})"
+            )
+    return manifest
+
+
+def _features_frame(names, chromosomes, res: dict, gene_ids=None) -> pd.DataFrame:
+    df = pd.DataFrame({"feature": names})
+    if gene_ids is not None:
+        df["gene_id"] = gene_ids
+    df["chromosome"] = chromosomes
+    df["status"] = res["status"]
+    df["variance"] = res["variance"]
+    return df
+
+
+def run_export(
+    *,
+    pseudobulk_dir: str | Path = "results/pseudobulk",
+    out_dir: str | Path = "results/motco_input",
+    cohort: str = "all",
+    data_root: str | Path | None = None,
+    force: bool = False,
+    debug_dir: str | Path | None = None,
+) -> dict:
+    """Export MOTCO-ready RNA and ATAC blocks per cohort.
+
+    Parameters
+    ----------
+    pseudobulk_dir:
+        Output directory of ``pseudobulk`` and ``covariates``.
+    out_dir:
+        Export root; each cohort goes to ``<out_dir>/<cohort>/``.
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    data_root:
+        Data root holding (or receiving) the gene annotation.
+    force:
+        Replace existing cohort directories.
+    debug_dir:
+        If given, also write the filtered counts, TMM factors and filtered
+        log2-CPM per cohort and omic there (for ``scripts/check_tmm_edger.R``).
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir": Path, "steps": {omic: counts}, "findings": [...]}``.
+
+    Notes
+    -----
+    Per cohort and omic: restrict to the cohort → drop chrX/Y/M → CPM ≥ 1 in
+    ≥ k donors → TMM → log2-CPM (prior 2) → top N by variance. Covariates are
+    exported alongside, not applied. Each cohort is written to
+    ``<cohort>.tmp/`` and renamed when complete.
+    """
+    import shutil
+    import scipy.sparse as sp
+
+    pb = Path(pseudobulk_dir)
+    out_dir = Path(out_dir)
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    pb_manifest = check_export_inputs(pb, cohorts)
+    for c in cohorts:
+        if (out_dir / c).exists() and not force:
+            raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+    print(f"[export] Pseudobulk directory: {pb}")
+    print(f"[export] Output directory: {out_dir}")
+
+    mapping, annotation = resolve_gene_annotation(data_root)
+    print(f"[export] Annotation: {annotation['release']} ({annotation['n_genes']} genes, sha256 {annotation['sha256'][:12]}…)")
+
+    table = pd.read_csv(pb / "donor_table.csv", dtype={"donor_id": str, "stage": str, "sex": str})
+    covariates = pd.read_csv(pb / "donor_covariates.csv", dtype={"donor_id": str, "education_level": str})
+    blocks = {}
+    for o in ("rna", "atac"):
+        a = ad.read_h5ad(pb / f"{o}_counts.h5ad")
+        X = sp.csr_matrix(a.X)
+        if o == "rna":
+            gene_ids = a.var["gene_ids"].astype(str).to_numpy()
+            chrom = rna_chromosomes(gene_ids, mapping)
+        else:
+            gene_ids = None
+            chrom = atac_chromosomes(a.var_names)
+        blocks[o] = {
+            "X": X, "donors": a.obs_names.astype(str).to_numpy(),
+            "names": a.var_names.astype(str).to_numpy(), "gene_ids": gene_ids, "chrom": chrom,
+        }
+        del a
+    n_unmapped = int((blocks["rna"]["chrom"] == UNMAPPED_CHROMOSOME).sum())
+    annotation["n_rna_genes"] = int(blocks["rna"]["names"].size)
+    annotation["n_rna_unmapped"] = n_unmapped
+    global_findings = []
+    if n_unmapped:
+        global_findings.append(
+            f"rna: {n_unmapped} of {blocks['rna']['names'].size} genes are absent from "
+            f"{annotation['release']}; they are kept (chromosome '{UNMAPPED_CHROMOSOME}')"
+        )
+    pb_manifest_sha = _sha256_file(pb / "manifest.json")
+    cov_manifest = pb / "covariates_manifest.json"
+
+    results = {}
+    for c in cohorts:
+        sub = table[table[c].astype(bool)].sort_values("donor_id").reset_index(drop=True)
+        donors = sub["donor_id"].to_numpy()
+        missing_cov = sorted(set(donors) - set(covariates.donor_id))
+        if missing_cov:
+            raise ValueError(f"{pb / 'donor_covariates.csv'}: no row for cohort {c} donor(s) {missing_cov}")
+        k, k_cell, cells = smallest_cell(sub)
+        print(f"[export] {c}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
+        findings = list(global_findings)
+        res = {}
+        for o, blk in blocks.items():
+            pos = pd.Index(blk["donors"]).get_indexer(donors)
+            if (pos < 0).any():
+                raise ValueError(f"{o}_counts.h5ad lacks cohort {c} donor(s) {list(donors[pos < 0])}")
+            counts = blk["X"][pos].toarray()
+            res[o] = preprocess_block(counts, blk["names"], blk["chrom"], k=k)
+            findings += [f"{o}: {msg}" for msg in res[o]["findings"]]
+            s = res[o]["steps"]
+            print(f"[export] {c} {o}: {s['input']} → {s['after_sex_chromosome']} → "
+                  f"{s['after_abundance']} → {s['after_variance']}")
+            if debug_dir is not None:
+                _write_debug(Path(debug_dir), c, o, donors, res[o])
+
+        tmp = out_dir / f"{c}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        for o in ("rna", "atac"):
+            df = pd.DataFrame(res[o]["values"], index=pd.Index(donors, name="donor_id"), columns=res[o]["kept"])
+            df.to_csv(tmp / f"{o}.csv", float_format=EXPORT_FLOAT_FORMAT)
+            _features_frame(blocks[o]["names"], blocks[o]["chrom"], res[o], blocks[o]["gene_ids"]).to_csv(
+                tmp / f"features_{o}.csv", index=False, float_format=EXPORT_FLOAT_FORMAT
+            )
+        meta = pd.DataFrame({
+            "donor_id": donors,
+            "sex": sub["sex"].to_numpy(),
+            "stage": sub["stage"].to_numpy(),
+            "stage_label": sub["stage"].map(STAGE_LABELS).to_numpy(),
+        })
+        meta.to_csv(tmp / "metadata.csv", index=False)
+        cov = covariates.set_index("donor_id").loc[donors].reset_index()
+        cov["n_rna"] = sub["n_rna"].to_numpy()
+        cov["n_atac"] = sub["n_atac"].to_numpy()
+        cov.to_csv(tmp / "covariates.csv", index=False)
+
+        cov_cols = [col for col in cov.columns if col not in ("donor_id", "age_capped")]
+        missingness = {
+            col: sorted(cov.loc[cov[col].isna(), "donor_id"]) for col in cov_cols
+        }
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cohort": c,
+            "n_donors": int(len(donors)),
+            "blocks": {
+                o: {"file": f"{o}.csv", "units": "log2-CPM", "motco_transform": "identity",
+                    "n_features": int(res[o]["values"].shape[1]), "features_file": f"features_{o}.csv"}
+                for o in ("rna", "atac")
+            },
+            "metadata": {
+                "file": "metadata.csv",
+                "sample_col": "donor_id",
+                "group_col": "sex",
+                "group_labels": sorted(sub["sex"].unique()),
+                "stage_col": "stage",
+                "stage_order": STAGES,
+                "stage_labels": STAGE_LABELS,
+                "cells": cells,
+            },
+            "preprocessing_order": [
+                "restrict to cohort donors",
+                "remove features on excluded chromosomes",
+                "keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome removal)",
+                "TMM factors on the filtered counts (library size = filtered column sums)",
+                "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
+                "keep the N features with the highest population variance (ddof 0), ties by name; input order kept",
+            ],
+            "thresholds": {
+                "excluded_chromosomes": list(EXPORT_EXCLUDED_CHROMOSOMES),
+                "min_cpm": EXPORT_MIN_CPM,
+                "k": k,
+                "k_source_cell": k_cell,
+                "prior_count": EXPORT_PRIOR_COUNT,
+                "N": EXPORT_TOP_N,
+                "tmm": {"logratio_trim": TMM_LOGRATIO_TRIM, "sum_trim": TMM_SUM_TRIM,
+                        "weighting": True, "reference": "upper-quartile factor closest to the mean"},
+                "float_format": EXPORT_FLOAT_FORMAT,
+            },
+            "feature_counts": {o: res[o]["steps"] for o in ("rna", "atac")},
+            "removed_by_chromosome": {o: res[o]["removed_by_chromosome"] for o in ("rna", "atac")},
+            "kept_mean_log_cpm_range": {o: res[o]["mean_log_cpm_range"] for o in ("rna", "atac")},
+            "tmm": {
+                o: {
+                    d: {"lib_size_filter": int(res[o]["lib_size_filter"][i]),
+                        "lib_size": int(res[o]["lib_size"][i]),
+                        "factor": float(res[o]["tmm_factors"][i])}
+                    for i, d in enumerate(donors)
+                }
+                for o in ("rna", "atac")
+            },
+            "annotation": annotation,
+            "input": {
+                "pseudobulk_dir": str(pb.resolve()),
+                "pseudobulk_manifest_sha256": pb_manifest_sha,
+                "pseudobulk_manifest_created_at": pb_manifest.get("created_at"),
+                "covariates_manifest_sha256": _sha256_file(cov_manifest) if cov_manifest.exists() else None,
+            },
+            "covariates": {
+                "file": "covariates.csv",
+                "applied": False,
+                "note": "covariates exported, not applied (adjustment belongs to MOTCO)",
+                "missing": missingness,
+                "n_age_capped": int(cov["age_capped"].astype(bool).sum()),
+            },
+            "software": _software_versions(),
+            "git": _git_revision(),
+            "findings": findings,
+        }
+        (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        final = out_dir / c
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(tmp, final)
+        print(f"[export] Wrote {final}")
+        for msg in findings:
+            print(f"[export] FINDING: {c}: {msg}")
+        results[c] = {"dir": final, "steps": manifest["feature_counts"], "findings": findings}
+
+    print("[export] Features after each step:")
+    rows = [
+        {"cohort": c, "omic": o, **steps}
+        for c, r in results.items() for o, steps in r["steps"].items()
+    ]
+    print(pd.DataFrame(rows).to_string(index=False))
+    return results
+
+
+def _write_debug(debug_dir: Path, cohort: str, omic: str, donors: np.ndarray, res: dict) -> None:
+    """Write filtered counts, TMM factors and log2-CPM for the edgeR cross-check."""
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stem = debug_dir / f"{cohort}_{omic}"
+    idx = pd.Index(donors, name="donor_id")
+    pd.DataFrame(res["filtered_counts"].astype(np.int64), index=idx, columns=res["filtered_names"]).to_csv(
+        f"{stem}_counts.csv"
+    )
+    pd.DataFrame({"lib_size": res["lib_size"], "factor": res["tmm_factors"]}, index=idx).to_csv(
+        f"{stem}_tmm.csv", float_format="%.17g"
+    )
+    pd.DataFrame(res["filtered_log_cpm"], index=idx, columns=res["filtered_names"]).to_csv(
+        f"{stem}_logcpm.csv", float_format="%.17g"
+    )
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -1731,4 +2678,9 @@ __all__ = [
     "build_donor_table",
     "summarize_cohorts",
     "run_pseudobulk",
+    "run_covariates",
+    "tmm_factors",
+    "log_cpm",
+    "preprocess_block",
+    "run_export",
 ]

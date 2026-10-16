@@ -29,8 +29,18 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `results/pseudobulk/` (`rna_counts.h5ad`, `atac_counts.h5ad`,
    `donor_table.csv`, `supertype_composition.csv`, `cohort_summary.csv`,
    `manifest.json`), with a resumable per-donor cache in `per_donor/`.
-   Counts stay raw: transforms, feature filters and the MOTCO export are
-   separate, later steps.
+   Counts stay raw: transforms and feature filters happen in `export`.
+3. `covariates` – read donor-level `obs` columns (age, PMI, RIN, education)
+   from the raw donor objects without loading matrices, code them
+   numerically (`90+` → 90, flagged), cross-check RNA against ATAC, and write
+   `results/pseudobulk/donor_covariates.csv` + `covariates_manifest.json`.
+   Runs on the cluster login node (needs the raw objects; seconds per file).
+4. `export` – from `results/pseudobulk/` only (any workstation), per cohort:
+   drop chrX/Y/M → CPM ≥ 1 in ≥ k donors → TMM → log2-CPM → top 5,000 by
+   variance per omic, writing `results/motco_input/<cohort>/` (`rna.csv`,
+   `atac.csv`, `metadata.csv`, `covariates.csv`, `features_<omic>.csv`,
+   `manifest.json`). Covariates are exported, not applied: adjustment is a
+   MOTCO change.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -43,8 +53,9 @@ when behavior or defaults change.
   pseudobulk, differential expression.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
-- `scripts/` – `pseudobulk.sbatch` (cluster job) and `sync_pseudobulk.sh`
-  (rsync of `results/pseudobulk/` to a workstation).
+- `scripts/` – `pseudobulk.sbatch` (cluster job), `sync_pseudobulk.sh`
+  (rsync of `results/pseudobulk/` to a workstation) and `check_tmm_edger.R`
+  (one-off edgeR cross-check of the export's TMM / log2-CPM).
 - `data/`, `results/` – gitignored; never commit their contents.
 - `openspec/` – OpenSpec change proposals/specs (see below).
 
@@ -52,14 +63,15 @@ when behavior or defaults change.
 
 - Python `>=3.12,<3.14`, managed with **uv** (`uv.lock` is committed).
 - Setup: the Nix flake (`flake.nix`) provides Python 3.12, uv, R, and the R
-  packages used by `DEG.R`; its shell hook runs `uv sync --locked`. Enter it
+  packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|subset|de> [options]`.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
-- Data root: explicit flag (`download --dest-root`, `pseudobulk --data-root`)
-  → `SEAD_DATA_ROOT` → `data/`. Machines differ only by this value.
+- Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)
+  → `SEAD_DATA_ROOT` → `data/`. Machines differ only by this value. `export`
+  uses it only for `<root>/annotation/` (GENCODE GTF, downloaded once).
 - Add dependencies with `uv add <pkg>` so `pyproject.toml` and `uv.lock` stay
   consistent.
 - There is no test suite or linter configured yet. Verify changes by running
@@ -90,6 +102,18 @@ when behavior or defaults change.
   - `COHORT_THRESHOLDS` (≥ 30 / ≥ 50 astrocyte nuclei in both omics) and
     `PREREGISTERED_COHORTS` (≥ 30: n = 80, F 11/10/28, M 9/10/12; ≥ 50:
     n = 74). Deviations go to `manifest.json` `findings`, never silently.
+- Covariate coding (`COVARIATE_COLUMNS`, `COVARIATE_CROSS_CHECK`): RNA values
+  are used; `N+` ages are capped and flagged; non-numeric values stay missing
+  and are listed; nothing is imputed.
+- MOTCO export constants (flag and ask before changing any of them):
+  `EXPORT_EXCLUDED_CHROMOSOMES` (chrX/Y/M; sex is the group),
+  `EXPORT_MIN_CPM` (1, in ≥ k donors, k = smallest sex × stage cell, computed
+  per cohort), TMM (edgeR defaults `TMM_LOGRATIO_TRIM` / `TMM_SUM_TRIM`),
+  `EXPORT_PRIOR_COUNT` (2), `EXPORT_TOP_N` (5,000 per block, equal N because
+  MOTCO z-scores features without block weights), `EXPORT_COHORTS`,
+  `STAGE_LABELS`, `GENCODE_RELEASE` (v32 basic, matching 10x GRCh38-2020-A).
+  No step may use sex, stage or covariates. Changes to the numpy TMM must be
+  re-checked with `scripts/check_tmm_edger.R`.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
@@ -107,6 +131,8 @@ when behavior or defaults change.
 - Compute nodes have no internet access: run `download --omic both` on the
   login node (nohup), then `scripts/pseudobulk.sbatch` runs
   `pseudobulk --omic both` as one sequential job; resubmitting resumes.
+  `covariates --omic both` reads metadata only and runs directly on the login
+  node.
 - Workstations pull only `results/pseudobulk/` with
   `scripts/sync_pseudobulk.sh`; never copy raw donor objects around.
 

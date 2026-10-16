@@ -30,6 +30,7 @@
               rPackages.SingleCellExperiment
               rPackages.MAST
               rPackages.anndataR
+              rPackages.edgeR
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
