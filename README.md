@@ -176,6 +176,83 @@ scripts/sync_pseudobulk.sh
 scripts/sync_pseudobulk.sh --with-cache
 ```
 
+### Donor covariates
+
+```
+sead-sexdiff covariates                 # RNA values, cross-checked against ATAC
+sead-sexdiff covariates --omic rna      # RNA only, no cross-check
+```
+
+Options: `--omic {rna,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`).
+
+Reads only `obs` columns of every MTG donor object (no matrices; seconds per file), so it needs the raw objects and runs on the cluster login node:
+
+```
+cd /home1/tgonza/sead_sexdiff && git pull && ~/.local/bin/uv sync --locked
+SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data .venv/bin/sead-sexdiff covariates --omic both
+```
+
+Its outputs land in `results/pseudobulk/`, so `scripts/sync_pseudobulk.sh` carries them to the workstations.
+
+| source `obs` column | coded column | omics |
+|---|---|---|
+| `Age at Death` | `age_at_death`, `age_capped` | RNA, ATAC |
+| `PMI` | `pmi` | RNA, ATAC |
+| `RIN` | `rin` | RNA |
+| `Years of education` | `years_education` | RNA, ATAC |
+| `Highest level of education` | `education_level` (string) | RNA, ATAC |
+
+- `donor_covariates.csv`: one row per donor with an RNA object. Each column must hold one value per donor object, otherwise the run fails naming the file and column.
+- Coding: an `N+` age (e.g. `90+`) becomes `N` with `age_capped = True`; empty, `nan`, `Unknown` or any other non-numeric value in a numeric column is left missing and listed in the manifest. Nothing is imputed.
+- RNA values are used. With `--omic both`, the shared columns are compared with the ATAC object (numeric columns after coding, relative tolerance 1e-9); each disagreement is recorded under `findings`, and the run continues.
+- `covariates_manifest.json`: columns and coding rules, objects read per omic, missing values, capped-age count, cross-check summary, findings, software versions and git revision.
+
+### MOTCO input export
+
+```
+sead-sexdiff export                     # both cohorts
+sead-sexdiff export --cohort cohort_30 --force
+```
+
+Options: `--pseudobulk-dir` (default `results/pseudobulk`), `--out-dir` (default `results/motco_input`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--data-root` (only to locate the annotation), `--force` (replace existing cohort directories; without it an existing cohort directory is an error).
+
+Reads only the pseudobulk outputs (`rna_counts.h5ad`, `atac_counts.h5ad`, `donor_table.csv`, `manifest.json`, `donor_covariates.csv`), so it runs on any workstation after `scripts/sync_pseudobulk.sh`. It refuses a partial pseudobulk run, missing files and cohorts marked not analysable. On first use it downloads the GENCODE v32 basic annotation (the reference of 10x GRCh38-2020-A / Cell Ranger 6.0) into `<data root>/annotation/gencode.v32.basic.annotation.gtf.gz` and records its sha256; this needs internet once.
+
+Per cohort and omic, in this order, each step computed on the cohort's donors only and never using sex, stage or covariates:
+
+1. Restrict to the cohort's donors (`cohort_30` primary, `cohort_50` sensitivity).
+2. Drop chrX, chrY and chrM features. RNA genes get their chromosome from the annotation via `gene_ids` (version ignored; genes absent from it, e.g. those on unplaced scaffolds, are kept and counted as a finding). ATAC peaks get it from their `chrN:start-end` name.
+3. Keep features with CPM ≥ 1 in at least `k` donors, `k` = the cohort's smallest sex × stage cell (9 in both cohorts). CPM uses each donor's total over the features left after step 2.
+4. TMM factors on the filtered counts (edgeR `calcNormFactors(method = "TMM")`, reimplemented in numpy).
+5. log2-CPM with prior count 2 (edgeR `cpm(log = TRUE, prior.count = 2)`: effective library size = filtered total × TMM factor).
+6. Keep the 5,000 features with the highest variance (ddof 0) of log2-CPM, ties by name. Columns keep the input feature order.
+
+These are scientific choices; the constants live in `src/sead_sexdiff/data.py` (`EXPORT_EXCLUDED_CHROMOSOMES`, `EXPORT_MIN_CPM`, `EXPORT_PRIOR_COUNT`, `EXPORT_TOP_N`, `EXPORT_COHORTS`, `STAGE_LABELS`, `GENCODE_RELEASE` / `GENCODE_URL`) and are not CLI flags.
+
+Outputs in `results/motco_input/<cohort>/` (each cohort is written to `<cohort>.tmp/` and renamed when complete; all donor-indexed files list the same donors sorted by `donor_id`):
+
+| file | content |
+|---|---|
+| `rna.csv`, `atac.csv` | donors × kept features, first column `donor_id`, log2-CPM at `%.10g` |
+| `metadata.csv` | `donor_id`, `sex`, `stage` (`0`/`1`/`2`), `stage_label` (`Not AD + Low` / `Intermediate` / `High`) |
+| `covariates.csv` | `donor_id`, the coded covariates, `n_rna`, `n_atac` (exported, **not applied**) |
+| `features_rna.csv`, `features_atac.csv` | every input feature with its chromosome, `status` (`sex_chromosome`, `abundance`, `variance` or `kept`) and log2-CPM variance where computed |
+| `manifest.json` | block units (`log2-CPM`, MOTCO transform `identity`), group/stage columns and stage order, thresholds (`min_cpm`, `k` and its cell, `prior_count`, `N`, excluded chromosomes), feature counts after each step, per-donor library sizes and TMM factors, annotation URL and sha256, input manifest hash, covariate missingness, software, git revision, findings |
+
+The CSVs are byte-identical across reruns on the same inputs. They feed MOTCO directly:
+
+```
+motco analyze --block rna=rna.csv --block atac=atac.csv --metadata metadata.csv \
+  --sample-col donor_id --group-col sex --stage-col stage --stage-order 0,1,2
+```
+
+`scripts/check_tmm_edger.R` is a one-off cross-check of the TMM factors and log2-CPM against edgeR (in the Nix shell). It reads the files written by `run_export(debug_dir=...)`:
+
+```
+uv run python -c "from sead_sexdiff.data import run_export; run_export(cohort='cohort_30', out_dir='/tmp/x', debug_dir='/tmp/dbg')"
+Rscript scripts/check_tmm_edger.R /tmp/dbg cohort_30
+```
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.
@@ -282,6 +359,16 @@ rec = pseudobulk_donor(
 rec["row"], rec["n_nuclei"], rec["supertype_counts"]
 
 outputs = run_pseudobulk(omic="both", limit=2)
+```
+
+- Donor covariates and the MOTCO export:
+
+```python
+from sead_sexdiff.data import run_covariates, run_export, tmm_factors, log_cpm
+
+run_covariates(omic="both")
+results = run_export(cohort="all", force=True)
+results["cohort_30"]["steps"]  # feature counts after each step, per omic
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:
