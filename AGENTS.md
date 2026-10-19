@@ -47,6 +47,16 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
    `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
    `summary.md`). Never assemble it from `motco plsr` + `motco de`.
+6. `rank-sensitivity` – from `results/motco_input/` and
+   `results/motco_analysis/` only, per cohort: MOTCO's dimensionality
+   sensitivity analysis, the same `analyze_trajectories` call with the latent
+   rank forced to each value of `ANALYSIS_FORCED_RANKS`, everything else
+   (inputs, covariates, orientation, permutations, seed) equal to `analyze`.
+   The CV-selected analysis is read and checked (export hashes, MOTCO
+   version, seed, permutations), never rerun or modified, and is the
+   reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
+   (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
+   `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -75,7 +85,7 @@ when behavior or defaults change.
   packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|rank-sensitivity|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`; `uv.lock` holds
   the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -142,11 +152,28 @@ when behavior or defaults change.
   orientation, double-CV rank) are not overridden, and there is no
   unadjusted run. `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
   worker), so report results from `n_jobs = 1`.
+- Rank-sensitivity constants (flag and ask before changing any of them):
+  `ANALYSIS_FORCED_RANKS` (2, 3, 4, 6, 9, 12: 2 = `n_stages − 1`, 3 the next
+  rank, 4/6/9/12 the steps of MOTCO's latent-rank ladder with 4 = 2(K − 1)
+  the forced rank with a Type I check; a constant, never a flag, never
+  chosen from results), the same `ANALYSIS_SEED` and `ANALYSIS_PERMUTATIONS`
+  at every rank (so every rank draws the same permutation indices), rank 1
+  not forceable (MOTCO accepts `forced_components ≥ 2`; the CV-selected
+  analysis is the reference row), `n_jobs = 1` for reported results, and the
+  rule that the CV-selected analysis stays primary.
 - Reporting MOTCO results follows the binding rules in
   `../MOTCO/docs/roadmap.md` (Phase 6, Next changes item 1): CV-selected rank
   beside `angle`; `angle`/`shape` non-rejections are uninformative; a
   `delta` rejection is a difference, not specifically of size; report the
-  covariate block and the feature filtering beside the results.
+  covariate block and the feature filtering beside the results. The
+  forced-rank sweep is read as sensitivity only: the CV-selected analysis
+  stays primary, a rejection status that differs between ranks is rank
+  dependence (not a result at that rank), the non-rejection rules hold at
+  every rank, MOTCO's forced-rank operating characteristics (Type I at
+  forced 4 only, unadjusted; `shape` power loss and `angle` leakage at
+  forced 2(K − 1); wider `angle` null above `n_stages − 1`) are carried as
+  limitations, and the adjusted analysis has no Type I check at any forced
+  rank.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
