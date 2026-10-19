@@ -518,16 +518,24 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Per variant of the registry PREPROCESSING_VARIANTS (a constant, not a flag; now: "
             f"{variants}) and per cohort: rerun the export from the pseudobulk outputs with the variant's "
-            "setting changed and everything else equal to the export step (keep_chrx removes chrY and chrM "
-            "only, so chrX features are kept and the abundance filter, TMM, log2-CPM and the variance ranking "
-            "are recomputed with them present), then rerun the covariate-adjusted trajectory analysis on the "
-            "variant blocks with the analyze step's settings (CV-selected rank, 999 RRPP permutations, same "
-            "seed), and compare it with the primary analysis. The primary export and analysis are read and "
-            "checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells; export hashes, MOTCO "
-            "version, seed, permutations, CV selection), never rerun or modified, and stay the primary result. "
-            "Writes <out-dir>/<variant>/motco_input/<cohort>/ (the variant export), "
-            "<out-dir>/<variant>/motco_analysis/<cohort>/ (the variant analysis) and "
-            "<out-dir>/<variant>/comparison/<cohort>/ (sensitivity.csv, sensitivity.md, sensitivity_manifest.json)."
+            "registered setting(s) changed and everything else equal to the export step (keep_chrx removes chrY "
+            "and chrM only; exclude_families removes the ribosomal, mitochondrial and hemoglobin RNA genes before "
+            "the abundance filter; rna_trend_ratio ranks RNA features by variance over a binned mean-variance "
+            "trend; atac_mean_accessibility ranks ATAC peaks by mean log2-CPM; residualized regresses each "
+            "feature on the export's log10 library sizes and the technical table's gene-set fractions after "
+            "log2-CPM; revised_candidate composes the four), then rerun the covariate-adjusted trajectory "
+            "analysis on the variant blocks with the analyze step's settings (CV-selected rank, 999 RRPP "
+            "permutations, same seed), and compare it with the primary analysis. The primary export and analysis "
+            "are read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells; export "
+            "hashes, MOTCO version, seed, permutations, CV selection; for the gene-set, residualized and candidate "
+            "variants also the technical table against the pseudobulk manifest), never rerun or modified, and stay "
+            "the primary result. For revised_candidate the predeclared adoption rule ADOPTION_RULE is evaluated "
+            "from the generated files into adoption_check.csv (no p-value is read). Writes "
+            "<out-dir>/<variant>/motco_input/<cohort>/ (the variant export, plus residualization.csv when it "
+            "residualizes), <out-dir>/<variant>/motco_analysis/<cohort>/ (the variant analysis) and "
+            "<out-dir>/<variant>/comparison/<cohort>/ (sensitivity.csv, sensitivity.md, sensitivity_manifest.json "
+            "and, for the candidate, adoption_check.csv). With --variant all, a variant x cohort whose comparison "
+            "directory exists is skipped with a message unless --force is given, so all is resumable."
         ),
     )
     sub_ps.add_argument(
@@ -587,7 +595,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub_ps.add_argument(
         "--force",
         action="store_true",
-        help="Replace a cohort's existing variant export, analysis and comparison directories under --out-dir",
+        help=(
+            "Replace a cohort's existing variant export, analysis and comparison directories under --out-dir "
+            "(without it, --variant all skips complete variant x cohort pairs; a named variant with existing output is an error)"
+        ),
     )
     # axis-diagnostics command: what the latent and block axes correlate with
     sub_ad = sub.add_parser(
@@ -876,13 +887,18 @@ def main(argv: list[str] | None = None) -> int:
         columns = ["variant", "cohort", "component_selection", "rank"]
         for s in ANALYSIS_STATISTICS:
             columns += [s, f"{s}_p", f"{s}_rejected"]
-        table = pd.concat(
-            [res["table"][columns] for per_cohort in results.values() for res in per_cohort.values()],
-            ignore_index=True,
-        )
-        print("[preprocessing-sensitivity] Comparison table (primary = the analyze step's result, primary; "
-              "the variant rows are sensitivity):")
-        print(table.to_string(index=False))
+        tables = [res["table"][columns] for per_cohort in results.values() for res in per_cohort.values()]
+        if tables:
+            table = pd.concat(tables, ignore_index=True)
+            print("[preprocessing-sensitivity] Comparison table (primary = the analyze step's result, primary; "
+                  "the variant rows are sensitivity):")
+            print(table.to_string(index=False))
+            for per_cohort in results.values():
+                for res in per_cohort.values():
+                    if res.get("adoption") is not None:
+                        holds = bool(res["adoption"].iloc[-1]["holds"])
+                        print(f"[preprocessing-sensitivity] {res['manifest']['variant']['name']} {res['manifest']['cohort']}: "
+                              f"adoption check {'holds' if holds else 'does not hold'} (adoption_check.csv)")
         print("[preprocessing-sensitivity] Done.")
         return 0
 
