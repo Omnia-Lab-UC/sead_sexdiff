@@ -35,19 +35,35 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    numerically (`90+` → 90, flagged), cross-check RNA against ATAC, and write
    `results/pseudobulk/donor_covariates.csv` + `covariates_manifest.json`.
    Runs on the cluster login node (needs the raw objects; seconds per file).
-4. `export` – from `results/pseudobulk/` only (any workstation), per cohort:
+4. `technical-covariates` – per RNA donor object, select the astrocyte
+   nuclei through the pseudobulk's code path (`select_astrocyte_nuclei`),
+   read their raw `UMIs` rows and `obs` QC columns (never the normalized
+   `X`) and write per donor the nucleus means and SDs and the UMI-weighted
+   pseudobulk fractions of the predeclared gene sets (`TECHNICAL_GENE_SETS`:
+   ribosomal, mitochondrial, hemoglobin), the within-donor supertype share
+   (η²) of each fraction, the nucleus and library QC means
+   (`TECHNICAL_OBS_COLUMNS`) and `n_libraries_rna`; from the ATAC objects
+   the library-level `ATAC_*` metrics (`obs` only). Fractions are
+   cross-checked against `rna_counts.h5ad` and nucleus counts against the
+   pseudobulk cache and `donor_table.csv` (any mismatch fails). Writes
+   `results/pseudobulk/donor_technical.csv`, `nucleus_technical_summary.csv`
+   and `technical_manifest.json`, never `donor_covariates.csv` or
+   `covariates_manifest.json` (hash-bound by the reference checks), with a
+   resumable per-donor JSON cache in `per_donor_technical/`. Runs on the
+   cluster (`scripts/technical.sbatch`, or nohup on the login node).
+5. `export` – from `results/pseudobulk/` only (any workstation), per cohort:
    drop chrX/Y/M → CPM ≥ 1 in ≥ k donors → TMM → log2-CPM → top 5,000 by
    variance per omic, writing `results/motco_input/<cohort>/` (`rna.csv`,
    `atac.csv`, `metadata.csv`, `covariates.csv`, `features_<omic>.csv`,
    `manifest.json`). Covariates are exported, not applied: adjustment is a
    MOTCO change.
-5. `analyze` – from `results/motco_input/` only, per cohort: the
+6. `analyze` – from `results/motco_input/` only, per cohort: the
    covariate-adjusted sex × stage trajectory comparison through MOTCO's
    `analyze_trajectories` (≥ 0.8.0), writing `results/motco_analysis/<cohort>/`
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
    `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
    `summary.md`). Never assemble it from `motco plsr` + `motco de`.
-6. `rank-sensitivity` – from `results/motco_input/` and
+7. `rank-sensitivity` – from `results/motco_input/` and
    `results/motco_analysis/` only, per cohort: MOTCO's dimensionality
    sensitivity analysis, the same `analyze_trajectories` call with the latent
    rank forced to each value of `ANALYSIS_FORCED_RANKS`, everything else
@@ -57,7 +73,7 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
    (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
-7. `preprocessing-sensitivity` – from `results/pseudobulk/`, the annotation,
+8. `preprocessing-sensitivity` – from `results/pseudobulk/`, the annotation,
    `results/motco_input/` and `results/motco_analysis/`, per variant of the
    registry `PREPROCESSING_VARIANTS` (now `keep_chrx`) and per cohort: the
    export rerun with the variant's one setting changed (`_export_cohort`,
@@ -71,6 +87,22 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    layout so `rank-sensitivity` can read a variant, and
    `comparison/<cohort>/` with `sensitivity.csv`, `sensitivity.md`,
    `sensitivity_manifest.json`).
+9. `axis-diagnostics` – from `results/motco_input/`, `results/motco_analysis/`,
+   `results/pseudobulk/donor_technical.csv` and, when present,
+   `results/motco_rank_sensitivity/<cohort>/rank_*/` only (any workstation),
+   per cohort: Spearman and covariate-partial Spearman correlations of every
+   latent component of every analysis read with the predeclared variables
+   (`DIAGNOSTIC_VARIABLES`: the technical table's numeric columns, the
+   export's TMM factors and log10 library sizes, the six analysis
+   covariates, stage, sex), the same for the first three PCs of each
+   z-scored block, the geometry shares along each component from
+   `stage_means.csv`, and the feature-selection accounting from
+   `features_<omic>.csv`. Every analysis manifest's input hashes are checked
+   against the export files first; nothing under the inputs is written.
+   Writes `results/motco_diagnostics/<cohort>/` (`axis_correlations.csv`,
+   `block_pcs.csv`, `geometry_shares.csv`, `feature_selection.csv`,
+   `diagnostics.md` with flagged rows first, `diagnostics_manifest.json`).
+   Its outputs feed no export or analysis command.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -80,12 +112,14 @@ when behavior or defaults change.
 - `src/sead_sexdiff/cli.py` – argparse CLI (`build_parser`, `main`); thin layer
   that calls into `data.py` and prints `[command]`-prefixed progress messages.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
-  pseudobulk, differential expression, covariates, MOTCO export, analysis
-  and the rank / preprocessing sensitivity analyses.
+  pseudobulk, differential expression, covariates, technical covariates,
+  MOTCO export, analysis, the rank / preprocessing sensitivity analyses and
+  the axis diagnostics.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
-- `scripts/` – `pseudobulk.sbatch` (cluster job), `sync_pseudobulk.sh`
-  (rsync of `results/pseudobulk/` to a workstation) and `check_tmm_edger.R`
+- `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
+  `sync_pseudobulk.sh` (rsync of `results/pseudobulk/` to a workstation,
+  per-donor caches excluded) and `check_tmm_edger.R`
   (one-off edgeR cross-check of the export's TMM / log2-CPM).
 - `data/`, `results/` – gitignored; never commit their contents.
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
@@ -100,7 +134,7 @@ when behavior or defaults change.
   packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`; `uv.lock` holds
   the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -145,6 +179,24 @@ when behavior or defaults change.
 - Covariate coding (`COVARIATE_COLUMNS`, `COVARIATE_CROSS_CHECK`): RNA values
   are used; `N+` ages are capped and flagged; non-numeric values stay missing
   and are listed; nothing is imputed.
+- The nucleus selection of the MTG steps is one code path,
+  `select_astrocyte_nuclei` (taxonomy mapping, `Reference` excluded,
+  `RNA_MIN_GENES` on the `UMIs` layer; ATAC `read_counts=False` reads `obs`
+  only): `pseudobulk_donor` sums what it returns and `technical_donor`
+  summarizes the same nuclei. Changing it changes both steps; the pseudobulk
+  outputs must then be re-checked against the per-donor cache.
+- Technical-covariate constants (flag and ask before changing any of them):
+  `TECHNICAL_GENE_SETS` (ribosomal `^RP[LS]\d+[A-Z]?$` / `^RPLP[0-2]$` /
+  `RPSA`, so pseudogenes and kinases are excluded; the 13 `MT-` genes; `HBB`,
+  `HBA1`, `HBA2`; recorded as matched lists, an empty match is an error),
+  `TECHNICAL_OBS_COLUMNS` per omic, `TECHNICAL_LIBRARY_COLUMN` (`load_name`),
+  `TECHNICAL_SD_DDOF` (1) and `TECHNICAL_MIN_SUPERTYPE_NUCLEI` (2, the η²
+  definition), nucleus-weighted means beside UMI-weighted pseudobulk
+  fractions, the within-donor supertype share as the biology-versus-
+  preparation statistic (read beside the manifest's between-donor share,
+  never alone), the `COVARIATE_RTOL` cross-check against `rna_counts.h5ad`,
+  and the rule that the technical files stay apart from
+  `donor_covariates.csv` / `covariates_manifest.json`.
 - MOTCO export constants (flag and ask before changing any of them):
   `EXPORT_EXCLUDED_CHROMOSOMES` (chrX/Y/M; sex is the group),
   `EXPORT_MIN_CPM` (1, in ≥ k donors, k = smallest sex × stage cell, computed
@@ -206,6 +258,26 @@ when behavior or defaults change.
   non-rejection rules hold in the variant, and with chrX kept X-dosage
   features enter the blocks that MOTCO's operating characteristics never
   covered, so the variant carries no Type I or power claim of its own.
+- Axis-diagnostic constants (flag and ask before changing any of them):
+  `DIAGNOSTIC_VARIABLES` (the variable sources; resolved at run time and
+  recorded with sources, never chosen or extended from results),
+  `DIAGNOSTIC_CORRELATION_THRESHOLD` (0.3, a reporting flag, never an
+  adoption rule: adoption rules belong to the change that runs a variant and
+  are written in its proposal before its runs), `DIAGNOSTIC_N_BLOCK_PCS` (3),
+  `DIAGNOSTIC_QUANTILES`, `DIAGNOSTIC_MEAN_CUTS`, Spearman (not Pearson; the
+  technical variables are skewed) with the partial correlation defined as
+  the Spearman correlation of OLS residuals on an intercept and the six
+  analysis covariates, population-SD z-scoring of the blocks, no p-values.
+  The diagnostic reads sex and stage, so it is a diagnostic and never a
+  filter: its outputs are an input of no `export`, `analyze`,
+  `rank-sensitivity` or `preprocessing-sensitivity` run, and preprocessing
+  variants are predeclared in a change proposal, never derived from a
+  diagnostic value. Reading rules for the report: an axis correlated with a
+  technical variable is a measurement-space finding about the primary
+  analysis, not a reinterpretation of its statistics; the primary analysis
+  stays primary with its non-rejection rules; a gene-set fraction is a
+  residualization candidate only when its between-donor share dominates and
+  its within-donor supertype share is small (cell state otherwise).
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
@@ -224,7 +296,9 @@ when behavior or defaults change.
   login node (nohup), then `scripts/pseudobulk.sbatch` runs
   `pseudobulk --omic both` as one sequential job; resubmitting resumes.
   `covariates --omic both` reads metadata only and runs directly on the login
-  node.
+  node. `technical-covariates --omic both` needs the raw objects and
+  `results/pseudobulk/` (incl. the per-donor cache): `scripts/technical.sbatch`
+  after the pseudobulk job, or nohup on the login node; resubmitting resumes.
 - Workstations pull only `results/pseudobulk/` with
   `scripts/sync_pseudobulk.sh`; never copy raw donor objects around.
 

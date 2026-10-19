@@ -208,6 +208,50 @@ Its outputs land in `results/pseudobulk/`, so `scripts/sync_pseudobulk.sh` carri
 - RNA values are used. With `--omic both`, the shared columns are compared with the ATAC object (numeric columns after coding, relative tolerance 1e-9); each disagreement is recorded under `findings`, and the run continues.
 - `covariates_manifest.json`: columns and coding rules, objects read per omic, missing values, capped-age count, cross-check summary, findings, software versions and git revision.
 
+### Donor technical covariates
+
+```
+sead-sexdiff technical-covariates                 # RNA objects plus the ATAC library metrics
+sead-sexdiff technical-covariates --omic rna      # RNA only
+sead-sexdiff technical-covariates --force         # recompute cached donors
+```
+
+Options: `--omic {rna,both}` (default `both`), `--data-root`, `--pseudobulk-dir` (default `results/pseudobulk`; the `pseudobulk` step's outputs, read for the cross-check), `--out-dir` (default `results/pseudobulk`), `--force` (recompute donors already in the per-donor cache).
+
+Per RNA donor object it selects the astrocyte nuclei exactly as the pseudobulk step does, through the shared `select_astrocyte_nuclei` (taxonomy mapping of the release, `Reference` donors excluded, ≥ 200 detected genes in the `UMIs` layer), reads their rows of the raw `UMIs` layer and their `obs` QC columns, and never loads the normalized `X`. From the ATAC objects it reads `obs` columns only. It needs the raw donor objects and the pseudobulk outputs, so it runs on the cluster after `pseudobulk` (`scripts/technical.sbatch`, the same partition and resources as `pseudobulk.sbatch`; a `nohup` run on the login node is also acceptable, since the per-donor read is the pseudobulk's, a few seconds per donor):
+
+```
+sbatch scripts/technical.sbatch
+```
+
+Gene sets (`TECHNICAL_GENE_SETS`, name patterns on the gene symbols of the pseudobulk's feature set; the manifest lists the matched genes):
+
+| set | patterns | matched in the MTG RNA objects |
+|---|---|---|
+| `ribosomal` | `^RP[LS]\d+[A-Z]?$`, `^RPLP[0-2]$`, `^RPSA$` (pseudogenes such as `RPL13AP5` and kinases such as `RPS6KA1` do not match) | 81 |
+| `mitochondrial` | `^MT-` | 13 |
+| `hemoglobin` | `HBB`, `HBA1`, `HBA2` | 3 |
+
+QC columns (`TECHNICAL_OBS_COLUMNS`), summarized over the selected nuclei and written in snake_case (`Fraction mitochondrial UMIs` → `fraction_mitochondrial_umis`):
+
+- RNA, per nucleus: `Fraction mitochondrial UMIs`, `Number of UMIs`, `Genes detected`, `Doublet score`.
+- RNA, library level (constant within a library; 80 of the 84 donors span two to five libraries, so the summary is the astrocyte-weighted mean): `GEX_Reads_mapped_confidently_to_intronic_regions`, `GEX_Fraction_of_transcriptomic_reads_in_cells`, `GEX_Median_UMI_counts_per_cell`, `GEX_sequencing_saturation`; the distinct values of `load_name` give `n_libraries_rna`.
+- ATAC, library level (usually one library per donor object; 29 of the 86 objects carry two or three distinct values, so the summary is again the astrocyte-weighted mean, with a per-donor `constant` flag in the manifest): `ATAC_TSS_enrichment_score`, `ATAC_Fraction_of_high_quality_fragments_overlapping_peaks`, `ATAC_Fraction_of_high_quality_fragments_in_cells`, `ATAC_Percent_duplicates`, `ATAC_Median_high_quality_fragments_per_cell`.
+
+Per nucleus, each set's fraction is the set's UMIs over the nucleus's total UMIs (all genes of the raw layer). Per donor and set the table holds `<set>_mean` and `<set>_sd` (nucleus-weighted mean and sample SD of the per-nucleus fractions), `<set>_pseudobulk` (sum of set UMIs over sum of total UMIs, the fraction `rna_counts.h5ad` gives) and `<set>_supertype_share` (within-donor η²: the between-supertype sum of squares of the per-nucleus fraction over its total sum of squares, over the supertypes present; empty when fewer than two supertypes hold ≥ 2 nuclei or the fraction has no variance). QC columns get `<column>_mean` and `<column>_sd` (RNA) or `<column>_mean` (ATAC, with a per-donor `constant` flag in the manifest). Nothing is imputed: non-numeric values are dropped from the means and listed in the manifest. The manifest also holds the between-donor share of each fraction and QC column (the donor η² over all nuclei of all donors, from the per-donor counts, means and SDs), which the technical-axis report reads beside the supertype share.
+
+Cross-check ("the same nuclei as the pseudobulk"): for every donor, each set's `<set>_pseudobulk` is recomputed from the donor's row of `rna_counts.h5ad` and must agree to a relative tolerance of 1e-9, and the selected nucleus count must equal `n_nuclei` in the pseudobulk cache (`per_donor/rna/<donor>.npz`, when present) and `n_rna` in `donor_table.csv`; any disagreement stops the run naming the donor and the set or both counts. The manifest records the pseudobulk manifest's sha256. A `Reference` donor is recorded as excluded with no technical row, as in the pseudobulk.
+
+Outputs in `results/pseudobulk/` (so `scripts/sync_pseudobulk.sh` carries them to the workstations):
+
+| file | content |
+|---|---|
+| `donor_technical.csv` | one row per non-`Reference` donor with an RNA object (84), sorted by `donor_id`: `donor_id`, `n_nuclei_rna`, `n_libraries_rna`, per set `<set>_mean`, `<set>_sd`, `<set>_pseudobulk`, `<set>_supertype_share`, the RNA QC means and SDs, the ATAC means (empty for a donor without an ATAC object, listed in the manifest) |
+| `nucleus_technical_summary.csv` | one row per donor and set: `donor_id`, `gene_set`, `n_nuclei`, `mean`, `sd`, `pseudobulk`, `supertype_share`, `n_supertypes` |
+| `technical_manifest.json` | gene sets with patterns and matched genes, QC columns per omic with their output names, the definitions, objects read per omic, excluded donors, donors missing an ATAC object, per-donor nucleus counts beside the pseudobulk cache's and `donor_table.csv`'s with the fraction cross-check and the libraries, the pseudobulk manifest sha256, the between-donor shares, the libraries-per-donor distribution, ATAC constancy flags, missing values, findings, software versions, git revision, and the sha256 of `donor_covariates.csv` and `covariates_manifest.json` before and after the run |
+
+The step never writes `donor_covariates.csv` or `covariates_manifest.json`, whose hashes the primary export's and analysis's reference checks bind. Its per-donor cache lives in `results/pseudobulk/per_donor_technical/<omic>/<donor>.json` (the summaries and per-supertype counts and means, no per-nucleus arrays); a rerun skips cached donors unless `--force`, so a stopped run resumes, and a cache made with different gene sets, QC columns or `min_genes` is refused. `scripts/sync_pseudobulk.sh` excludes the cache unless `--with-cache`.
+
 ### MOTCO input export
 
 ```
@@ -363,6 +407,45 @@ Reading rules, binding for the report (`reports/motco-astrocyte-chrx-sensitivity
 - A statistic whose rejection status differs between the variant and the primary is preprocessing dependence of the sensitivity analysis, not a result of the variant. No rejection in either is no evidence of a difference with chrX kept either, not evidence of agreement in size, direction or shape.
 - `angle` and `shape` non-rejections stay uninformative in the variant; a `delta` rejection is a difference, not specifically of size. A CV-selected rank that differs is reported beside `angle`, not read as better or worse.
 - chrX limitations: with chrX kept, features whose expression or accessibility differs between the sexes by X dosage enter the blocks (the report names them, `XIST` first, and says whether the variant kept them); a constant sex offset shifts the two sexes' centroids but not the within-sex displacement between stages, and the PLS basis is stage-supervised, so such features enter the latent space only through their covariance with stage, but MOTCO's operating characteristics were not measured with such features and the variant carries no Type I or power claim of its own.
+
+### MOTCO axis diagnostics
+
+```
+sead-sexdiff axis-diagnostics                      # both cohorts
+sead-sexdiff axis-diagnostics --cohort cohort_30 --force
+```
+
+Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--analysis-dir` (default `results/motco_analysis`; the `analyze` step's output, read as the primary analysis and never written), `--rank-dir` (default `results/motco_rank_sensitivity`; the `rank-sensitivity` step's output, whose `rank_*/` analyses are read when present), `--pseudobulk-dir` (default `results/pseudobulk`; holds `donor_technical.csv`), `--out-dir` (default `results/motco_diagnostics`), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
+
+Measures, from kept outputs only, what the MOTCO latent axes and the exported blocks' principal axes correlate with, so that preprocessing decisions rest on recorded diagnostics rather than on scratch checks. Per cohort it reads the primary export, the primary analysis, `results/pseudobulk/donor_technical.csv` (synced from the cluster after `technical-covariates`; `technical_manifest.json` is read beside it for the pseudobulk-hash check) and every `results/motco_rank_sensitivity/<cohort>/rank_*/` analysis found (an absent sweep is a finding, not an error), and nothing else; it runs on any workstation in seconds. A missing input stops the run naming the file and the command that produces it. Before writing, every analysis manifest's recorded input hashes are compared with the sha256 of the export files now on disk; a difference stops the run naming the file and both hashes. Nothing under the input directories is written.
+
+Variables (`DIAGNOSTIC_VARIABLES`, a constant resolved at run time and recorded in the manifest with each variable's source; never chosen or extended from results): every numeric column of `donor_technical.csv` (gene-set fractions, supertype shares, nucleus and library QC means and SDs, nuclei and library counts); `tmm_<omic>` and `log10_lib_<omic>` from the export manifest's `tmm` block; the six analysis covariates as the analysis derives them (`log10_n_rna`, `log10_n_atac` on the log10 scale); `stage` (0, 1, 2) and `male` (1 for Male).
+
+Statistics (`DIAGNOSTIC_CORRELATION_THRESHOLD` = 0.3 is a reporting flag, not an adoption rule; no p-value is attached to any correlation):
+
+- For every latent component of every analysis read (`latent_scores.csv`): the Spearman correlation with each variable over the donors that have it (`n` recorded), the partial Spearman correlation given the six analysis covariates (the Spearman correlation of the OLS residuals of both variables on an intercept and the covariates; n/a for a covariate itself) and the component's score SD. Rows with |rho| ≥ 0.3 (raw or partial) are flagged.
+- The same for the first three principal components of each z-scored block (population SD; SVD scores with the sign fixed so the largest loading is positive), with each component's variance share.
+- From each analysis's `stage_means.csv`, the share of the squared length of each sex's net displacement (last stage minus first), of the per-stage sex-difference vectors (squares summed over stages) and of the stage-centred sex differences that lies along each component (at rank 1 every share is 1 and the signed displacements per sex are recorded).
+- From the export's `features_<omic>.csv` and block, per omic: the 5/25/50/75/95 % quantiles of the kept features' mean log2-CPM, the share of kept features with mean below 0 and below 1, the share of the abundance-passing variance held by the kept features, the variance at the cut (kept minimum, dropped median) and the share of kept features whose |Spearman| with the primary `pls_0` is ≥ 0.3.
+- Findings: whether `pls_0` is identical (`np.allclose`) across the primary and every forced rank (PLS components nest, so the sweep inherits the primary's first axis); the variables flagged against the primary `pls_0`; variables with missing donors (correlations are pairwise-complete); whether the technical table's pseudobulk manifest hash equals the export's.
+
+Outputs in `results/motco_diagnostics/<cohort>/` (written to `<cohort>.tmp/` and renamed; the CSVs are byte-identical across reruns on the same inputs):
+
+| file | content |
+|---|---|
+| `axis_correlations.csv` | one row per analysis (`primary`, then `rank_02`, …), component and variable: rank, component SD, source, `n`, `spearman`, `n_partial`, `partial_spearman`, `flag_raw`, `flag_partial`; variables sorted by name |
+| `block_pcs.csv` | the same for `rna` and `atac` `pc1`–`pc3`, with `variance_share` |
+| `geometry_shares.csv` | per analysis, quantity (`net_displacement_<sex>`, `sex_difference_by_stage`, `sex_difference_centred`) and component: the signed value (single vectors only), the squared length along the component, the total and the share |
+| `feature_selection.csv` | one row per omic with the accounting above |
+| `diagnostics.md` | the flagged correlations first (latent components, then block PCs), the primary analysis's full variables × components table, a per-component summary of each forced-rank analysis (SD, flagged count, top variable, geometry shares), the block PC tables, the geometry shares, the feature-selection table, the analyses read and the findings |
+| `diagnostics_manifest.json` | every input path and sha256 (export files, each analysis's four files, the technical table and manifest with the pseudobulk-hash check), the variable list with sources and missing counts, the threshold, the definitions, the block PC variance shares, the nestedness check, flag counts, the output hashes, software, git revision, findings |
+
+Reading rules, binding for the report (`reports/motco-astrocyte-technical-axis-<date>.md`):
+
+- An axis correlated with a technical variable is a finding about the measurement space of the primary analysis, not a reinterpretation of its statistics or p-values. The primary analysis stays primary and its non-rejections keep their reading rules (`angle` and `shape` non-rejections are uninformative; a `delta` rejection is a difference, not specifically of size).
+- The correlations are descriptive at n = 80 and carry no p-values; the flag is a reporting threshold, and the report claims no inference from them.
+- A gene-set fraction whose between-donor share dominates and whose within-donor supertype share is small in most donors is read as a preparation property and a residualization candidate for the next change; one whose within-donor supertype share exceeds its between-donor share is read as cell state and not a candidate. Both shares are the technical step's (`technical_manifest.json` `between_donor_share`, `donor_technical.csv` `<set>_supertype_share`), read beside the nucleus QC columns, never alone.
+- No preprocessing variant is chosen in the report. The diagnostic reads stage and sex, so it is a diagnostic and never a filter: its outputs are read by no `export`, `analyze`, `rank-sensitivity` or `preprocessing-sensitivity` run, and preprocessing variants are predeclared in a change proposal, never derived from a diagnostic value.
 
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 

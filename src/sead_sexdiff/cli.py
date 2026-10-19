@@ -20,10 +20,13 @@ from .data import (
     ANALYSIS_STATISTICS,
     ANALYSIS_FORCED_RANKS,
     PREPROCESSING_VARIANTS,
+    DIAGNOSTIC_CORRELATION_THRESHOLD,
     run_analysis,
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
     run_covariates,
+    run_technical_covariates,
+    run_axis_diagnostics,
     run_export,
     run_pseudobulk,
     write_subset_from_folder,
@@ -310,6 +313,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (default: %(default)s)",
     )
 
+    # technical-covariates command: donor technical table of the astrocyte nuclei
+    sub_tc = sub.add_parser(
+        "technical-covariates",
+        help="Write the donor technical table of the astrocyte nuclei (gene-set UMI fractions, nucleus and library QC)",
+        description=(
+            "For every MTG RNA donor object, select the astrocyte nuclei exactly as the "
+            "pseudobulk step does (shared code path), read their rows of the raw UMIs layer "
+            "and their obs QC columns (never the normalized X), and write per donor the "
+            "nucleus means and SDs and the UMI-weighted pseudobulk fractions of the predeclared "
+            "gene sets (ribosomal, mitochondrial, hemoglobin), the within-donor supertype share "
+            "of each fraction, the nucleus and library QC means and the number of libraries; "
+            "from the ATAC objects the library-level ATAC_* metrics (obs only). The pseudobulk "
+            "fractions are cross-checked against rna_counts.h5ad and the nucleus counts against "
+            "the pseudobulk cache and donor_table.csv. Writes donor_technical.csv, "
+            "nucleus_technical_summary.csv and technical_manifest.json; never writes "
+            "donor_covariates.csv or covariates_manifest.json. Resumable per donor "
+            "(per_donor_technical/). Needs the raw donor objects (cluster)."
+        ),
+    )
+    sub_tc.add_argument(
+        "--omic",
+        choices=["rna", "both"],
+        default="both",
+        help="RNA objects only, or RNA plus the ATAC library metrics (default: %(default)s)",
+    )
+    sub_tc.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
+    )
+    sub_tc.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Directory with the pseudobulk outputs, read for the cross-check (default: %(default)s)",
+    )
+    sub_tc.add_argument(
+        "--out-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Output directory (default: %(default)s)",
+    )
+    sub_tc.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute donors already in the per-donor cache",
+    )
+
     # export command: MOTCO-ready blocks per cohort
     sub_ex = sub.add_parser(
         "export",
@@ -537,6 +589,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace a cohort's existing variant export, analysis and comparison directories under --out-dir",
     )
+    # axis-diagnostics command: what the latent and block axes correlate with
+    sub_ad = sub.add_parser(
+        "axis-diagnostics",
+        help="Measure what the MOTCO latent axes and the exported blocks' principal axes correlate with",
+        description=(
+            "Per cohort, from kept outputs only (the export, the analyze step's analysis, the technical table "
+            "and, when present, the rank-sensitivity analyses): Spearman correlations of every latent component "
+            "with the predeclared variables (the technical table's donor columns, the export's TMM factors and "
+            "log10 library sizes, the six analysis covariates, stage and sex) and the partial correlations given "
+            "the six analysis covariates; the same for the first three principal components of each z-scored "
+            "block; the share of the trajectory geometry (net displacements, sex differences) along each "
+            "component; and the feature-selection accounting (kept features' mean log2-CPM quantiles, variance "
+            "share, variance at the cut, share correlated with pls_0). Each analysis manifest's input hashes are "
+            "checked against the export files first; nothing under the input directories is written. Rows with "
+            f"|rho| >= {DIAGNOSTIC_CORRELATION_THRESHOLD} are flagged (a reporting flag, not an adoption rule; no "
+            "p-values). Writes axis_correlations.csv, block_pcs.csv, geometry_shares.csv, feature_selection.csv, "
+            "diagnostics.md and diagnostics_manifest.json. Its outputs feed no export or analysis command: "
+            "preprocessing variants are predeclared in a change proposal, never derived from a diagnostic value."
+        ),
+    )
+    sub_ad.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to diagnose (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root with one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--rank-dir",
+        default=Path("results/motco_rank_sensitivity"),
+        type=Path,
+        help="Sweep root of the rank-sensitivity step; its rank_*/ analyses are read when present (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Directory holding donor_technical.csv from the technical-covariates step (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--out-dir",
+        default=Path("results/motco_diagnostics"),
+        type=Path,
+        help="Diagnostics root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_ad.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing cohort directories under --out-dir",
+    )
     return parser
 
 
@@ -671,6 +784,20 @@ def main(argv: list[str] | None = None) -> int:
         print("[covariates] Done.")
         return 0
 
+    if args.command == "technical-covariates":
+        print("[technical-covariates] Summarizing the astrocyte nuclei of every donor object...")
+        outputs = run_technical_covariates(
+            args.omic,
+            data_root=args.data_root,
+            pseudobulk_dir=args.pseudobulk_dir,
+            out_dir=args.out_dir,
+            force=args.force,
+        )
+        for name in ("table", "summary", "manifest"):
+            print(f"[technical-covariates] Wrote {outputs[name]}")
+        print("[technical-covariates] Done.")
+        return 0
+
     if args.command == "export":
         print("[export] Exporting MOTCO input blocks...")
         run_export(
@@ -757,6 +884,27 @@ def main(argv: list[str] | None = None) -> int:
               "the variant rows are sensitivity):")
         print(table.to_string(index=False))
         print("[preprocessing-sensitivity] Done.")
+        return 0
+
+    if args.command == "axis-diagnostics":
+        print("[axis-diagnostics] Measuring the latent and block axes...")
+        results = run_axis_diagnostics(
+            args.cohort,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            rank_dir=args.rank_dir,
+            pseudobulk_dir=args.pseudobulk_dir,
+            out_dir=args.out_dir,
+            force=args.force,
+        )
+        for cohort, res in results.items():
+            axis = res["tables"]["axis"]
+            flagged = axis[(axis["analysis"] == "primary") & (axis["component"] == "pls_0") & (axis["flag_raw"] | axis["flag_partial"])]
+            print(f"[axis-diagnostics] {cohort}: {len(flagged)} variables flagged against the primary pls_0 "
+                  f"(|rho| >= {DIAGNOSTIC_CORRELATION_THRESHOLD}, raw or partial; no p-values):")
+            if len(flagged):
+                print(flagged[["variable", "n", "spearman", "partial_spearman"]].to_string(index=False))
+        print("[axis-diagnostics] Done.")
         return 0
 
     parser.error("Unknown command")
