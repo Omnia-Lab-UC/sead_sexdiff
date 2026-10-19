@@ -17,6 +17,8 @@ from .data import (
     MTG_PREFIXES,
     resolve_data_root,
     EXPORT_COHORTS,
+    ANALYSIS_STATISTICS,
+    run_analysis,
     run_covariates,
     run_export,
     run_pseudobulk,
@@ -349,6 +351,53 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing cohort directories",
     )
+
+    # analyze command: covariate-adjusted MOTCO trajectory analysis per cohort
+    sub_an = sub.add_parser(
+        "analyze",
+        help="Run the covariate-adjusted MOTCO trajectory analysis per cohort",
+        description=(
+            "Per cohort, from the export outputs only: compare the female and male "
+            "astrocyte trajectories across ADNC stages 0, 1, 2 with MOTCO's "
+            "analyze_trajectories (RNA + ATAC blocks, net-displacement orientation, "
+            "CV-selected rank, 999 RRPP permutations, fixed seed), adjusting for "
+            "age_at_death, pmi, rin, years_education, log10_n_rna and log10_n_atac. "
+            "Writes MOTCO's artifact plus analysis_metadata.csv, "
+            "analysis_manifest.json and summary.md."
+        ),
+    )
+    sub_an.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to analyse (default: %(default)s)",
+    )
+    sub_an.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root with one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_an.add_argument(
+        "--out-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_an.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel jobs for MOTCO's CV and RRPP, -1 = all CPUs. Values other than 1 "
+            "change the RRPP draws (p-values); results are reported at 1 (default: %(default)s)"
+        ),
+    )
+    sub_an.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing cohort directories",
+    )
     return parser
 
 
@@ -493,6 +542,33 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
         )
         print("[export] Done.")
+        return 0
+
+    if args.command == "analyze":
+        import pandas as pd
+
+        print("[analyze] Running the MOTCO trajectory analysis...")
+        results = run_analysis(
+            args.cohort,
+            input_dir=args.input_dir,
+            out_dir=args.out_dir,
+            n_jobs=args.n_jobs,
+            force=args.force,
+        )
+        rows = []
+        for cohort, res in results.items():
+            record = res["record"]
+            for s in ANALYSIS_STATISTICS:
+                rows.append({
+                    "cohort": cohort,
+                    "statistic": s,
+                    "observed": record["statistics"].get(s),
+                    "p": record["p_values"].get(s),
+                    "rank": record["latent"]["selected_lv"] if s == "angle" else "",
+                })
+        print("[analyze] Statistics (p from RRPP; rank = CV-selected latent rank):")
+        print(pd.DataFrame(rows).to_string(index=False))
+        print("[analyze] Done.")
         return 0
 
     parser.error("Unknown command")

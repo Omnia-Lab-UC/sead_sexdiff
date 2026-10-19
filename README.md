@@ -7,7 +7,8 @@ Project layout:
 ```
 .
 ├── data/            # place raw/input data here (ignored by package build)
-├── results/         # analysis outputs, figures, tables, etc.
+├── reports/         # committed case-study reports (numbers generated from results/)
+├── results/         # analysis outputs, figures, tables, etc. (gitignored)
 ├── scripts/         # cluster sbatch wrapper and output sync helper
 ├── src/
 │   └── sead_sexdiff/
@@ -246,12 +247,53 @@ motco analyze --block rna=rna.csv --block atac=atac.csv --metadata metadata.csv 
   --sample-col donor_id --group-col sex --stage-col stage --stage-order 0,1,2
 ```
 
+The case-study analysis itself, with covariates, is the `analyze` command below.
+
 `scripts/check_tmm_edger.R` is a one-off cross-check of the TMM factors and log2-CPM against edgeR (in the Nix shell). It reads the files written by `run_export(debug_dir=...)`:
 
 ```
 uv run python -c "from sead_sexdiff.data import run_export; run_export(cohort='cohort_30', out_dir='/tmp/x', debug_dir='/tmp/dbg')"
 Rscript scripts/check_tmm_edger.R /tmp/dbg cohort_30
 ```
+
+### MOTCO trajectory analysis
+
+```
+sead-sexdiff analyze                    # both cohorts
+sead-sexdiff analyze --cohort cohort_50 --force
+```
+
+Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--out-dir` (default `results/motco_analysis`), `--n-jobs` (parallel jobs for MOTCO's CV and RRPP, `-1` = all CPUs; default 1; MOTCO seeds one RRPP stream per worker, so other values change the permutation draws, p-values and null summaries, though not the statistics, rank or latent space; the reported results use 1), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
+
+Reads only the export (`rna.csv`, `atac.csv`, `metadata.csv`, `covariates.csv`, `manifest.json` per cohort), so it runs on any workstation. It needs MOTCO ≥ 0.8.0, a dependency pinned to the tag `v0.8.0` of [tomszar/MOTCO](https://github.com/tomszar/MOTCO); an older install stops the run before any file is read. It stops when a file is missing (naming the `export` command), when the four tables list different donors, or when the export manifest's donor or feature counts disagree with the tables.
+
+Each cohort (`cohort_30` primary, `cohort_50` sensitivity) is analysed once with MOTCO's real-data entry point `motco.analysis.analyze_trajectories`, never with `motco plsr` + `motco de`:
+
+- blocks `rna` and `atac` in identity units (log2-CPM as exported); group `sex`; stage `stage` in the explicit order `0, 1, 2`;
+- MOTCO's defaults: net-displacement orientation, double-CV rank selection (`cv2_splits=4`, `cv1_splits=3`, `n_repeats=5`, `max_components=20`, `random_state=1203`), no attribution;
+- 999 RRPP permutations, seed `20261019`, α = 0.05 with rejection when p ≤ α;
+- covariates, additive and in this order: `age_at_death`, `pmi`, `rin`, `years_education`, `log10_n_rna`, `log10_n_atac`. The last two are `log10(n_rna)` and `log10(n_atac)`, derived here (the export is unchanged). `education_level` is not entered (categorical, one design column per level) and neither is `age_capped` (constant in this release: no capped ages; MOTCO rejects a constant covariate). Missing-covariate policy `error`: a missing value stops the run naming the column and donor, and nothing is imputed. There is no unadjusted run.
+
+These are scientific choices; the constants live in `src/sead_sexdiff/data.py` (`ANALYSIS_COVARIATES`, `ANALYSIS_LOG10_COLUMNS`, `ANALYSIS_EXCLUDED_COVARIATES`, `ANALYSIS_MISSING_COVARIATES`, `ANALYSIS_PERMUTATIONS`, `ANALYSIS_SEED`, `ANALYSIS_ALPHA`, `ANALYSIS_REJECTION_RULE`, `ANALYSIS_MOTCO_MIN_VERSION`) and are not CLI flags.
+
+Outputs in `results/motco_analysis/<cohort>/` (written to `<cohort>.tmp/` and renamed when complete):
+
+| file | content |
+|---|---|
+| `result.json` | MOTCO's record: `statistics` (`delta`, `angle` in degrees, `shape`), `p_values`, `null_summary`, `latent` (`selected_lv`, `component_selection`, `cv_mean_auroc`), `design` (levels, cell sizes), `covariates` (design columns, reference row, missing policy, dropped donors, coefficients), `measurement`, `software` |
+| `latent_scores.csv`, `pls_loadings.csv`, `stage_means.csv` | MOTCO's per-donor PLS scores, feature rotations and latent LS-means per sex × stage |
+| `analysis_metadata.csv` | the table the model saw: `donor_id`, `sex`, `stage`, `stage_label` and the six covariates, sorted by `donor_id` |
+| `analysis_manifest.json` | sha256 of the five inputs (incl. the export manifest), model declaration, preprocessing summary copied from the export manifest (excluded chromosomes, `min_cpm`, `k`, `prior_count`, `N`, feature counts per step, capped-age count, export findings), covariates entered / derived / excluded with reasons, measurement settings, `cli_equivalent`, software (incl. `motco`, `scikit-learn`), git revision, findings |
+| `summary.md` | generated from `result.json`: statistics with p, null mean / sd / q95 and the CV-selected rank in the `angle` row; cell sizes; latent block; covariate block |
+
+At the same `--n-jobs`, the latent scores, loadings, stage means and `analysis_metadata.csv` are byte-identical across reruns and `result.json` differs only in `runtime_seconds`. To reproduce a cohort with MOTCO's own CLI, run the manifest's `cli_equivalent.command` from the repository root with `OUT_DIR` replaced by a new directory; it passes `analysis_metadata.csv` with the six `--covariate` flags and gives the same statistics, p-values and rank.
+
+Interpretation rules, binding from MOTCO's operating studies (`../MOTCO/docs/roadmap.md`, Phase 6 and Next changes item 1; the covariate Type I report §5):
+
+- `delta`: a rejection is evidence that the trajectories differ, not specifically in size. MOTCO's unadjusted Phase 6 study let a non-rejection argue against size differences of about 25 % or more, but the adjusted analysis carries no power claim, so here a non-rejection is not evidence against a size difference.
+- `angle` (net displacement): the angle between the sexes' net displacement vectors (stage 2 mean − stage 0 mean), so it reads only the endpoint stages. Report the CV-selected rank beside it. A non-rejection is uninformative at n = 80, not evidence that the directions agree.
+- `shape`: a rejection is evidence of a difference but not of which kind; a non-rejection is uninformative.
+- Report the `covariates` block beside the results. The adjustment is additive and linear, the latent space is fitted without the covariates (covariate-blind basis), the Type I check covered three covariate design columns (six are entered here), and there is no power claim for the adjusted analysis. The operating characteristics come from a structural analogue (InterSIM blocks, 498 features), not from these data.
 
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
@@ -369,6 +411,16 @@ from sead_sexdiff.data import run_covariates, run_export, tmm_factors, log_cpm
 run_covariates(omic="both")
 results = run_export(cohort="all", force=True)
 results["cohort_30"]["steps"]  # feature counts after each step, per omic
+```
+
+- The MOTCO trajectory analysis:
+
+```python
+from sead_sexdiff.data import load_analysis_inputs, run_analysis
+
+loaded = load_analysis_inputs("results/motco_input/cohort_30")  # checked blocks + model metadata
+results = run_analysis("cohort_30", force=True)
+results["cohort_30"]["record"]["p_values"]
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:

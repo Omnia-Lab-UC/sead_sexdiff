@@ -41,6 +41,12 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `atac.csv`, `metadata.csv`, `covariates.csv`, `features_<omic>.csv`,
    `manifest.json`). Covariates are exported, not applied: adjustment is a
    MOTCO change.
+5. `analyze` – from `results/motco_input/` only, per cohort: the
+   covariate-adjusted sex × stage trajectory comparison through MOTCO's
+   `analyze_trajectories` (≥ 0.8.0), writing `results/motco_analysis/<cohort>/`
+   (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
+   `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
+   `summary.md`). Never assemble it from `motco plsr` + `motco de`.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -50,13 +56,16 @@ when behavior or defaults change.
 - `src/sead_sexdiff/cli.py` – argparse CLI (`build_parser`, `main`); thin layer
   that calls into `data.py` and prints `[command]`-prefixed progress messages.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
-  pseudobulk, differential expression.
+  pseudobulk, differential expression, covariates, MOTCO export and analysis.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` (cluster job), `sync_pseudobulk.sh`
   (rsync of `results/pseudobulk/` to a workstation) and `check_tmm_edger.R`
   (one-off edgeR cross-check of the export's TMM / log2-CPM).
 - `data/`, `results/` – gitignored; never commit their contents.
+- `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
+  Their numbers are pasted from generated outputs (`summary.md`, manifests),
+  never retyped, and checked against `result.json` before committing.
 - `openspec/` – OpenSpec change proposals/specs (see below).
 
 ## Environment & commands
@@ -66,7 +75,13 @@ when behavior or defaults change.
   packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|subset|de> [options]`.
+- `motco` is a git dependency pinned to a release tag of
+  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`; `uv.lock` holds
+  the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
+  never as a path dependency on `../MOTCO`. It pins scikit-learn exactly; do
+  not loosen that pin to resolve a conflict. `run_analysis` refuses a MOTCO
+  older than `ANALYSIS_MOTCO_MIN_VERSION`.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
 - Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)
@@ -114,6 +129,24 @@ when behavior or defaults change.
   `STAGE_LABELS`, `GENCODE_RELEASE` (v32 basic, matching 10x GRCh38-2020-A).
   No step may use sex, stage or covariates. Changes to the numpy TMM must be
   re-checked with `scripts/check_tmm_edger.R`.
+- MOTCO analysis constants (flag and ask before changing any of them):
+  `ANALYSIS_COVARIATES` (age_at_death, pmi, rin, years_education,
+  log10_n_rna, log10_n_atac; additive, in this order),
+  `ANALYSIS_LOG10_COLUMNS` (nuclei counts enter on the log10 scale, derived
+  at analysis time), `ANALYSIS_EXCLUDED_COVARIATES` (`education_level` by
+  decision, `age_capped` constant in this release),
+  `ANALYSIS_MISSING_COVARIATES` (`error`, never impute),
+  `ANALYSIS_PERMUTATIONS` (999), `ANALYSIS_SEED` (20261019),
+  `ANALYSIS_ALPHA` (0.05) with `ANALYSIS_REJECTION_RULE` (p ≤ α),
+  `ANALYSIS_MOTCO_MIN_VERSION` (0.8.0). MOTCO's own defaults (net-displacement
+  orientation, double-CV rank) are not overridden, and there is no
+  unadjusted run. `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
+  worker), so report results from `n_jobs = 1`.
+- Reporting MOTCO results follows the binding rules in
+  `../MOTCO/docs/roadmap.md` (Phase 6, Next changes item 1): CV-selected rank
+  beside `angle`; `angle`/`shape` non-rejections are uninformative; a
+  `delta` rejection is a difference, not specifically of size; report the
+  covariate block and the feature filtering beside the results.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
