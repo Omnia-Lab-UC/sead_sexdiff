@@ -57,6 +57,20 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
    (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
+7. `preprocessing-sensitivity` – from `results/pseudobulk/`, the annotation,
+   `results/motco_input/` and `results/motco_analysis/`, per variant of the
+   registry `PREPROCESSING_VARIANTS` (now `keep_chrx`) and per cohort: the
+   export rerun with the variant's one setting changed (`_export_cohort`,
+   shared with `export`) and the analysis rerun unchanged on the variant
+   blocks (`_analyze_cohort` with the `analyze` parameters), compared with
+   the primary analysis. The primary export and analysis are read and
+   checked (pseudobulk, covariates and annotation hashes, thresholds, `k`,
+   cells; export hashes, MOTCO version, seed, permutations, CV selection),
+   never rerun or modified. Writes `results/motco_sensitivity/<variant>/`
+   (`motco_input/<cohort>/`, `motco_analysis/<cohort>/`, mirroring the primary
+   layout so `rank-sensitivity` can read a variant, and
+   `comparison/<cohort>/` with `sensitivity.csv`, `sensitivity.md`,
+   `sensitivity_manifest.json`).
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -66,7 +80,8 @@ when behavior or defaults change.
 - `src/sead_sexdiff/cli.py` – argparse CLI (`build_parser`, `main`); thin layer
   that calls into `data.py` and prints `[command]`-prefixed progress messages.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
-  pseudobulk, differential expression, covariates, MOTCO export and analysis.
+  pseudobulk, differential expression, covariates, MOTCO export, analysis
+  and the rank / preprocessing sensitivity analyses.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` (cluster job), `sync_pseudobulk.sh`
@@ -85,7 +100,7 @@ when behavior or defaults change.
   packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|rank-sensitivity|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`; `uv.lock` holds
   the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -174,6 +189,23 @@ when behavior or defaults change.
   forced 2(K − 1); wider `angle` null above `n_stages − 1`) are carried as
   limitations, and the adjusted analysis has no Type I check at any forced
   rank.
+- Preprocessing-sensitivity constants (flag and ask before changing any of
+  them): `PREPROCESSING_VARIANTS`, a registry keyed by variant name with a
+  `description` and the `_export_cohort` keyword(s) it changes (`keep_chrx`:
+  `excluded_chromosomes = ("chrY", "chrM")`, so chrX is kept and the whole
+  export pipeline is recomputed with it present; never a flag, never chosen
+  from results, entries only added by a change proposal), the rule that a
+  variant reruns the whole export at the primary's thresholds and N and the
+  analysis at the primary's settings (same `ANALYSIS_SEED` and
+  `ANALYSIS_PERMUTATIONS`, CV rank selection), the output names
+  (`PREPROCESSING_*`), `n_jobs = 1` for reported results, and the rule that
+  the primary analysis stays primary. The variant is read as sensitivity
+  only: a rejection status that differs between the variant and the primary
+  is preprocessing dependence (not a result of the variant), a CV-selected
+  rank that differs is reported beside `angle` (not better or worse), the
+  non-rejection rules hold in the variant, and with chrX kept X-dosage
+  features enter the blocks that MOTCO's operating characteristics never
+  covered, so the variant carries no Type I or power claim of its own.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk

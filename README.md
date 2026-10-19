@@ -328,6 +328,42 @@ Reading rules, binding for the report (`reports/motco-astrocyte-rank-sensitivity
 - `angle` and `shape` non-rejections stay uninformative at every rank; a `delta` rejection is a difference, not specifically of size.
 - MOTCO's forced-rank operating characteristics are carried as limitations: its Type I evidence at a forced rank covers rank 4 at this design without covariates; forced 2(K − 1) lost `shape` power and leaked `angle` into the magnitude cell in MOTCO's orientation probe; ranks above `n_stages − 1` widened the `angle` null in MOTCO's rank ladder. The covariate-adjusted analysis has no Type I check at any forced rank.
 
+### MOTCO preprocessing sensitivity
+
+```
+sead-sexdiff preprocessing-sensitivity                       # every registered variant, both cohorts
+sead-sexdiff preprocessing-sensitivity --variant keep_chrx --cohort cohort_50 --force
+```
+
+Options: `--variant {keep_chrx,all}` (default `all`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--pseudobulk-dir` (default `results/pseudobulk`; the export's inputs), `--input-dir` (default `results/motco_input`; the `export` step's output, read as the primary export and never written), `--analysis-dir` (default `results/motco_analysis`; the `analyze` step's output, read as the primary analysis and never written), `--out-dir` (default `results/motco_sensitivity`), `--data-root` (only to locate the annotation), `--n-jobs` (parallel jobs for MOTCO's CV and RRPP, `-1` = all CPUs; default 1; other values change the permutation draws and are recorded as a finding; the reported results use 1), `--force` (replace a cohort's existing variant export, analysis and comparison directories under `--out-dir`; without it any of the three existing is an error and nothing is written).
+
+Measures how the covariate-adjusted trajectory comparison depends on a preprocessing choice of the export: per variant and cohort, the export is rerun with one predeclared setting changed and the analysis is rerun unchanged on the variant blocks, beside the primary analysis. The variants are a registry constant, `PREPROCESSING_VARIANTS` in `src/sead_sexdiff/data.py`, not a flag, and no variant is added, dropped or altered from the results. It holds one variant:
+
+- `keep_chrx`: excluded chromosomes `chrY` and `chrM` instead of `chrX`, `chrY`, `chrM`, so chrX features are kept. Every other export setting (the cohort's donors, `k` from the smallest sex × stage cell, CPM ≥ 1 in ≥ `k` donors, TMM, prior count 2, top 5,000 by variance per omic, GENCODE v32 basic) is the primary export's. Mechanically this is the primary pipeline with chrX present, not the primary blocks with chrX appended: step 3's library sizes include the chrX counts, so every feature's CPM shifts slightly and the abundance filter can change at its margin; TMM factors and log2-CPM are recomputed on the new filtered set; chrX features enter the variance ranking and compete for the 5,000 slots like any other feature. The primary export removed chrX by design because sex is the group and X-dosage features (`XIST` in females, the escapees) would separate the sexes trivially; the variant measures what that removal changes.
+
+The variant analysis is one `analyze_trajectories` call with the `analyze` step's settings: the same blocks and units, stage order, six covariates in the same order, missing-covariate policy `error`, net-displacement orientation, CV rank selection at MOTCO's defaults, 999 RRPP permutations and the seed `20261019`, so the variant draws the same permutation indices as the primary and the difference between the two rows is a data difference. There is no per-variant analysis setting.
+
+The primary export and analysis are read, never rerun. Before anything is written, for every requested variant and cohort, the step checks that `results/motco_input/<cohort>/manifest.json` records the same sha256 for the pseudobulk manifest, the covariates manifest and the annotation as the files now on disk, the same `min_cpm`, `prior_count`, `N`, TMM settings and excluded chromosomes as the constants, and the same `k`, cells and donor count as `donor_table.csv` gives now (a difference stops the step naming the file or setting and the `export` command); and that `results/motco_analysis/<cohort>/analysis_manifest.json` records the same sha256 for the five export files as the files now on disk, the installed MOTCO version, the seed and permutation count the step uses and CV rank selection (the rank sweep's check; a difference names the file or setting and the `analyze` command). A missing pseudobulk file, export or analysis directory stops the step naming it and the command that produces it. The variant export's `metadata.csv` and `covariates.csv` must then be byte-identical to the primary's; a difference is an error. Nothing under `results/motco_input/` or `results/motco_analysis/` is ever written.
+
+Outputs under `results/motco_sensitivity/<variant>/`, a layout that mirrors the primary pipeline so that `rank-sensitivity --input-dir results/motco_sensitivity/<variant>/motco_input --analysis-dir results/motco_sensitivity/<variant>/motco_analysis --out-dir …` can run the forced-rank sweep on a variant without code changes (each cohort directory is written as `<cohort>.tmp/` and renamed, in the order export → analysis → comparison; a cohort is complete when its comparison directory exists):
+
+| path | content |
+|---|---|
+| `motco_input/<cohort>/` | the variant export: the same seven files as `results/motco_input/<cohort>/`, with `thresholds.excluded_chromosomes = ["chrY", "chrM"]` and a `variant` block (name, description, settings, the primary export directory) in its `manifest.json`; `features_<omic>.csv` gives every chrX feature an `abundance`, `variance` or `kept` status, never `sex_chromosome` |
+| `motco_analysis/<cohort>/` | the variant analysis: the same seven files as `results/motco_analysis/<cohort>/` (`result.json` with `component_selection = cv`, `permutations = 999`, the seed and the six covariates; `analysis_manifest.json` whose `preprocessing` block carries the variant's excluded chromosomes and feature counts and whose `cli_equivalent` reproduces the run with `motco analyze` on the variant blocks) |
+| `comparison/<cohort>/sensitivity.csv` | two rows generated from the records, the primary row first (`variant = primary`, the primary's CV-selected rank, the primary analysis directory) then the variant row (`variant = keep_chrx`, its CV-selected rank, `motco_analysis/<cohort>` relative to the variant root); per statistic (`delta`, `angle`, `shape`) the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95, plus `cv_mean_auroc`. Floats in their shortest round-trip form, no runtime column, so the file is byte-identical across reruns |
+| `comparison/<cohort>/sensitivity.md` | the same values as one table per statistic; the feature accounting per omic and export (counts after chromosome removal, abundance and variance, kept features on chrX, kept features shared with the other export and kept only by one of them, and the status of `XIST` in both exports); a run table (rank selection, CV AUROC, runtime, directory); the findings |
+| `comparison/<cohort>/sensitivity_manifest.json` | the variant name and settings, cohort, seed, permutations, α, `n_jobs`; sha256 of the pseudobulk manifest, the covariates manifest and the annotation, of the five primary export files, of the primary `result.json` and `analysis_manifest.json`, of the five variant export files and of the variant's two analysis files; both ranks, CV AUROCs and runtimes; the feature accounting with the kept chrX feature names; software (incl. `motco`, `scikit-learn`), git revision, findings (the CV-selected ranks differ; a statistic's rejection status differs, recorded as preprocessing dependence; `n_jobs ≠ 1`; the variant export's own findings) |
+
+Two runs of a variant on the same pseudobulk outputs, annotation, primary export, primary analysis, MOTCO release, seed and `n_jobs` give identical statistics, p-values, rank and null summaries and byte-identical variant export CSVs, `latent_scores.csv`, `pls_loadings.csv`, `stage_means.csv`, `analysis_metadata.csv` and `sensitivity.csv`.
+
+Reading rules, binding for the report (`reports/motco-astrocyte-chrx-sensitivity-<date>.md`):
+
+- The primary analysis remains the primary result; the variant is sensitivity to it and never its replacement, and no variant is chosen after seeing the results. `cohort_30` is primary and `cohort_50` sensitivity, as in the primary report.
+- A statistic whose rejection status differs between the variant and the primary is preprocessing dependence of the sensitivity analysis, not a result of the variant. No rejection in either is no evidence of a difference with chrX kept either, not evidence of agreement in size, direction or shape.
+- `angle` and `shape` non-rejections stay uninformative in the variant; a `delta` rejection is a difference, not specifically of size. A CV-selected rank that differs is reported beside `angle`, not read as better or worse.
+- chrX limitations: with chrX kept, features whose expression or accessibility differs between the sexes by X dosage enter the blocks (the report names them, `XIST` first, and says whether the variant kept them); a constant sex offset shifts the two sexes' centroids but not the within-sex displacement between stages, and the PLS basis is stage-supervised, so such features enter the latent space only through their covariance with stage, but MOTCO's operating characteristics were not measured with such features and the variant carries no Type I or power claim of its own.
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.
@@ -454,6 +490,20 @@ from sead_sexdiff.data import load_analysis_inputs, run_analysis
 loaded = load_analysis_inputs("results/motco_input/cohort_30")  # checked blocks + model metadata
 results = run_analysis("cohort_30", force=True)
 results["cohort_30"]["record"]["p_values"]
+```
+
+- The rank and preprocessing sensitivity analyses (the primary analysis is read, never rerun):
+
+```python
+from sead_sexdiff.data import PREPROCESSING_VARIANTS, run_preprocessing_sensitivity, run_rank_sensitivity
+
+sweep = run_rank_sensitivity("cohort_30", force=True)
+sweep["cohort_30"]["table"]  # the cross-rank table, reference row first
+
+PREPROCESSING_VARIANTS["keep_chrx"]["export"]  # {'excluded_chromosomes': ('chrY', 'chrM')}
+results = run_preprocessing_sensitivity("keep_chrx", "cohort_30", force=True)
+results["keep_chrx"]["cohort_30"]["table"]     # primary row then variant row
+results["keep_chrx"]["cohort_30"]["findings"]
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:
