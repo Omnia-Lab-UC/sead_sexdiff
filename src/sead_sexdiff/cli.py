@@ -19,8 +19,10 @@ from .data import (
     EXPORT_COHORTS,
     ANALYSIS_STATISTICS,
     ANALYSIS_FORCED_RANKS,
+    PREPROCESSING_VARIANTS,
     run_analysis,
     run_rank_sensitivity,
+    run_preprocessing_sensitivity,
     run_covariates,
     run_export,
     run_pseudobulk,
@@ -455,6 +457,86 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing cohort directories under --out-dir",
     )
+
+    # preprocessing-sensitivity command: export variants beside the primary analysis
+    variants = ", ".join(PREPROCESSING_VARIANTS)
+    sub_ps = sub.add_parser(
+        "preprocessing-sensitivity",
+        help="Rerun the export with one registered setting changed, then the analysis, beside the primary",
+        description=(
+            "Per variant of the registry PREPROCESSING_VARIANTS (a constant, not a flag; now: "
+            f"{variants}) and per cohort: rerun the export from the pseudobulk outputs with the variant's "
+            "setting changed and everything else equal to the export step (keep_chrx removes chrY and chrM "
+            "only, so chrX features are kept and the abundance filter, TMM, log2-CPM and the variance ranking "
+            "are recomputed with them present), then rerun the covariate-adjusted trajectory analysis on the "
+            "variant blocks with the analyze step's settings (CV-selected rank, 999 RRPP permutations, same "
+            "seed), and compare it with the primary analysis. The primary export and analysis are read and "
+            "checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells; export hashes, MOTCO "
+            "version, seed, permutations, CV selection), never rerun or modified, and stay the primary result. "
+            "Writes <out-dir>/<variant>/motco_input/<cohort>/ (the variant export), "
+            "<out-dir>/<variant>/motco_analysis/<cohort>/ (the variant analysis) and "
+            "<out-dir>/<variant>/comparison/<cohort>/ (sensitivity.csv, sensitivity.md, sensitivity_manifest.json)."
+        ),
+    )
+    sub_ps.add_argument(
+        "--variant",
+        choices=list(PREPROCESSING_VARIANTS) + ["all"],
+        default="all",
+        help="Registered variant(s) to run (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to run (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help="Directory with the pseudobulk and covariates outputs, the export's inputs (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--out-dir",
+        default=Path("results/motco_sensitivity"),
+        type=Path,
+        help="Sensitivity root; one subdirectory per variant (default: %(default)s)",
+    )
+    sub_ps.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=(
+            "Data root holding <root>/annotation/ for the GENCODE GTF "
+            f"(default: ${DATA_ROOT_ENV}, else data)"
+        ),
+    )
+    sub_ps.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel jobs for MOTCO's CV and RRPP, -1 = all CPUs. Values other than 1 change the RRPP "
+            "draws (p-values); results are reported at 1 (default: %(default)s)"
+        ),
+    )
+    sub_ps.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a cohort's existing variant export, analysis and comparison directories under --out-dir",
+    )
     return parser
 
 
@@ -647,6 +729,34 @@ def main(argv: list[str] | None = None) -> int:
         print("[rank-sensitivity] Cross-rank table (cv = the CV-selected analysis, primary; forced = sensitivity):")
         print(table.to_string(index=False))
         print("[rank-sensitivity] Done.")
+        return 0
+
+    if args.command == "preprocessing-sensitivity":
+        import pandas as pd
+
+        print("[preprocessing-sensitivity] Running the preprocessing sensitivity analysis...")
+        results = run_preprocessing_sensitivity(
+            args.variant,
+            args.cohort,
+            pseudobulk_dir=args.pseudobulk_dir,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            out_dir=args.out_dir,
+            data_root=args.data_root,
+            n_jobs=args.n_jobs,
+            force=args.force,
+        )
+        columns = ["variant", "cohort", "component_selection", "rank"]
+        for s in ANALYSIS_STATISTICS:
+            columns += [s, f"{s}_p", f"{s}_rejected"]
+        table = pd.concat(
+            [res["table"][columns] for per_cohort in results.values() for res in per_cohort.values()],
+            ignore_index=True,
+        )
+        print("[preprocessing-sensitivity] Comparison table (primary = the analyze step's result, primary; "
+              "the variant rows are sensitivity):")
+        print(table.to_string(index=False))
+        print("[preprocessing-sensitivity] Done.")
         return 0
 
     parser.error("Unknown command")

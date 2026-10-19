@@ -2423,6 +2423,261 @@ def _features_frame(names, chromosomes, res: dict, gene_ids=None) -> pd.DataFram
     return df
 
 
+def _load_export_inputs(pseudobulk_dir: str | Path, data_root: str | Path | None, *, log_prefix: str = "export") -> dict:
+    """Load everything the per-cohort export reads: annotation, tables, matrices.
+
+    Parameters
+    ----------
+    pseudobulk_dir:
+        Output directory of ``pseudobulk`` and ``covariates`` (already checked
+        with :func:`check_export_inputs`).
+    data_root:
+        Data root holding (or receiving) the gene annotation.
+    log_prefix:
+        Prefix of the progress lines.
+
+    Returns
+    -------
+    dict
+        ``table`` (``donor_table.csv``), ``covariates`` (``donor_covariates.csv``),
+        ``blocks`` (omic → ``{"X", "donors", "names", "gene_ids", "chrom"}``),
+        ``annotation`` (provenance plus ``n_rna_genes`` / ``n_rna_unmapped``)
+        and ``pb_info`` (the export manifest's ``input`` block: pseudobulk
+        directory, manifest hashes and timestamp).
+    """
+    import scipy.sparse as sp
+
+    pb = Path(pseudobulk_dir)
+    pb_manifest = json.loads((pb / "manifest.json").read_text())
+    mapping, annotation = resolve_gene_annotation(data_root)
+    print(f"[{log_prefix}] Annotation: {annotation['release']} ({annotation['n_genes']} genes, sha256 {annotation['sha256'][:12]}…)")
+
+    table = pd.read_csv(pb / "donor_table.csv", dtype={"donor_id": str, "stage": str, "sex": str})
+    covariates = pd.read_csv(pb / "donor_covariates.csv", dtype={"donor_id": str, "education_level": str})
+    blocks = {}
+    for o in ("rna", "atac"):
+        a = ad.read_h5ad(pb / f"{o}_counts.h5ad")
+        X = sp.csr_matrix(a.X)
+        if o == "rna":
+            gene_ids = a.var["gene_ids"].astype(str).to_numpy()
+            chrom = rna_chromosomes(gene_ids, mapping)
+        else:
+            gene_ids = None
+            chrom = atac_chromosomes(a.var_names)
+        blocks[o] = {
+            "X": X, "donors": a.obs_names.astype(str).to_numpy(),
+            "names": a.var_names.astype(str).to_numpy(), "gene_ids": gene_ids, "chrom": chrom,
+        }
+        del a
+    annotation["n_rna_genes"] = int(blocks["rna"]["names"].size)
+    annotation["n_rna_unmapped"] = int((blocks["rna"]["chrom"] == UNMAPPED_CHROMOSOME).sum())
+    cov_manifest = pb / "covariates_manifest.json"
+    pb_info = {
+        "pseudobulk_dir": str(pb.resolve()),
+        "pseudobulk_manifest_sha256": _sha256_file(pb / "manifest.json"),
+        "pseudobulk_manifest_created_at": pb_manifest.get("created_at"),
+        "covariates_manifest_sha256": _sha256_file(cov_manifest) if cov_manifest.exists() else None,
+    }
+    return {"table": table, "covariates": covariates, "blocks": blocks, "annotation": annotation, "pb_info": pb_info}
+
+
+def _cohort_rows(table: pd.DataFrame, covariates: pd.DataFrame, cohort: str, pseudobulk_dir: Path) -> pd.DataFrame:
+    """The cohort's rows of the donor table, sorted by ``donor_id`` and checked against the covariates."""
+    sub = table[table[cohort].astype(bool)].sort_values("donor_id").reset_index(drop=True)
+    missing_cov = sorted(set(sub["donor_id"]) - set(covariates.donor_id))
+    if missing_cov:
+        raise ValueError(f"{Path(pseudobulk_dir) / 'donor_covariates.csv'}: no row for cohort {cohort} donor(s) {missing_cov}")
+    return sub
+
+
+def _export_cohort(
+    cohort: str,
+    sub: pd.DataFrame,
+    blocks: dict,
+    covariates: pd.DataFrame,
+    annotation: dict,
+    pb_info: dict,
+    *,
+    out_dir: Path,
+    final_name: str,
+    excluded_chromosomes: Iterable[str],
+    variant: dict | None = None,
+    debug_dir: Path | None = None,
+    log_prefix: str = "export",
+) -> dict:
+    """Preprocess one cohort and write its complete MOTCO input directory.
+
+    Shared by ``run_export`` (the primary export, ``EXPORT_EXCLUDED_CHROMOSOMES``)
+    and ``run_preprocessing_sensitivity`` (a registered variant): the two differ
+    only in the keyword settings, so a variant export is the primary export
+    with one setting changed and nothing else.
+
+    Parameters
+    ----------
+    cohort:
+        Cohort name (manifest and progress lines).
+    sub:
+        The cohort's rows of ``donor_table.csv``, sorted by ``donor_id``
+        (``_cohort_rows``).
+    blocks:
+        Omic → ``{"X", "donors", "names", "gene_ids", "chrom"}``
+        (``_load_export_inputs``).
+    covariates:
+        ``donor_covariates.csv``.
+    annotation:
+        Provenance of the gene annotation, recorded in the manifest.
+    pb_info:
+        The manifest's ``input`` block (pseudobulk directory and manifest hashes).
+    out_dir, final_name:
+        The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
+        to ``<out_dir>/<final_name>`` when complete.
+    excluded_chromosomes:
+        Chromosomes whose features are removed before the abundance filter
+        (recorded in ``thresholds.excluded_chromosomes``).
+    variant:
+        For a preprocessing-sensitivity variant, ``{"name", "description",
+        "settings", "reference_export_dir"}``, written as the manifest's
+        ``variant`` block; ``None`` for the primary export, whose manifest then
+        has no such key.
+    debug_dir:
+        If given, the filtered counts, TMM factors and log2-CPM per omic go
+        there (``_write_debug``).
+    log_prefix:
+        Prefix of the progress lines, ``[export]`` by default.
+
+    Returns
+    -------
+    dict
+        ``{"dir": Path, "manifest": dict, "findings": [...], "k": int, "cells": dict}``.
+    """
+    import shutil
+
+    excluded = tuple(excluded_chromosomes)
+    donors = sub["donor_id"].to_numpy()
+    k, k_cell, cells = smallest_cell(sub)
+    print(f"[{log_prefix}] {cohort}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
+    findings = []
+    n_unmapped = annotation.get("n_rna_unmapped", 0)
+    if n_unmapped:
+        findings.append(
+            f"rna: {n_unmapped} of {blocks['rna']['names'].size} genes are absent from "
+            f"{annotation['release']}; they are kept (chromosome '{UNMAPPED_CHROMOSOME}')"
+        )
+    res = {}
+    for o, blk in blocks.items():
+        pos = pd.Index(blk["donors"]).get_indexer(donors)
+        if (pos < 0).any():
+            raise ValueError(f"{o}_counts.h5ad lacks cohort {cohort} donor(s) {list(donors[pos < 0])}")
+        counts = blk["X"][pos].toarray()
+        res[o] = preprocess_block(counts, blk["names"], blk["chrom"], k=k, excluded_chromosomes=excluded)
+        findings += [f"{o}: {msg}" for msg in res[o]["findings"]]
+        s = res[o]["steps"]
+        print(f"[{log_prefix}] {cohort} {o}: {s['input']} → {s['after_sex_chromosome']} → "
+              f"{s['after_abundance']} → {s['after_variance']}")
+        if debug_dir is not None:
+            _write_debug(Path(debug_dir), cohort, o, donors, res[o])
+
+    tmp = out_dir / f"{final_name}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    for o in ("rna", "atac"):
+        df = pd.DataFrame(res[o]["values"], index=pd.Index(donors, name="donor_id"), columns=res[o]["kept"])
+        df.to_csv(tmp / f"{o}.csv", float_format=EXPORT_FLOAT_FORMAT)
+        _features_frame(blocks[o]["names"], blocks[o]["chrom"], res[o], blocks[o]["gene_ids"]).to_csv(
+            tmp / f"features_{o}.csv", index=False, float_format=EXPORT_FLOAT_FORMAT
+        )
+    meta = pd.DataFrame({
+        "donor_id": donors,
+        "sex": sub["sex"].to_numpy(),
+        "stage": sub["stage"].to_numpy(),
+        "stage_label": sub["stage"].map(STAGE_LABELS).to_numpy(),
+    })
+    meta.to_csv(tmp / "metadata.csv", index=False)
+    cov = covariates.set_index("donor_id").loc[donors].reset_index()
+    cov["n_rna"] = sub["n_rna"].to_numpy()
+    cov["n_atac"] = sub["n_atac"].to_numpy()
+    cov.to_csv(tmp / "covariates.csv", index=False)
+
+    cov_cols = [col for col in cov.columns if col not in ("donor_id", "age_capped")]
+    missingness = {
+        col: sorted(cov.loc[cov[col].isna(), "donor_id"]) for col in cov_cols
+    }
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cohort": cohort,
+        "n_donors": int(len(donors)),
+        "blocks": {
+            o: {"file": f"{o}.csv", "units": "log2-CPM", "motco_transform": "identity",
+                "n_features": int(res[o]["values"].shape[1]), "features_file": f"features_{o}.csv"}
+            for o in ("rna", "atac")
+        },
+        "metadata": {
+            "file": "metadata.csv",
+            "sample_col": "donor_id",
+            "group_col": "sex",
+            "group_labels": sorted(sub["sex"].unique()),
+            "stage_col": "stage",
+            "stage_order": STAGES,
+            "stage_labels": STAGE_LABELS,
+            "cells": cells,
+        },
+        "preprocessing_order": [
+            "restrict to cohort donors",
+            "remove features on excluded chromosomes",
+            "keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome removal)",
+            "TMM factors on the filtered counts (library size = filtered column sums)",
+            "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
+            "keep the N features with the highest population variance (ddof 0), ties by name; input order kept",
+        ],
+        "thresholds": {
+            "excluded_chromosomes": list(excluded),
+            "min_cpm": EXPORT_MIN_CPM,
+            "k": k,
+            "k_source_cell": k_cell,
+            "prior_count": EXPORT_PRIOR_COUNT,
+            "N": EXPORT_TOP_N,
+            "tmm": {"logratio_trim": TMM_LOGRATIO_TRIM, "sum_trim": TMM_SUM_TRIM,
+                    "weighting": True, "reference": "upper-quartile factor closest to the mean"},
+            "float_format": EXPORT_FLOAT_FORMAT,
+        },
+        **({"variant": dict(variant)} if variant is not None else {}),
+        "feature_counts": {o: res[o]["steps"] for o in ("rna", "atac")},
+        "removed_by_chromosome": {o: res[o]["removed_by_chromosome"] for o in ("rna", "atac")},
+        "kept_mean_log_cpm_range": {o: res[o]["mean_log_cpm_range"] for o in ("rna", "atac")},
+        "tmm": {
+            o: {
+                d: {"lib_size_filter": int(res[o]["lib_size_filter"][i]),
+                    "lib_size": int(res[o]["lib_size"][i]),
+                    "factor": float(res[o]["tmm_factors"][i])}
+                for i, d in enumerate(donors)
+            }
+            for o in ("rna", "atac")
+        },
+        "annotation": annotation,
+        "input": dict(pb_info),
+        "covariates": {
+            "file": "covariates.csv",
+            "applied": False,
+            "note": "covariates exported, not applied (adjustment belongs to MOTCO)",
+            "missing": missingness,
+            "n_age_capped": int(cov["age_capped"].astype(bool).sum()),
+        },
+        "software": _software_versions(),
+        "git": _git_revision(),
+        "findings": findings,
+    }
+    (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    final = out_dir / final_name
+    if final.exists():
+        shutil.rmtree(final)
+    os.replace(tmp, final)
+    print(f"[{log_prefix}] Wrote {final}")
+    for msg in findings:
+        print(f"[{log_prefix}] FINDING: {cohort}: {msg}")
+    return {"dir": final, "manifest": manifest, "findings": findings, "k": k, "cells": cells}
+
+
 def run_export(
     *,
     pseudobulk_dir: str | Path = "results/pseudobulk",
@@ -2453,190 +2708,41 @@ def run_export(
     Returns
     -------
     dict
-        Cohort → ``{"dir": Path, "steps": {omic: counts}, "findings": [...]}``.
+        Cohort → ``{"dir": Path, "steps": {omic: counts}, "findings": [...],
+        "manifest": dict, "k": int, "cells": dict}``.
 
     Notes
     -----
     Per cohort and omic: restrict to the cohort → drop chrX/Y/M → CPM ≥ 1 in
     ≥ k donors → TMM → log2-CPM (prior 2) → top N by variance. Covariates are
     exported alongside, not applied. Each cohort is written to
-    ``<cohort>.tmp/`` and renamed when complete.
+    ``<cohort>.tmp/`` and renamed when complete (``_export_cohort``, shared
+    with ``run_preprocessing_sensitivity``, which calls it with one setting
+    changed).
     """
-    import shutil
-    import scipy.sparse as sp
-
     pb = Path(pseudobulk_dir)
     out_dir = Path(out_dir)
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
             raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
-    pb_manifest = check_export_inputs(pb, cohorts)
+    check_export_inputs(pb, cohorts)
     for c in cohorts:
         if (out_dir / c).exists() and not force:
             raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
     print(f"[export] Pseudobulk directory: {pb}")
     print(f"[export] Output directory: {out_dir}")
 
-    mapping, annotation = resolve_gene_annotation(data_root)
-    print(f"[export] Annotation: {annotation['release']} ({annotation['n_genes']} genes, sha256 {annotation['sha256'][:12]}…)")
-
-    table = pd.read_csv(pb / "donor_table.csv", dtype={"donor_id": str, "stage": str, "sex": str})
-    covariates = pd.read_csv(pb / "donor_covariates.csv", dtype={"donor_id": str, "education_level": str})
-    blocks = {}
-    for o in ("rna", "atac"):
-        a = ad.read_h5ad(pb / f"{o}_counts.h5ad")
-        X = sp.csr_matrix(a.X)
-        if o == "rna":
-            gene_ids = a.var["gene_ids"].astype(str).to_numpy()
-            chrom = rna_chromosomes(gene_ids, mapping)
-        else:
-            gene_ids = None
-            chrom = atac_chromosomes(a.var_names)
-        blocks[o] = {
-            "X": X, "donors": a.obs_names.astype(str).to_numpy(),
-            "names": a.var_names.astype(str).to_numpy(), "gene_ids": gene_ids, "chrom": chrom,
-        }
-        del a
-    n_unmapped = int((blocks["rna"]["chrom"] == UNMAPPED_CHROMOSOME).sum())
-    annotation["n_rna_genes"] = int(blocks["rna"]["names"].size)
-    annotation["n_rna_unmapped"] = n_unmapped
-    global_findings = []
-    if n_unmapped:
-        global_findings.append(
-            f"rna: {n_unmapped} of {blocks['rna']['names'].size} genes are absent from "
-            f"{annotation['release']}; they are kept (chromosome '{UNMAPPED_CHROMOSOME}')"
-        )
-    pb_manifest_sha = _sha256_file(pb / "manifest.json")
-    cov_manifest = pb / "covariates_manifest.json"
-
+    inputs = _load_export_inputs(pb, data_root)
     results = {}
     for c in cohorts:
-        sub = table[table[c].astype(bool)].sort_values("donor_id").reset_index(drop=True)
-        donors = sub["donor_id"].to_numpy()
-        missing_cov = sorted(set(donors) - set(covariates.donor_id))
-        if missing_cov:
-            raise ValueError(f"{pb / 'donor_covariates.csv'}: no row for cohort {c} donor(s) {missing_cov}")
-        k, k_cell, cells = smallest_cell(sub)
-        print(f"[export] {c}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
-        findings = list(global_findings)
-        res = {}
-        for o, blk in blocks.items():
-            pos = pd.Index(blk["donors"]).get_indexer(donors)
-            if (pos < 0).any():
-                raise ValueError(f"{o}_counts.h5ad lacks cohort {c} donor(s) {list(donors[pos < 0])}")
-            counts = blk["X"][pos].toarray()
-            res[o] = preprocess_block(counts, blk["names"], blk["chrom"], k=k)
-            findings += [f"{o}: {msg}" for msg in res[o]["findings"]]
-            s = res[o]["steps"]
-            print(f"[export] {c} {o}: {s['input']} → {s['after_sex_chromosome']} → "
-                  f"{s['after_abundance']} → {s['after_variance']}")
-            if debug_dir is not None:
-                _write_debug(Path(debug_dir), c, o, donors, res[o])
-
-        tmp = out_dir / f"{c}.tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        tmp.mkdir(parents=True)
-        for o in ("rna", "atac"):
-            df = pd.DataFrame(res[o]["values"], index=pd.Index(donors, name="donor_id"), columns=res[o]["kept"])
-            df.to_csv(tmp / f"{o}.csv", float_format=EXPORT_FLOAT_FORMAT)
-            _features_frame(blocks[o]["names"], blocks[o]["chrom"], res[o], blocks[o]["gene_ids"]).to_csv(
-                tmp / f"features_{o}.csv", index=False, float_format=EXPORT_FLOAT_FORMAT
-            )
-        meta = pd.DataFrame({
-            "donor_id": donors,
-            "sex": sub["sex"].to_numpy(),
-            "stage": sub["stage"].to_numpy(),
-            "stage_label": sub["stage"].map(STAGE_LABELS).to_numpy(),
-        })
-        meta.to_csv(tmp / "metadata.csv", index=False)
-        cov = covariates.set_index("donor_id").loc[donors].reset_index()
-        cov["n_rna"] = sub["n_rna"].to_numpy()
-        cov["n_atac"] = sub["n_atac"].to_numpy()
-        cov.to_csv(tmp / "covariates.csv", index=False)
-
-        cov_cols = [col for col in cov.columns if col not in ("donor_id", "age_capped")]
-        missingness = {
-            col: sorted(cov.loc[cov[col].isna(), "donor_id"]) for col in cov_cols
-        }
-        manifest = {
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "cohort": c,
-            "n_donors": int(len(donors)),
-            "blocks": {
-                o: {"file": f"{o}.csv", "units": "log2-CPM", "motco_transform": "identity",
-                    "n_features": int(res[o]["values"].shape[1]), "features_file": f"features_{o}.csv"}
-                for o in ("rna", "atac")
-            },
-            "metadata": {
-                "file": "metadata.csv",
-                "sample_col": "donor_id",
-                "group_col": "sex",
-                "group_labels": sorted(sub["sex"].unique()),
-                "stage_col": "stage",
-                "stage_order": STAGES,
-                "stage_labels": STAGE_LABELS,
-                "cells": cells,
-            },
-            "preprocessing_order": [
-                "restrict to cohort donors",
-                "remove features on excluded chromosomes",
-                "keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome removal)",
-                "TMM factors on the filtered counts (library size = filtered column sums)",
-                "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
-                "keep the N features with the highest population variance (ddof 0), ties by name; input order kept",
-            ],
-            "thresholds": {
-                "excluded_chromosomes": list(EXPORT_EXCLUDED_CHROMOSOMES),
-                "min_cpm": EXPORT_MIN_CPM,
-                "k": k,
-                "k_source_cell": k_cell,
-                "prior_count": EXPORT_PRIOR_COUNT,
-                "N": EXPORT_TOP_N,
-                "tmm": {"logratio_trim": TMM_LOGRATIO_TRIM, "sum_trim": TMM_SUM_TRIM,
-                        "weighting": True, "reference": "upper-quartile factor closest to the mean"},
-                "float_format": EXPORT_FLOAT_FORMAT,
-            },
-            "feature_counts": {o: res[o]["steps"] for o in ("rna", "atac")},
-            "removed_by_chromosome": {o: res[o]["removed_by_chromosome"] for o in ("rna", "atac")},
-            "kept_mean_log_cpm_range": {o: res[o]["mean_log_cpm_range"] for o in ("rna", "atac")},
-            "tmm": {
-                o: {
-                    d: {"lib_size_filter": int(res[o]["lib_size_filter"][i]),
-                        "lib_size": int(res[o]["lib_size"][i]),
-                        "factor": float(res[o]["tmm_factors"][i])}
-                    for i, d in enumerate(donors)
-                }
-                for o in ("rna", "atac")
-            },
-            "annotation": annotation,
-            "input": {
-                "pseudobulk_dir": str(pb.resolve()),
-                "pseudobulk_manifest_sha256": pb_manifest_sha,
-                "pseudobulk_manifest_created_at": pb_manifest.get("created_at"),
-                "covariates_manifest_sha256": _sha256_file(cov_manifest) if cov_manifest.exists() else None,
-            },
-            "covariates": {
-                "file": "covariates.csv",
-                "applied": False,
-                "note": "covariates exported, not applied (adjustment belongs to MOTCO)",
-                "missing": missingness,
-                "n_age_capped": int(cov["age_capped"].astype(bool).sum()),
-            },
-            "software": _software_versions(),
-            "git": _git_revision(),
-            "findings": findings,
-        }
-        (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        final = out_dir / c
-        if final.exists():
-            shutil.rmtree(final)
-        os.replace(tmp, final)
-        print(f"[export] Wrote {final}")
-        for msg in findings:
-            print(f"[export] FINDING: {c}: {msg}")
-        results[c] = {"dir": final, "steps": manifest["feature_counts"], "findings": findings}
+        sub = _cohort_rows(inputs["table"], inputs["covariates"], c, pb)
+        res = _export_cohort(
+            c, sub, inputs["blocks"], inputs["covariates"], inputs["annotation"], inputs["pb_info"],
+            out_dir=out_dir, final_name=c, excluded_chromosomes=EXPORT_EXCLUDED_CHROMOSOMES,
+            debug_dir=None if debug_dir is None else Path(debug_dir),
+        )
+        results[c] = {"steps": res["manifest"]["feature_counts"], **res}
 
     print("[export] Features after each step:")
     rows = [
@@ -3703,6 +3809,687 @@ def run_rank_sensitivity(
     return results
 
 
+# ---------------------------------------------------------------------------
+# MOTCO preprocessing sensitivity (export variants beside the primary analysis)
+# ---------------------------------------------------------------------------
+
+# Registered export variants, a constant and not a flag. Each variant is the
+# primary export with the listed `_export_cohort` keyword(s) changed, followed
+# by the primary analysis unchanged, and is read as sensitivity to the primary
+# analysis only. `keep_chrx` keeps chrX (chrY and chrM are still removed): the
+# whole export pipeline is recomputed with chrX present, so library sizes, the
+# abundance filter, TMM factors, log2-CPM and the variance ranking all change
+# and chrX features compete for the N slots like any other feature. Variants
+# are never added, dropped or altered from the results; the primary analysis
+# stays primary.
+PREPROCESSING_VARIANTS: dict[str, dict] = {
+    "keep_chrx": {
+        "description": "chrX kept; chrY and chrM removed; every other export setting equal to the primary",
+        "export": {"excluded_chromosomes": ("chrY", "chrM")},
+    },
+}
+PREPROCESSING_PRIMARY_LABEL = "primary"
+# Layout under <out_dir>/<variant>/: mirrors results/motco_input and
+# results/motco_analysis so the rank sweep can read a variant with no code change
+PREPROCESSING_INPUT_DIR = "motco_input"
+PREPROCESSING_ANALYSIS_DIR = "motco_analysis"
+PREPROCESSING_COMPARISON_DIR = "comparison"
+PREPROCESSING_SENSITIVITY_TABLE = "sensitivity.csv"
+PREPROCESSING_SENSITIVITY_MARKDOWN = "sensitivity.md"
+PREPROCESSING_SENSITIVITY_MANIFEST = "sensitivity_manifest.json"
+# X-dosage marker genes whose status is reported beside the feature accounting
+PREPROCESSING_NAMED_FEATURES = ("XIST",)
+
+
+def _check_export_reference(
+    primary_export_dir: str | Path,
+    pseudobulk_dir: str | Path,
+    annotation: dict,
+    *,
+    k: int,
+    cells: dict,
+    n_donors: int,
+) -> dict:
+    """Read the primary export of one cohort and check it was made from the inputs now on disk.
+
+    Parameters
+    ----------
+    primary_export_dir:
+        ``<export root>/<cohort>/`` as written by ``run_export``.
+    pseudobulk_dir:
+        The pseudobulk directory the sensitivity step reads.
+    annotation:
+        Provenance of the annotation now resolved (``resolve_gene_annotation``).
+    k, cells, n_donors:
+        The values ``donor_table.csv`` gives now for the cohort
+        (``smallest_cell``), which the primary export must have used.
+
+    Returns
+    -------
+    dict
+        ``dir``, ``manifest`` (parsed ``manifest.json``) and ``files`` (the
+        five analysis-input files' paths and sha256).
+
+    Raises
+    ------
+    FileNotFoundError
+        The export directory or one of its files is missing (the message
+        names the ``export`` command).
+    ValueError
+        The pseudobulk manifest, the covariates manifest or the annotation now
+        on disk has a sha256 different from the one the export recorded; a
+        threshold differs from the export constants; or ``k``, the cells or
+        the donor count differ from the donor table now; the message names the
+        file or setting and the ``export`` command. Nothing is written.
+    """
+    d = Path(primary_export_dir)
+    pb = Path(pseudobulk_dir)
+    hint = "run `sead-sexdiff export` to produce the primary export"
+    if not d.is_dir():
+        raise FileNotFoundError(f"{d} does not exist; {hint}")
+    for name in _ANALYSIS_INPUTS:
+        if not (d / name).exists():
+            raise FileNotFoundError(f"{d / name} is missing; {hint}")
+    manifest_path = d / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    rerun = (
+        "the primary export does not match its inputs or the export constants; rerun `sead-sexdiff export` "
+        "(then `sead-sexdiff analyze`) before the preprocessing sensitivity analysis"
+    )
+    recorded_input = manifest.get("input", {})
+    for name, key in (
+        ("manifest.json", "pseudobulk_manifest_sha256"),
+        ("covariates_manifest.json", "covariates_manifest_sha256"),
+    ):
+        before = recorded_input.get(key)
+        path = pb / name
+        now = _sha256_file(path) if path.exists() else None
+        if before != now:
+            raise ValueError(
+                f"{path} has sha256 {now} but {manifest_path} recorded {before} ({key}); {rerun}"
+            )
+    before = manifest.get("annotation", {}).get("sha256")
+    if before != annotation.get("sha256"):
+        raise ValueError(
+            f"annotation file {annotation.get('file')} has sha256 {annotation.get('sha256')} but "
+            f"{manifest_path} recorded {before}; {rerun}"
+        )
+    thr = manifest.get("thresholds", {})
+    recorded = {
+        "excluded_chromosomes": thr.get("excluded_chromosomes"),
+        "min_cpm": thr.get("min_cpm"),
+        "prior_count": thr.get("prior_count"),
+        "N": thr.get("N"),
+        "tmm.logratio_trim": thr.get("tmm", {}).get("logratio_trim"),
+        "tmm.sum_trim": thr.get("tmm", {}).get("sum_trim"),
+        "float_format": thr.get("float_format"),
+        "k": thr.get("k"),
+        "cells": manifest.get("metadata", {}).get("cells"),
+        "n_donors": manifest.get("n_donors"),
+    }
+    expected = {
+        "excluded_chromosomes": list(EXPORT_EXCLUDED_CHROMOSOMES),
+        "min_cpm": EXPORT_MIN_CPM,
+        "prior_count": EXPORT_PRIOR_COUNT,
+        "N": EXPORT_TOP_N,
+        "tmm.logratio_trim": TMM_LOGRATIO_TRIM,
+        "tmm.sum_trim": TMM_SUM_TRIM,
+        "float_format": EXPORT_FLOAT_FORMAT,
+        "k": k,
+        "cells": cells,
+        "n_donors": n_donors,
+    }
+    for key, want in expected.items():
+        if recorded[key] != want:
+            source = "the donor table now gives" if key in ("k", "cells", "n_donors") else "the export constants give"
+            raise ValueError(f"{manifest_path} records {key} = {recorded[key]!r} but {source} {want!r}; {rerun}")
+    files = {name: {"path": str(d / name), "sha256": _sha256_file(d / name)} for name in _ANALYSIS_INPUTS}
+    return {"dir": d, "manifest": manifest, "files": files}
+
+
+def _variant_row(record: dict, *, variant: str, cohort: str, directory: str) -> dict:
+    """``_sensitivity_row`` with a leading ``variant`` column (``primary`` or the variant name)."""
+    row = _sensitivity_row(
+        record, cohort=cohort, component_selection=record["latent"]["component_selection"], directory=directory
+    )
+    return {"variant": variant, **row}
+
+
+def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str | Path) -> dict:
+    """Compare the feature filtering of the primary and a variant export.
+
+    Parameters
+    ----------
+    primary_export_dir, variant_export_dir:
+        Export directories of one cohort (``features_<omic>.csv`` and
+        ``manifest.json`` are read).
+
+    Returns
+    -------
+    dict
+        Omic → ``feature_counts`` and ``removed_by_chromosome`` of both exports,
+        ``chrx`` (input count, the variant's status counts, kept count and
+        kept feature names), ``kept`` (both kept counts; shared, primary-only
+        and variant-only) and ``named`` (status of
+        ``PREPROCESSING_NAMED_FEATURES`` in both exports, when present).
+
+    Raises
+    ------
+    ValueError
+        The two exports list different input features, or a chrX feature of
+        the variant carries the ``sex_chromosome`` status.
+    """
+    p, v = Path(primary_export_dir), Path(variant_export_dir)
+    pm = json.loads((p / "manifest.json").read_text())
+    vm = json.loads((v / "manifest.json").read_text())
+    dtypes = {"feature": str, "chromosome": str, "status": str}
+    out = {}
+    for o in ANALYSIS_BLOCKS:
+        pf = pd.read_csv(p / f"features_{o}.csv", dtype=dtypes)
+        vf = pd.read_csv(v / f"features_{o}.csv", dtype=dtypes)
+        if pf["feature"].tolist() != vf["feature"].tolist():
+            raise ValueError(f"{p / f'features_{o}.csv'} and {v / f'features_{o}.csv'} list different input features")
+        p_kept = set(pf.loc[pf["status"] == "kept", "feature"])
+        v_kept = set(vf.loc[vf["status"] == "kept", "feature"])
+        v_chrx = vf[vf["chromosome"] == "chrX"]
+        bad = v_chrx.loc[v_chrx["status"] == "sex_chromosome", "feature"].tolist()
+        if bad:
+            raise ValueError(
+                f"{v / f'features_{o}.csv'}: {len(bad)} chrX feature(s) carry status sex_chromosome "
+                f"(e.g. {bad[0]!r}) although the variant keeps chrX"
+            )
+        kept_chrx = sorted(v_chrx.loc[v_chrx["status"] == "kept", "feature"])
+        named = {}
+        for name in PREPROCESSING_NAMED_FEATURES:
+            rows_p, rows_v = pf[pf["feature"] == name], vf[vf["feature"] == name]
+            if len(rows_p) == 1 and len(rows_v) == 1:
+                named[name] = {
+                    "chromosome": rows_v["chromosome"].iloc[0],
+                    "primary": rows_p["status"].iloc[0],
+                    "variant": rows_v["status"].iloc[0],
+                }
+        out[o] = {
+            "feature_counts": {"primary": pm["feature_counts"][o], "variant": vm["feature_counts"][o]},
+            "removed_by_chromosome": {
+                "primary": pm.get("removed_by_chromosome", {}).get(o),
+                "variant": vm.get("removed_by_chromosome", {}).get(o),
+            },
+            "chrx": {
+                "input": int(len(v_chrx)),
+                "status_counts_variant": {s: int(n) for s, n in sorted(v_chrx["status"].value_counts().items())},
+                "kept": len(kept_chrx),
+                "kept_features": kept_chrx,
+            },
+            "kept": {
+                "primary": len(p_kept),
+                "variant": len(v_kept),
+                "shared": len(p_kept & v_kept),
+                "primary_only": len(p_kept - v_kept),
+                "variant_only": len(v_kept - p_kept),
+            },
+            "named": named,
+        }
+    return out
+
+
+def render_preprocessing_sensitivity(
+    rows: list[dict],
+    features: dict,
+    *,
+    variant: str,
+    cohort: str,
+    settings: dict,
+    description: str = "",
+    seed: int = ANALYSIS_SEED,
+    permutations: int = ANALYSIS_PERMUTATIONS,
+    alpha: float = ANALYSIS_ALPHA,
+    findings: list[str] | None = None,
+) -> str:
+    """Render ``sensitivity.md`` from the rows of ``sensitivity.csv`` and the feature accounting.
+
+    Parameters
+    ----------
+    rows:
+        ``_variant_row`` dicts, the primary row first and the variant row second.
+    features:
+        ``_feature_accounting`` output.
+    variant, settings, description:
+        The variant's name, the export settings it changes and its description
+        (from ``PREPROCESSING_VARIANTS``).
+    cohort:
+        Cohort name for the title.
+    seed, permutations, alpha:
+        Named in the header; a statistic is rejected when ``p <= alpha``.
+    findings:
+        The comparison's findings, listed at the end.
+
+    Returns
+    -------
+    str
+        Markdown: a header naming the variant, its settings, seed,
+        permutations, α and both ranks and the reading rules; one table per
+        statistic (two rows); the feature table per omic and export; a run
+        table (rank selection, CV AUROC, runtime, directory); the findings.
+        Every number comes from the rows and the accounting; the runtimes are
+        the one thing here that is not in ``sensitivity.csv``.
+    """
+    primary, var = rows[0], rows[1]
+    changed = ", ".join(f"`{key}` = {list(val) if isinstance(val, (list, tuple)) else val}" for key, val in settings.items())
+    lines = [
+        f"# MOTCO preprocessing sensitivity: {cohort}, variant `{variant}`",
+        "",
+        f"{description}. Export setting(s) changed: {changed} (primary: `excluded_chromosomes` = "
+        f"{list(EXPORT_EXCLUDED_CHROMOSOMES)}); every other export setting and every analysis setting equal "
+        f"the primary's. The `{primary['variant']}` row is the CV-selected primary analysis at rank "
+        f"{primary['rank']}, which stays the primary result; the `{variant}` row (CV-selected rank "
+        f"{var['rank']}) is read as sensitivity to it, never as its replacement, and no variant is chosen from "
+        f"the results. {permutations} RRPP permutations with seed {seed} in both rows (the same permutation "
+        f"indices); α = {alpha} (rejected when p ≤ α). `angle` and `shape` non-rejections are uninformative in "
+        "both rows; a `delta` rejection is a difference, not specifically of size; a rejection status that "
+        "differs between the rows is preprocessing dependence of the sensitivity analysis, not a result of "
+        "the variant; a CV-selected rank that differs is reported beside `angle`, not read as better or worse.",
+    ]
+    for s in ANALYSIS_STATISTICS:
+        lines += [
+            "",
+            f"## {s}" + (" (degrees)" if s == "angle" else ""),
+            "",
+            "| variant | selection | rank | observed | p (RRPP) | rejected | null mean | null sd | null q95 |",
+            "|---|---|---:|---:|---:|:---:|---:|---:|---:|",
+        ]
+        for r in rows:
+            rejected = r[f"{s}_rejected"]
+            lines.append(
+                f"| {r['variant']} | {r['component_selection']} | {r['rank']} | {_fmt(r[s])} | "
+                f"{_fmt(r[f'{s}_p'], '.4g')} | {'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
+                f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
+            )
+    lines += [
+        "",
+        "## Features",
+        "",
+        "Counts after each export step per omic; `kept on chrX` and `kept only here` are per export, "
+        "`kept shared` is the number of kept features common to both exports.",
+        "",
+        "| omic | export | input | after chromosome removal | after abundance | kept (after variance) | "
+        "kept on chrX | kept shared | kept only here |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for o, acc in features.items():
+        for label, key, chrx, only in (
+            (primary["variant"], "primary", 0, acc["kept"]["primary_only"]),
+            (variant, "variant", acc["chrx"]["kept"], acc["kept"]["variant_only"]),
+        ):
+            fc = acc["feature_counts"][key]
+            lines.append(
+                f"| {o} | {label} | {fc['input']} | {fc['after_sex_chromosome']} | {fc['after_abundance']} | "
+                f"{fc['after_variance']} | {chrx} | {acc['kept']['shared']} | {only} |"
+            )
+    named = [(o, name, info) for o, acc in features.items() for name, info in acc["named"].items()]
+    if named:
+        lines.append("")
+        for o, name, info in named:
+            lines.append(
+                f"- `{name}` ({info['chromosome']}, {o}): status `{info['primary']}` in the "
+                f"{primary['variant']} export, `{info['variant']}` in the {variant} export."
+            )
+    lines += [
+        "",
+        "## Runs",
+        "",
+        "| variant | selection | rank | cv_mean_auroc | runtime (s) | directory |",
+        "|---|---|---:|---:|---:|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['variant']} | {r['component_selection']} | {r['rank']} | {_fmt(r['cv_mean_auroc'], '.4f')} | "
+            f"{_fmt(r['runtime_seconds'], '.1f')} | `{r['dir']}` |"
+        )
+    lines += ["", "## Findings", ""]
+    lines += [f"- {msg}" for msg in (findings or [])] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def run_preprocessing_sensitivity(
+    variant: str = "all",
+    cohort: str = "all",
+    *,
+    pseudobulk_dir: str | Path = "results/pseudobulk",
+    input_dir: str | Path = "results/motco_input",
+    analysis_dir: str | Path = "results/motco_analysis",
+    out_dir: str | Path = "results/motco_sensitivity",
+    data_root: str | Path | None = None,
+    n_jobs: int = 1,
+    force: bool = False,
+) -> dict:
+    """Rerun the export with one registered setting changed, then the primary analysis unchanged.
+
+    Parameters
+    ----------
+    variant:
+        A key of ``PREPROCESSING_VARIANTS`` or ``"all"``.
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    pseudobulk_dir:
+        Output directory of ``pseudobulk`` and ``covariates`` (the export's inputs).
+    input_dir:
+        Export root of the ``export`` step; ``<input_dir>/<cohort>/`` is the
+        primary export, read and checked, never written.
+    analysis_dir:
+        Analysis root of the ``analyze`` step; ``<analysis_dir>/<cohort>/`` is
+        the primary analysis, read and checked, never written.
+    out_dir:
+        Sensitivity root; each variant goes to ``<out_dir>/<variant>/`` with
+        ``motco_input/<cohort>/`` (the variant export), ``motco_analysis/<cohort>/``
+        (the variant analysis) and ``comparison/<cohort>/`` (``sensitivity.csv``,
+        ``sensitivity.md``, ``sensitivity_manifest.json``).
+    data_root:
+        Data root holding (or receiving) the gene annotation.
+    n_jobs:
+        Parallel jobs for MOTCO's CV and RRPP (``-1`` = all CPUs); as in
+        ``run_analysis``, values other than 1 change the permutation draws and
+        are recorded as a finding. The reported results use 1.
+    force:
+        Replace a cohort's three directories under the variant.
+
+    Returns
+    -------
+    dict
+        Variant → cohort → ``{"export", "analysis", "comparison", "rows", "table",
+        "manifest", "findings"}``.
+
+    Raises
+    ------
+    ValueError
+        An unregistered variant; the primary export or analysis does not match
+        the inputs, constants or settings; or the variant's donor tables differ
+        from the primary's.
+    FileExistsError
+        One of a cohort's three directories exists and ``force`` is false.
+    FileNotFoundError
+        A pseudobulk input, the primary export or the primary analysis is missing.
+
+    Notes
+    -----
+    Every check (registered variant, existing output, inputs present, primary
+    export vs the pseudobulk manifest, covariates manifest, annotation,
+    thresholds, ``k``, cells and donor count, primary analysis vs the export
+    hashes, MOTCO version, seed, permutations and CV selection) runs for every
+    requested variant and cohort before anything is written. Per cohort the
+    variant export is one ``_export_cohort`` call with the variant's keyword(s)
+    (the primary pipeline with one setting changed: library sizes, the
+    abundance filter, TMM, log2-CPM and the variance ranking recomputed), its
+    ``metadata.csv`` and ``covariates.csv`` must be byte-identical to the
+    primary's, and the variant analysis is one ``_analyze_cohort`` call with
+    the primary's parameters (CV rank selection, ``ANALYSIS_PERMUTATIONS``,
+    ``ANALYSIS_SEED``, so RRPP draws the same permutation indices as the
+    primary). The comparison holds the primary row first and the variant row
+    second; a rejection status that differs is preprocessing dependence of the
+    sensitivity analysis and the primary analysis stays primary.
+    """
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    log = "preprocessing-sensitivity"
+    pb = Path(pseudobulk_dir)
+    input_dir = Path(input_dir)
+    analysis_dir = Path(analysis_dir)
+    out_dir = Path(out_dir)
+    variants = list(PREPROCESSING_VARIANTS) if variant == "all" else [variant]
+    for v in variants:
+        if v not in PREPROCESSING_VARIANTS:
+            raise ValueError(
+                f"Unknown preprocessing variant {v!r}; the registry PREPROCESSING_VARIANTS holds "
+                f"{list(PREPROCESSING_VARIANTS)} (or 'all'). Variants are predeclared constants, never chosen "
+                "from results; nothing was written"
+            )
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    subdirs = (PREPROCESSING_INPUT_DIR, PREPROCESSING_ANALYSIS_DIR, PREPROCESSING_COMPARISON_DIR)
+    for v in variants:
+        for c in cohorts:
+            for sub in subdirs:
+                if (out_dir / v / sub / c).exists() and not force:
+                    raise FileExistsError(
+                        f"{out_dir / v / sub / c} exists; rerun with --force to replace the variant's export, "
+                        f"analysis and comparison of {c}"
+                    )
+    check_export_inputs(pb, cohorts)
+    for c in cohorts:
+        if not (input_dir / c).is_dir():
+            raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce the primary export")
+        if not (analysis_dir / c).is_dir():
+            raise FileNotFoundError(
+                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze` to produce the primary analysis"
+            )
+    motco_version = check_motco_version()
+    from motco.analysis import TrajectoryAnalysisParams
+
+    print(f"[{log}] MOTCO {motco_version}")
+    print(f"[{log}] Pseudobulk directory: {pb}")
+    print(f"[{log}] Primary export directory: {input_dir}")
+    print(f"[{log}] Primary analysis directory: {analysis_dir}")
+    print(f"[{log}] Output directory: {out_dir}")
+    print(f"[{log}] Variants: {', '.join(variants)} (registry PREPROCESSING_VARIANTS; the primary analysis stays primary)")
+
+    inputs = _load_export_inputs(pb, data_root, log_prefix=log)
+    annotation = inputs["annotation"]
+    # Check every cohort's primary export and analysis before writing anything
+    prepared = {}
+    for c in cohorts:
+        sub = _cohort_rows(inputs["table"], inputs["covariates"], c, pb)
+        k, k_cell, cells = smallest_cell(sub)
+        ref_export = _check_export_reference(input_dir / c, pb, annotation, k=k, cells=cells, n_donors=len(sub))
+        loaded = load_analysis_inputs(input_dir / c)
+        reference = _check_reference(input_dir / c, analysis_dir / c, loaded["inputs"], motco_version)
+        ref_rank = reference["record"]["latent"]["selected_lv"]
+        print(
+            f"[{log}] {c}: primary export {ref_export['dir']} ({len(sub)} donors, k = {k} from {k_cell}; pseudobulk, "
+            f"covariates, annotation and thresholds match) and primary analysis {reference['dir']} "
+            f"(CV-selected rank {ref_rank}; hashes and settings match)"
+        )
+        prepared[c] = {"sub": sub, "k": k, "cells": cells, "export": ref_export, "analysis": reference}
+
+    software = _software_versions()
+    software["motco"] = motco_version
+    try:
+        software["scikit-learn"] = version("scikit-learn")
+    except PackageNotFoundError:
+        software["scikit-learn"] = None
+
+    results: dict[str, dict] = {v: {} for v in variants}
+    for v in variants:
+        spec = PREPROCESSING_VARIANTS[v]
+        v_root = out_dir / v
+        settings = {"excluded_chromosomes": EXPORT_EXCLUDED_CHROMOSOMES, **spec["export"]}
+        recorded_settings = {
+            key: list(val) if isinstance(val, (list, tuple)) else val for key, val in spec["export"].items()
+        }
+        for c in cohorts:
+            prep = prepared[c]
+            primary_export, primary_analysis = prep["export"], prep["analysis"]
+            for sub in subdirs:  # with force, all three are replaced before the first is rewritten
+                if (v_root / sub / c).exists():
+                    shutil.rmtree(v_root / sub / c)
+            variant_block = {
+                "name": v,
+                "description": spec["description"],
+                "settings": recorded_settings,
+                "reference_export_dir": str(primary_export["dir"]),
+            }
+            exp = _export_cohort(
+                c, prep["sub"], inputs["blocks"], inputs["covariates"], annotation, inputs["pb_info"],
+                out_dir=v_root / PREPROCESSING_INPUT_DIR, final_name=c, variant=variant_block, log_prefix=log,
+                **settings,
+            )
+            for name in ("metadata.csv", "covariates.csv"):
+                if _sha256_file(exp["dir"] / name) != primary_export["files"][name]["sha256"]:
+                    raise ValueError(
+                        f"{exp['dir'] / name} is not byte-identical to {primary_export['dir'] / name}: the variant "
+                        "export must use the primary export's donors and covariates, so the pseudobulk inputs are "
+                        "not the ones the primary export was made from"
+                    )
+            loaded_v = load_analysis_inputs(exp["dir"])
+            params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+            ana = _analyze_cohort(
+                c, exp["dir"], loaded_v, params,
+                out_dir=v_root / PREPROCESSING_ANALYSIS_DIR, final_name=c, n_jobs=n_jobs,
+                findings=[f"preprocessing variant {v}: the primary analysis in {primary_analysis['dir']} is primary"],
+                log_prefix=log,
+            )
+
+            # Comparison: the primary row first, the variant row second
+            ref_record, var_record = primary_analysis["record"], ana["record"]
+            rows = [
+                _variant_row(ref_record, variant=PREPROCESSING_PRIMARY_LABEL, cohort=c, directory=str(primary_analysis["dir"])),
+                _variant_row(var_record, variant=v, cohort=c, directory=f"{PREPROCESSING_ANALYSIS_DIR}/{c}"),
+            ]
+            for r in rows:
+                print(
+                    f"[{log}] {c}: {r['variant']} (rank {r['rank']}): "
+                    + ", ".join(f"{s} {_fmt(r[s])} (p {_fmt(r[f'{s}_p'], '.4g')})" for s in ANALYSIS_STATISTICS)
+                )
+            features = _feature_accounting(primary_export["dir"], exp["dir"])
+            for o, acc in features.items():
+                print(
+                    f"[{log}] {c} {o}: kept {acc['kept']['shared']} shared, {acc['kept']['primary_only']} primary-only, "
+                    f"{acc['kept']['variant_only']} {v}-only; {acc['chrx']['kept']} of {acc['chrx']['input']} chrX "
+                    f"features kept by {v}"
+                )
+            findings: list[str] = []
+            ref_rank, var_rank = ref_record["latent"]["selected_lv"], var_record["latent"]["selected_lv"]
+            if ref_rank != var_rank:
+                findings.append(
+                    f"CV-selected rank differs: {ref_rank} in the primary analysis, {var_rank} in the {v} analysis; "
+                    "reported beside angle, not read as better or worse"
+                )
+            for s in ANALYSIS_STATISTICS:
+                p_ref, p_v = ref_record["p_values"].get(s), var_record["p_values"].get(s)
+                if p_ref is not None and p_v is not None and (p_ref <= ANALYSIS_ALPHA) != (p_v <= ANALYSIS_ALPHA):
+                    findings.append(
+                        f"{s}: rejection status in the {v} analysis (p = {_fmt(p_v, '.4g')}) differs from the primary "
+                        f"analysis (p = {_fmt(p_ref, '.4g')}); preprocessing dependence of the sensitivity analysis, "
+                        "the primary result stays primary"
+                    )
+            if n_jobs != 1:
+                findings.append(
+                    f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
+                    "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
+                    "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+                )
+            findings += [f"{v} export: {msg}" for msg in exp["findings"]]
+
+            comp_root = v_root / PREPROCESSING_COMPARISON_DIR
+            tmp = comp_root / f"{c}.tmp"
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            tmp.mkdir(parents=True)
+            table = pd.DataFrame(rows).drop(columns=list(_RANK_SENSITIVITY_CSV_EXCLUDED))
+            table.to_csv(tmp / PREPROCESSING_SENSITIVITY_TABLE, index=False, float_format=_csv_float)
+            (tmp / PREPROCESSING_SENSITIVITY_MARKDOWN).write_text(
+                render_preprocessing_sensitivity(
+                    rows, features, variant=v, cohort=c, settings=recorded_settings,
+                    description=spec["description"], seed=ANALYSIS_SEED, permutations=ANALYSIS_PERMUTATIONS,
+                    alpha=ANALYSIS_ALPHA, findings=findings,
+                )
+            )
+            variant_files = {
+                name: {"path": str(exp["dir"] / name), "sha256": _sha256_file(exp["dir"] / name)}
+                for name in _ANALYSIS_INPUTS
+            }
+            variant_analysis_files = {
+                name: {"path": str(ana["dir"] / name), "sha256": _sha256_file(ana["dir"] / name)}
+                for name in _REFERENCE_FILES
+            }
+            manifest = {
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "variant": {"name": v, "description": spec["description"], "settings": recorded_settings},
+                "cohort": c,
+                "n_donors": int(len(prep["sub"])),
+                "seed": ANALYSIS_SEED,
+                "permutations": ANALYSIS_PERMUTATIONS,
+                "same_seed_note": (
+                    "the same seed and permutation count as the primary analysis, so both draw the same "
+                    "permutation indices and the difference between the rows is a data difference"
+                ),
+                "alpha": ANALYSIS_ALPHA,
+                "rejection_rule": ANALYSIS_REJECTION_RULE,
+                "n_jobs": n_jobs,
+                "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+                "inputs": {
+                    **inputs["pb_info"],
+                    "annotation": {key: annotation.get(key) for key in ("release", "file", "sha256")},
+                },
+                "primary": {
+                    "export": {
+                        "dir": str(primary_export["dir"]),
+                        "files": primary_export["files"],
+                        "manifest_sha256": primary_export["files"]["manifest.json"]["sha256"],
+                        "k": prep["k"],
+                        "cells": prep["cells"],
+                        "thresholds": primary_export["manifest"].get("thresholds"),
+                    },
+                    "analysis": {
+                        "dir": str(primary_analysis["dir"]),
+                        "files": primary_analysis["files"],
+                        "component_selection": ref_record["latent"]["component_selection"],
+                        "selected_lv": ref_rank,
+                        "cv_mean_auroc": ref_record["latent"].get("cv_mean_auroc"),
+                        "runtime_seconds": ref_record["measurement"]["runtime_seconds"],
+                        "motco": primary_analysis["manifest"]["software"]["motco"],
+                        "seed": primary_analysis["manifest"]["measurement"]["seed"],
+                        "permutations": primary_analysis["manifest"]["measurement"]["permutations"],
+                    },
+                    "note": (
+                        "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
+                        "export file hashes, MOTCO version, seed, permutations, CV selection), never rerun or modified"
+                    ),
+                },
+                "variant_run": {
+                    "export": {
+                        "dir": str(exp["dir"]),
+                        "files": variant_files,
+                        "manifest_sha256": variant_files["manifest.json"]["sha256"],
+                        "thresholds": exp["manifest"]["thresholds"],
+                        "feature_counts": exp["manifest"]["feature_counts"],
+                        "findings": exp["findings"],
+                    },
+                    "analysis": {
+                        "dir": str(ana["dir"]),
+                        "files": variant_analysis_files,
+                        "component_selection": var_record["latent"]["component_selection"],
+                        "selected_lv": var_rank,
+                        "cv_mean_auroc": var_record["latent"].get("cv_mean_auroc"),
+                        "runtime_seconds": var_record["measurement"]["runtime_seconds"],
+                        "findings": ana["findings"],
+                    },
+                },
+                "features": features,
+                "outputs": sorted([
+                    PREPROCESSING_SENSITIVITY_TABLE, PREPROCESSING_SENSITIVITY_MARKDOWN,
+                    PREPROCESSING_SENSITIVITY_MANIFEST,
+                ]),
+                "software": software,
+                "git": _git_revision(),
+                "findings": findings,
+            }
+            (tmp / PREPROCESSING_SENSITIVITY_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+            final = comp_root / c
+            if final.exists():
+                shutil.rmtree(final)
+            os.replace(tmp, final)
+            print(f"[{log}] Wrote {final}")
+            for msg in findings:
+                print(f"[{log}] FINDING: {v} {c}: {msg}")
+            results[v][c] = {
+                "export": exp, "analysis": ana, "comparison": final, "rows": rows, "table": table,
+                "manifest": manifest, "findings": findings,
+            }
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -3729,4 +4516,7 @@ __all__ = [
     "run_analysis",
     "render_rank_sensitivity",
     "run_rank_sensitivity",
+    "PREPROCESSING_VARIANTS",
+    "render_preprocessing_sensitivity",
+    "run_preprocessing_sensitivity",
 ]
