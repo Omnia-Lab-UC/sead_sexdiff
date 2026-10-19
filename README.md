@@ -295,6 +295,39 @@ Interpretation rules, binding from MOTCO's operating studies (`../MOTCO/docs/roa
 - `shape`: a rejection is evidence of a difference but not of which kind; a non-rejection is uninformative.
 - Report the `covariates` block beside the results. The adjustment is additive and linear, the latent space is fitted without the covariates (covariate-blind basis), the Type I check covered three covariate design columns (six are entered here), and there is no power claim for the adjusted analysis. The operating characteristics come from a structural analogue (InterSIM blocks, 498 features), not from these data.
 
+### MOTCO rank sensitivity
+
+```
+sead-sexdiff rank-sensitivity                      # both cohorts
+sead-sexdiff rank-sensitivity --cohort cohort_50 --force
+```
+
+Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--analysis-dir` (default `results/motco_analysis`; the `analyze` step's output, read as the reference and never written), `--out-dir` (default `results/motco_rank_sensitivity`), `--n-jobs` (parallel jobs for MOTCO's RRPP, `-1` = all CPUs; default 1; other values change the permutation draws at every rank and are recorded as a finding; the reported results use 1), `--force` (replace existing cohort directories under `--out-dir`; without it an existing cohort directory is an error and nothing is written).
+
+MOTCO's documented dimensionality sensitivity analysis for the covariate-adjusted trajectory comparison: per cohort, the analysis is rerun through the same entry point (`analyze_trajectories` with `forced_components = k`) at every rank of a fixed ladder, `ANALYSIS_FORCED_RANKS = (2, 3, 4, 6, 9, 12)`, and everything else equals the `analyze` step: the same export inputs, blocks and units, stage order, six covariates in the same order, missing-covariate policy, net-displacement orientation, 999 RRPP permutations and the same seed `20261019` at every rank, so that every rank draws the same permutation indices and differences between ranks are measurement differences, not draw differences. Cross-validation does not run in a forced-rank run.
+
+The ladder: 2 is `n_stages − 1`, the rank MOTCO's stage-supervised rule is expected to select with three stages and the lowest rank at which `angle` can carry orientation information; 3 is the next rank; 4, 6, 9 and 12 are the steps of MOTCO's own latent-rank ladder, which makes the two sweeps comparable, and 4 = 2(K − 1) is the forced rank with a Type I check at this design (unadjusted). The ladder is a constant, not a flag, and no rank is added, dropped or chosen from the results. Rank 1, the CV-selected rank in both cohorts, cannot be forced (MOTCO accepts `forced_components ≥ 2` only); the CV-selected analysis is the reference row instead, and the manifest says so. A rank larger than `min(n_donors, n_features)` stops the sweep, naming the rank, before anything is written.
+
+The CV-selected analysis is read, not rerun. Before any rank runs, the sweep checks that `<analysis-dir>/<cohort>/analysis_manifest.json` records the same sha256 for each of the five export files as the files now on disk, the same MOTCO version as the one installed and the same seed and permutation count as the sweep uses; a difference stops the sweep naming the file or setting and the `analyze` command. A missing export or analysis directory does the same. Nothing under `results/motco_analysis/` is ever written.
+
+Outputs in `results/motco_rank_sensitivity/<cohort>/` (written to `<cohort>.tmp/` and renamed when every rank and the table are complete):
+
+| file | content |
+|---|---|
+| `rank_02/` … `rank_12/` | one full analysis directory per forced rank, with the same seven files as `results/motco_analysis/<cohort>/` (`result.json` with `component_selection = forced`, `latent_scores.csv`, `pls_loadings.csv`, `stage_means.csv`, `analysis_metadata.csv`, `analysis_manifest.json` with `measurement.forced_components`, `cv = null` and a `cli_equivalent` carrying `--forced-components k`, and `summary.md` naming the forced rank in the `angle` row) |
+| `rank_sensitivity.csv` | the cross-rank table generated from the records: the reference row first (`component_selection = cv`, the CV-selected rank) then one row per forced rank in ascending order, with per statistic (`delta`, `angle`, `shape`) the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95, plus the reference row's `cv_mean_auroc` and each row's directory (relative `rank_<kk>` for the forced rows). Floats are written in their shortest round-trip form and runtimes are left out, so the file is byte-identical across reruns |
+| `rank_sensitivity.md` | the same values rendered as one table per statistic plus a run table (CV AUROC, runtime, directory), with a header naming the ladder, seed, permutations, α and the reference rank |
+| `rank_sensitivity_manifest.json` | cohort, ladder, seed, permutations, α, `n_jobs`, sha256 of the five export inputs and of the reference `result.json` and `analysis_manifest.json`, the reference's rank and whether it is in the ladder, per-rank directories and runtimes, software (incl. `motco`, `scikit-learn`), git revision, findings (the CV-selected rank not being in the ladder; a forced run at the CV rank differing from the reference; `n_jobs ≠ 1`; a rejection status that differs between a forced rank and the reference) |
+
+Two sweeps on the same inputs, reference, MOTCO release, seed and `n_jobs` give identical statistics, p-values and null summaries at every rank and byte-identical `latent_scores.csv`, `pls_loadings.csv`, `stage_means.csv` and `rank_sensitivity.csv`. Each `rank_<kk>/analysis_manifest.json` carries a `cli_equivalent` that reproduces that rank with `motco analyze --forced-components k` (no CV flags).
+
+Reading rules, binding for the report (`reports/motco-astrocyte-rank-sensitivity-<date>.md`):
+
+- The CV-selected analysis remains the primary result; the sweep is sensitivity to it and never its replacement. No rank is chosen after seeing the results.
+- A statistic whose rejection status differs between ranks is rank dependence of the sensitivity analysis, not a result at the rank where it is rejected. No rejection at any rank is no evidence of a difference at any rank, not evidence of agreement in size, direction or shape.
+- `angle` and `shape` non-rejections stay uninformative at every rank; a `delta` rejection is a difference, not specifically of size.
+- MOTCO's forced-rank operating characteristics are carried as limitations: its Type I evidence at a forced rank covers rank 4 at this design without covariates; forced 2(K − 1) lost `shape` power and leaked `angle` into the magnitude cell in MOTCO's orientation probe; ranks above `n_stages − 1` widened the `angle` null in MOTCO's rank ladder. The covariate-adjusted analysis has no Type I check at any forced rank.
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.

@@ -18,7 +18,9 @@ from .data import (
     resolve_data_root,
     EXPORT_COHORTS,
     ANALYSIS_STATISTICS,
+    ANALYSIS_FORCED_RANKS,
     run_analysis,
+    run_rank_sensitivity,
     run_covariates,
     run_export,
     run_pseudobulk,
@@ -398,6 +400,61 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing cohort directories",
     )
+
+    # rank-sensitivity command: forced-rank sweep beside the CV-selected analysis
+    ladder = ", ".join(str(k) for k in ANALYSIS_FORCED_RANKS)
+    sub_rs = sub.add_parser(
+        "rank-sensitivity",
+        help="Rerun the MOTCO trajectory analysis at a fixed ladder of forced latent ranks",
+        description=(
+            "Per cohort, from the export outputs and the analyze step's outputs: rerun the "
+            f"covariate-adjusted trajectory analysis with the latent rank forced to {ladder} "
+            "(a constant, not a flag), everything else equal to the analyze step (same blocks, "
+            "covariates, orientation, permutations and seed at every rank). The CV-selected "
+            "analysis is read, checked against the inputs and settings, and placed as the "
+            "reference row of the cross-rank table; it is never rerun or modified and stays the "
+            "primary result. Rank 1 cannot be forced. Writes rank_<kk>/ analysis directories, "
+            "rank_sensitivity.csv, rank_sensitivity.md and rank_sensitivity_manifest.json."
+        ),
+    )
+    sub_rs.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to sweep (default: %(default)s)",
+    )
+    sub_rs.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root with one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_rs.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the reference, never written (default: %(default)s)",
+    )
+    sub_rs.add_argument(
+        "--out-dir",
+        default=Path("results/motco_rank_sensitivity"),
+        type=Path,
+        help="Sweep root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_rs.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel jobs for MOTCO's RRPP, -1 = all CPUs. Values other than 1 change the RRPP "
+            "draws (p-values) at every rank; results are reported at 1 (default: %(default)s)"
+        ),
+    )
+    sub_rs.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing cohort directories under --out-dir",
+    )
     return parser
 
 
@@ -569,6 +626,27 @@ def main(argv: list[str] | None = None) -> int:
         print("[analyze] Statistics (p from RRPP; rank = CV-selected latent rank):")
         print(pd.DataFrame(rows).to_string(index=False))
         print("[analyze] Done.")
+        return 0
+
+    if args.command == "rank-sensitivity":
+        import pandas as pd
+
+        print("[rank-sensitivity] Running the forced-rank sweep...")
+        results = run_rank_sensitivity(
+            args.cohort,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            out_dir=args.out_dir,
+            n_jobs=args.n_jobs,
+            force=args.force,
+        )
+        columns = ["cohort", "component_selection", "rank"]
+        for s in ANALYSIS_STATISTICS:
+            columns += [s, f"{s}_p", f"{s}_rejected"]
+        table = pd.concat([res["table"][columns] for res in results.values()], ignore_index=True)
+        print("[rank-sensitivity] Cross-rank table (cv = the CV-selected analysis, primary; forced = sensitivity):")
+        print(table.to_string(index=False))
+        print("[rank-sensitivity] Done.")
         return 0
 
     parser.error("Unknown command")

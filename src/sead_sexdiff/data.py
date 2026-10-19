@@ -2841,10 +2841,15 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
     str
         Markdown: statistics (observed, RRPP p, null mean/sd/q95, CV-selected
         rank in the ``angle`` row), cell sizes, latent block and covariate block.
+        For a forced-rank record (``latent.component_selection == "forced"``)
+        the ``angle`` row names the forced rank and says the CV-selected
+        analysis is primary, and the latent block says cross-validation was
+        skipped; the output for CV records is unchanged.
     """
     design = record["design"]
     meas = record["measurement"]
     latent = record["latent"]
+    forced = latent["component_selection"] == "forced"
     stages = design["stage_levels"]
     lines = [
         f"# MOTCO trajectory analysis: {cohort}",
@@ -2864,7 +2869,12 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         null = record["null_summary"].get(s, {})
         rejected = "n/a" if p is None else ("yes" if p <= alpha else "no")
         note = ""
-        if s == "angle":
+        if s == "angle" and forced:
+            note = (
+                f"degrees; forced rank {latent['selected_lv']} (dimensionality sensitivity; "
+                "the CV-selected analysis is primary)"
+            )
+        elif s == "angle":
             note = f"degrees; CV-selected rank {latent['selected_lv']}"
             if latent["selected_lv"] == 1:
                 note += " (at rank 1 the angle is 0° or 180° by construction)"
@@ -2883,15 +2893,21 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         cells = design["cell_sizes"][g]
         lines.append(f"| {g} | " + " | ".join(str(cells[s]) for s in stages) + f" | {sum(cells.values())} |")
     cv = latent.get("integration_params", {})
+    if forced:
+        cv_line = "- cross-validation: skipped (rank forced)"
+    else:
+        cv_line = (
+            f"- CV: cv2_splits {cv.get('cv2_splits')}, cv1_splits {cv.get('cv1_splits')}, n_repeats "
+            f"{cv.get('n_repeats')} ({latent.get('cv_repeats_completed')} completed), max_components "
+            f"{cv.get('max_components')}, random_state {cv.get('random_state')}"
+        )
     lines += [
         "",
         "## Latent space",
         "",
         f"- PLS-DA rank: {latent['selected_lv']} (`{latent['component_selection']}`)",
         f"- cv_mean_auroc: {_fmt(latent.get('cv_mean_auroc'), '.4f')}",
-        f"- CV: cv2_splits {cv.get('cv2_splits')}, cv1_splits {cv.get('cv1_splits')}, n_repeats "
-        f"{cv.get('n_repeats')} ({latent.get('cv_repeats_completed')} completed), max_components "
-        f"{cv.get('max_components')}, random_state {cv.get('random_state')}",
+        cv_line,
         "- blocks: " + ", ".join(
             f"{b['name']} ({b['n_features']} features, {b['transform']})" for b in record["blocks"]
         ),
@@ -2917,7 +2933,7 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
 
 
 def _cli_equivalent(cohort_dir: Path, metadata_path: Path, params, n_jobs: int) -> dict:
-    """The ``motco analyze`` command that reproduces ``run_analysis`` for one cohort."""
+    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank)."""
     import shlex
 
     argv = ["motco", "analyze"]
@@ -2934,16 +2950,225 @@ def _cli_equivalent(cohort_dir: Path, metadata_path: Path, params, n_jobs: int) 
         "--missing-covariates", ANALYSIS_MISSING_COVARIATES,
         "--permutations", str(params.permutations), "--seed", str(params.seed), "--n-jobs", str(n_jobs),
         "--orientation-estimator", params.orientation_estimator,
-        "--cv1-splits", str(params.cv1_splits), "--cv2-splits", str(params.cv2_splits),
-        "--n-repeats", str(params.n_repeats), "--max-components", str(params.max_components),
-        "--cv-random-state", str(params.random_state),
-        "--out-dir", "OUT_DIR",
     ]
+    if params.forced_components is not None:
+        # Cross-validation does not run, so none of its knobs apply
+        argv += ["--forced-components", str(params.forced_components)]
+    else:
+        argv += [
+            "--cv1-splits", str(params.cv1_splits), "--cv2-splits", str(params.cv2_splits),
+            "--n-repeats", str(params.n_repeats), "--max-components", str(params.max_components),
+            "--cv-random-state", str(params.random_state),
+        ]
+    argv += ["--out-dir", "OUT_DIR"]
     return {
         "command": shlex.join(argv),
         "argv": argv,
         "note": "replace OUT_DIR with a new directory; paths are relative to the directory run_analysis ran in",
     }
+
+
+def _analyze_cohort(
+    cohort: str,
+    cohort_dir: Path,
+    loaded: dict,
+    params,
+    *,
+    out_dir: Path,
+    final_name: str,
+    n_jobs: int,
+    findings: list[str] | None = None,
+    published_dir: Path | None = None,
+    log_prefix: str = "analyze",
+) -> dict:
+    """Run MOTCO on one loaded cohort and write a complete analysis directory.
+
+    Shared by ``run_analysis`` (CV-selected rank) and ``run_rank_sensitivity``
+    (forced rank): the two differ only in ``params`` and in where the directory
+    goes, so a forced-rank directory is a CV directory with one setting changed.
+
+    Parameters
+    ----------
+    cohort:
+        Cohort name (title and manifest).
+    cohort_dir:
+        The export directory the inputs were read from.
+    loaded:
+        ``load_analysis_inputs(cohort_dir)``.
+    params:
+        ``motco.analysis.TrajectoryAnalysisParams``; ``forced_components`` set
+        for a forced-rank run, ``None`` for CV rank selection.
+    out_dir:
+        The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
+        to ``<out_dir>/<final_name>`` when complete.
+    final_name:
+        Name of the finished directory under ``out_dir``.
+    n_jobs:
+        Recorded in the manifest and in ``cli_equivalent``.
+    findings:
+        Findings recorded before the helper's own (capped ages, ``n_jobs``,
+        rank 1).
+    published_dir:
+        The path the directory will have once the caller is done, when that
+        differs from ``<out_dir>/<final_name>`` (the sweep writes its ranks
+        under ``<cohort>.tmp/`` first); used for ``cli_equivalent``.
+    log_prefix:
+        Prefix of the progress lines, ``[analyze]`` by default.
+
+    Returns
+    -------
+    dict
+        ``{"dir": Path, "record": dict, "manifest": dict, "findings": [...]}``.
+    """
+    import io
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    from motco.analysis import OmicsBlock, TrajectoryDataset, analyze_trajectories, write_analysis_outputs
+
+    motco_version = check_motco_version()
+    blocks = loaded["blocks"]
+    export_manifest = loaded["export_manifest"]
+    final = out_dir / final_name
+    published = Path(published_dir) if published_dir is not None else final
+    # Parse the table back as `motco analyze --metadata` does, so the
+    # CLI-equivalent run sees exactly what this one sees
+    metadata_csv = loaded["metadata"].to_csv(index=False)
+    metadata = pd.read_csv(io.StringIO(metadata_csv))
+    metadata["donor_id"] = metadata["donor_id"].astype(str)
+    forced = params.forced_components
+    print(
+        f"[{log_prefix}] {cohort}: {len(metadata)} donors, "
+        + " + ".join(f"{b.shape[1]} {o}" for o, b in blocks.items())
+        + f" features, covariates {', '.join(ANALYSIS_COVARIATES)}"
+    )
+
+    dataset = TrajectoryDataset(
+        blocks=[OmicsBlock(o, blocks[o], "identity") for o in ANALYSIS_BLOCKS],
+        metadata=metadata,
+        sample_col="donor_id",
+        group_col="sex",
+        stage_col="stage",
+        stage_order=STAGES,
+        covariate_cols=ANALYSIS_COVARIATES,
+        missing_covariates=ANALYSIS_MISSING_COVARIATES,
+    )
+    selection = "CV rank selection" if forced is None else f"forced rank {forced}"
+    print(f"[{log_prefix}] {cohort}: {selection} + {params.permutations} RRPP permutations (n_jobs {n_jobs})...")
+    result = analyze_trajectories(dataset, params)
+    record = result.record
+    print(
+        f"[{log_prefix}] {cohort}: rank {record['latent']['selected_lv']} ({record['latent']['component_selection']}), "
+        f"{record['measurement']['runtime_seconds']:.1f} s"
+    )
+
+    findings = list(findings or [])
+    n_capped = export_manifest.get("covariates", {}).get("n_age_capped")
+    if n_capped:
+        findings.append(
+            f"{n_capped} donor(s) have capped ages but age_capped is not entered "
+            "(the covariate set assumed it constant); revisit the covariate set"
+        )
+    if n_jobs != 1:
+        findings.append(
+            f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
+            "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
+            "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+        )
+    if record["latent"]["selected_lv"] == 1:
+        findings.append(
+            "CV selected rank 1: in a one-dimensional latent space the net displacements are parallel "
+            "or antiparallel, so angle is 0° or 180° by construction and carries no orientation information"
+        )
+
+    tmp = out_dir / f"{final_name}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    written = write_analysis_outputs(result, tmp)
+    (tmp / "analysis_metadata.csv").write_text(metadata_csv)
+    (tmp / "summary.md").write_text(render_analysis_summary(record, cohort=cohort))
+    software = _software_versions()
+    software["motco"] = motco_version
+    try:
+        software["scikit-learn"] = version("scikit-learn")
+    except PackageNotFoundError:
+        software["scikit-learn"] = None
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cohort": cohort,
+        "n_donors": int(len(metadata)),
+        "inputs": {
+            "dir": str(cohort_dir),
+            "files": loaded["inputs"],
+            "export_manifest_sha256": loaded["inputs"]["manifest.json"]["sha256"],
+            "export_manifest_created_at": export_manifest.get("created_at"),
+            "export_git": export_manifest.get("git"),
+        },
+        "model": {
+            "entry_point": "motco.analysis.analyze_trajectories",
+            "blocks": [
+                {"name": o, "file": f"{o}.csv", "transform": "identity", "n_features": int(blocks[o].shape[1])}
+                for o in ANALYSIS_BLOCKS
+            ],
+            "metadata_file": "analysis_metadata.csv",
+            "sample_col": "donor_id",
+            "group_col": "sex",
+            "group_levels": record["design"]["group_levels"],
+            "stage_col": "stage",
+            "stage_order": list(STAGES),
+            "stage_labels": STAGE_LABELS,
+        },
+        "preprocessing": {
+            "source": "export manifest",
+            "thresholds": export_manifest.get("thresholds"),
+            "feature_counts": export_manifest.get("feature_counts"),
+            "n_age_capped": n_capped,
+            "export_findings": export_manifest.get("findings", []),
+        },
+        "covariates": {
+            "entered": list(ANALYSIS_COVARIATES),
+            "derived": {name: f"log10({src})" for name, src in ANALYSIS_LOG10_COLUMNS.items()},
+            "excluded": dict(ANALYSIS_EXCLUDED_COVARIATES),
+            "missing_policy": ANALYSIS_MISSING_COVARIATES,
+            "imputed": False,
+        },
+        "measurement": {
+            "orientation_estimator": params.orientation_estimator,
+            "component_selection": record["latent"]["component_selection"],
+            "forced_components": params.forced_components,
+            **(
+                {"cv": None, "cv_note": "cross-validation skipped: the latent rank was forced"}
+                if forced is not None else
+                {"cv": {
+                    "cv1_splits": params.cv1_splits, "cv2_splits": params.cv2_splits,
+                    "n_repeats": params.n_repeats, "max_components": params.max_components,
+                    "random_state": params.random_state,
+                }}
+            ),
+            "permutations": params.permutations,
+            "seed": params.seed,
+            "alpha": ANALYSIS_ALPHA,
+            "rejection_rule": ANALYSIS_REJECTION_RULE,
+            "n_jobs": n_jobs,
+            "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+            "attribution": False,
+        },
+        "cli_equivalent": _cli_equivalent(cohort_dir, published / "analysis_metadata.csv", params, n_jobs),
+        "outputs": sorted([p.name for p in written.values()] + [
+            "analysis_metadata.csv", "summary.md", "analysis_manifest.json",
+        ]),
+        "software": software,
+        "git": _git_revision(),
+        "findings": findings,
+    }
+    (tmp / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if final.exists():
+        shutil.rmtree(final)
+    os.replace(tmp, final)
+    print(f"[{log_prefix}] Wrote {final}")
+    for msg in findings:
+        print(f"[{log_prefix}] FINDING: {cohort}: {msg}")
+    return {"dir": final, "record": record, "manifest": manifest, "findings": findings}
 
 
 def run_analysis(
@@ -2975,7 +3200,7 @@ def run_analysis(
     Returns
     -------
     dict
-        Cohort → ``{"dir": Path, "record": dict, "findings": [...]}``.
+        Cohort → ``{"dir": Path, "record": dict, "manifest": dict, "findings": [...]}``.
 
     Notes
     -----
@@ -2986,20 +3211,11 @@ def run_analysis(
     ``ANALYSIS_SEED``. The model's metadata table is serialized to
     ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
     parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
-    run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete.
+    run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete
+    (``_analyze_cohort``, shared with ``run_rank_sensitivity``).
     """
-    import io
-    import shutil
-    from importlib.metadata import PackageNotFoundError, version
-
     motco_version = check_motco_version()
-    from motco.analysis import (
-        OmicsBlock,
-        TrajectoryAnalysisParams,
-        TrajectoryDataset,
-        analyze_trajectories,
-        write_analysis_outputs,
-    )
+    from motco.analysis import TrajectoryAnalysisParams
 
     input_dir = Path(input_dir)
     out_dir = Path(out_dir)
@@ -3021,63 +3237,405 @@ def run_analysis(
     for c in cohorts:
         cohort_dir = input_dir / c
         loaded = load_analysis_inputs(cohort_dir)
-        blocks = loaded["blocks"]
-        export_manifest = loaded["export_manifest"]
-        # Parse the table back as `motco analyze --metadata` does, so the
-        # CLI-equivalent run sees exactly what this one sees
-        metadata_csv = loaded["metadata"].to_csv(index=False)
-        metadata = pd.read_csv(io.StringIO(metadata_csv))
-        metadata["donor_id"] = metadata["donor_id"].astype(str)
-        print(
-            f"[analyze] {c}: {len(metadata)} donors, "
-            + " + ".join(f"{b.shape[1]} {o}" for o, b in blocks.items())
-            + f" features, covariates {', '.join(ANALYSIS_COVARIATES)}"
-        )
-
-        dataset = TrajectoryDataset(
-            blocks=[OmicsBlock(o, blocks[o], "identity") for o in ANALYSIS_BLOCKS],
-            metadata=metadata,
-            sample_col="donor_id",
-            group_col="sex",
-            stage_col="stage",
-            stage_order=STAGES,
-            covariate_cols=ANALYSIS_COVARIATES,
-            missing_covariates=ANALYSIS_MISSING_COVARIATES,
-        )
         params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
-        print(f"[analyze] {c}: CV rank selection + {params.permutations} RRPP permutations (n_jobs {n_jobs})...")
-        result = analyze_trajectories(dataset, params)
-        record = result.record
+        results[c] = _analyze_cohort(c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# MOTCO rank sensitivity (forced-rank sweep beside the CV-selected analysis)
+# ---------------------------------------------------------------------------
+
+# Forced latent ranks, a constant and not a flag: 2 = n_stages − 1 (the lowest
+# rank at which `angle` carries orientation information, and the rank MOTCO's
+# stage-supervised rule selects at three stages in its operating studies); 3
+# the next rank; 4, 6, 9 and 12 the steps of MOTCO's own latent-rank ladder
+# (4 = 2(K − 1) is the forced rank with a Type I check at this design). Rank 1
+# cannot be forced (MOTCO accepts forced_components >= 2 only): the CV-selected
+# analysis is the reference row instead. The sweep never chooses a rank.
+ANALYSIS_FORCED_RANKS = (2, 3, 4, 6, 9, 12)
+RANK_SENSITIVITY_DIR_TEMPLATE = "rank_{:02d}"
+RANK_SENSITIVITY_TABLE = "rank_sensitivity.csv"
+RANK_SENSITIVITY_MARKDOWN = "rank_sensitivity.md"
+RANK_SENSITIVITY_MANIFEST = "rank_sensitivity_manifest.json"
+RANK_1_NOTE = (
+    "rank 1 cannot be forced (MOTCO accepts forced_components >= 2 only); "
+    "the CV-selected analysis is the reference row"
+)
+_REFERENCE_FILES = ("result.json", "analysis_manifest.json")
+# rank_sensitivity.csv holds only values that reproduce across reruns; runtimes
+# go to rank_sensitivity.md and the manifest
+_RANK_SENSITIVITY_CSV_EXCLUDED = ("runtime_seconds",)
+
+
+def _csv_float(value) -> str:
+    """Shortest round-trip representation, so a CSV cell equals the JSON value exactly."""
+    return repr(float(value))
+
+
+def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: dict, motco_version: str) -> dict:
+    """Read the CV-selected analysis of one cohort and check it matches the sweep.
+
+    Parameters
+    ----------
+    cohort_dir:
+        The export directory the sweep reads.
+    analysis_dir:
+        ``<analysis root>/<cohort>/`` as written by ``run_analysis``.
+    inputs:
+        ``load_analysis_inputs(cohort_dir)["inputs"]``: file → path and sha256
+        of the five export files now on disk.
+    motco_version:
+        The installed MOTCO version.
+
+    Returns
+    -------
+    dict
+        ``dir``, ``record`` (parsed ``result.json``), ``manifest`` (parsed
+        ``analysis_manifest.json``) and ``files`` (the two files' paths and
+        sha256).
+
+    Raises
+    ------
+    FileNotFoundError
+        The analysis directory or one of its two files is missing (the message
+        names the ``analyze`` command).
+    ValueError
+        An export file's sha256, the MOTCO version, the seed, the permutation
+        count or the component selection recorded by the analysis differs from
+        the sweep's; the message names the file or setting.
+    """
+    d = Path(analysis_dir)
+    hint = "run `sead-sexdiff analyze` to produce it"
+    if not d.is_dir():
+        raise FileNotFoundError(f"{d} does not exist; {hint}")
+    for name in _REFERENCE_FILES:
+        if not (d / name).exists():
+            raise FileNotFoundError(f"{d / name} is missing; {hint}")
+    record = json.loads((d / "result.json").read_text())
+    manifest = json.loads((d / "analysis_manifest.json").read_text())
+    rerun = "rerun `sead-sexdiff analyze` so the reference matches the inputs"
+    recorded = manifest.get("inputs", {}).get("files", {})
+    for name in _ANALYSIS_INPUTS:
+        before = recorded.get(name, {}).get("sha256")
+        now = inputs[name]["sha256"]
+        if before != now:
+            raise ValueError(
+                f"{Path(cohort_dir) / name} has changed since the analysis in {d} "
+                f"(sha256 {before} recorded, {now} now); {rerun}"
+            )
+    ref_version = manifest.get("software", {}).get("motco")
+    if ref_version != motco_version:
+        raise ValueError(
+            f"{d / 'analysis_manifest.json'} records MOTCO version {ref_version} but {motco_version} is "
+            f"installed; {rerun}"
+        )
+    meas = manifest.get("measurement", {})
+    for key, expected in (("seed", ANALYSIS_SEED), ("permutations", ANALYSIS_PERMUTATIONS)):
+        if meas.get(key) != expected:
+            raise ValueError(
+                f"{d / 'analysis_manifest.json'} records {key} = {meas.get(key)} but the sweep uses {expected}; {rerun}"
+            )
+    selection = record.get("latent", {}).get("component_selection")
+    if selection != "cv":
+        raise ValueError(
+            f"{d / 'result.json'} records component_selection = {selection!r}; the reference must be the "
+            f"CV-selected analysis; {rerun}"
+        )
+    files = {name: {"path": str(d / name), "sha256": _sha256_file(d / name)} for name in _REFERENCE_FILES}
+    return {"dir": d, "record": record, "manifest": manifest, "files": files}
+
+
+def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, directory: str) -> dict:
+    """Flatten one analysis record into a row of the cross-rank table.
+
+    ``directory`` is the reference analysis directory for the ``cv`` row and
+    the ``rank_<kk>`` name (relative to the cohort directory) for a forced
+    row, so the table does not depend on where the sweep was written.
+    ``runtime_seconds`` is rendered in the Markdown and recorded in the
+    manifest but left out of the CSV.
+    """
+    row = {"cohort": cohort, "component_selection": component_selection, "rank": record["latent"]["selected_lv"]}
+    for s in ANALYSIS_STATISTICS:
+        p = record["p_values"].get(s)
+        null = record["null_summary"].get(s, {})
+        row[s] = record["statistics"].get(s)
+        row[f"{s}_p"] = p
+        row[f"{s}_rejected"] = None if p is None else bool(p <= ANALYSIS_ALPHA)
+        row[f"{s}_null_mean"] = null.get("mean")
+        row[f"{s}_null_sd"] = null.get("sd")
+        row[f"{s}_null_q95"] = null.get("q95")
+    row["cv_mean_auroc"] = record["latent"].get("cv_mean_auroc")
+    row["runtime_seconds"] = record["measurement"]["runtime_seconds"]
+    row["dir"] = directory
+    return row
+
+
+def render_rank_sensitivity(
+    rows: list[dict],
+    *,
+    cohort: str,
+    seed: int = ANALYSIS_SEED,
+    permutations: int = ANALYSIS_PERMUTATIONS,
+    alpha: float = ANALYSIS_ALPHA,
+) -> str:
+    """Render ``rank_sensitivity.md`` from the rows of ``rank_sensitivity.csv``.
+
+    Parameters
+    ----------
+    rows:
+        ``_sensitivity_row`` dicts, the reference (``cv``) row first and the
+        forced ranks in ascending order.
+    cohort:
+        Cohort name for the title.
+    seed, permutations, alpha:
+        Named in the header; a statistic is rejected when ``p <= alpha``.
+
+    Returns
+    -------
+    str
+        Markdown: a header naming the ladder, seed, permutations, α and the
+        reference rank, one table per statistic (rank × observed / p /
+        rejected / null mean / sd / q95) and a table of the runs (CV AUROC,
+        runtime, directory). Every number comes from the rows; the runtimes
+        are the one thing here that is not in ``rank_sensitivity.csv``.
+    """
+    ref = rows[0]
+    ranks = [r["rank"] for r in rows[1:]]
+    lines = [
+        f"# MOTCO rank sensitivity: {cohort}",
+        "",
+        f"Forced-rank sweep of the covariate-adjusted trajectory analysis. The reference row (`cv`) is the "
+        f"CV-selected analysis at rank {ref['rank']}, which stays the primary result; the forced ranks "
+        f"{', '.join(str(k) for k in ranks)} are read as sensitivity to it, and no rank is chosen from the "
+        f"results. {permutations} RRPP permutations with seed {seed} at every rank (the same permutation "
+        f"indices throughout); α = {alpha} (rejected when p ≤ α). `angle` and `shape` non-rejections are "
+        "uninformative at every rank; a `delta` rejection is a difference, not specifically of size.",
+    ]
+    for s in ANALYSIS_STATISTICS:
+        lines += [
+            "",
+            f"## {s}" + (" (degrees)" if s == "angle" else ""),
+            "",
+            "| selection | rank | observed | p (RRPP) | rejected | null mean | null sd | null q95 |",
+            "|---|---:|---:|---:|:---:|---:|---:|---:|",
+        ]
+        for r in rows:
+            rejected = r[f"{s}_rejected"]
+            lines.append(
+                f"| {r['component_selection']} | {r['rank']} | {_fmt(r[s])} | {_fmt(r[f'{s}_p'], '.4g')} | "
+                f"{'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
+                f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
+            )
+    lines += [
+        "",
+        "## Runs",
+        "",
+        "| selection | rank | cv_mean_auroc | runtime (s) | directory |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['component_selection']} | {r['rank']} | {_fmt(r['cv_mean_auroc'], '.4f')} | "
+            f"{_fmt(r['runtime_seconds'], '.1f')} | `{r['dir']}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_rank_sensitivity(
+    cohort: str = "all",
+    *,
+    input_dir: str | Path = "results/motco_input",
+    analysis_dir: str | Path = "results/motco_analysis",
+    out_dir: str | Path = "results/motco_rank_sensitivity",
+    n_jobs: int = 1,
+    force: bool = False,
+) -> dict:
+    """Rerun the covariate-adjusted analysis at every forced rank of the ladder.
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    input_dir:
+        Export root; each cohort is read from ``<input_dir>/<cohort>/``.
+    analysis_dir:
+        Analysis root of the ``analyze`` step; ``<analysis_dir>/<cohort>/`` is
+        the reference, read and checked, never written.
+    out_dir:
+        Sweep root; each cohort goes to ``<out_dir>/<cohort>/``.
+    n_jobs:
+        Parallel jobs for MOTCO's RRPP (``-1`` = all CPUs); as in
+        ``run_analysis``, values other than 1 change the permutation draws and
+        are recorded as a finding. The reported results use 1.
+    force:
+        Replace existing cohort directories.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir", "reference", "ranks" (rank → _analyze_cohort
+        result), "table" (DataFrame), "manifest", "findings"}``.
+
+    Raises
+    ------
+    FileExistsError
+        A cohort directory exists and ``force`` is false.
+    FileNotFoundError
+        The export or the analysis of a cohort is missing.
+    ValueError
+        The reference analysis does not match the inputs or settings, or a rank
+        of the ladder is infeasible for a cohort.
+
+    Notes
+    -----
+    Every check (existing output, export and analysis present, reference
+    hashes and settings, feasibility of every rank) runs for every requested
+    cohort before anything is written. Each rank is one ``_analyze_cohort``
+    call with ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
+    seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k)``, so the only
+    difference from the ``analyze`` step is the rank; cross-validation does
+    not run. A cohort is written under ``<cohort>.tmp/`` (``rank_<kk>/``
+    directories, ``rank_sensitivity.csv``, ``rank_sensitivity.md``,
+    ``rank_sensitivity_manifest.json``) and renamed when complete.
+    """
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    motco_version = check_motco_version()
+    from motco.analysis import TrajectoryAnalysisParams
+
+    input_dir = Path(input_dir)
+    analysis_dir = Path(analysis_dir)
+    out_dir = Path(out_dir)
+    ladder = tuple(ANALYSIS_FORCED_RANKS)
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    for c in cohorts:
+        if (out_dir / c).exists() and not force:
+            raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+    for c in cohorts:
+        if not (input_dir / c).is_dir():
+            raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce it")
+        if not (analysis_dir / c).is_dir():
+            raise FileNotFoundError(
+                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze` to produce the reference analysis"
+            )
+    print(f"[rank-sensitivity] MOTCO {motco_version}")
+    print(f"[rank-sensitivity] Input directory: {input_dir}")
+    print(f"[rank-sensitivity] Reference analysis directory: {analysis_dir}")
+    print(f"[rank-sensitivity] Output directory: {out_dir}")
+    print(f"[rank-sensitivity] Forced ranks: {', '.join(str(k) for k in ladder)} ({RANK_1_NOTE})")
+
+    # Load and check every cohort before writing anything
+    prepared = {}
+    for c in cohorts:
+        cohort_dir = input_dir / c
+        loaded = load_analysis_inputs(cohort_dir)
+        reference = _check_reference(cohort_dir, analysis_dir / c, loaded["inputs"], motco_version)
+        n_donors = len(loaded["metadata"])
+        n_features = sum(b.shape[1] for b in loaded["blocks"].values())
+        max_rank = min(n_donors, n_features)
+        for k in ladder:
+            if not (2 <= k <= max_rank):
+                raise ValueError(
+                    f"forced rank {k} is infeasible for {c}: MOTCO accepts 2 <= forced_components <= "
+                    f"min(n_donors = {n_donors}, n_features = {n_features}) = {max_rank}; the ladder "
+                    "ANALYSIS_FORCED_RANKS is a constant, nothing was written"
+                )
+        ref_rank = reference["record"]["latent"]["selected_lv"]
         print(
-            f"[analyze] {c}: rank {record['latent']['selected_lv']} ({record['latent']['component_selection']}), "
-            f"{record['measurement']['runtime_seconds']:.1f} s"
+            f"[rank-sensitivity] {c}: reference {reference['dir']} (CV-selected rank {ref_rank}, "
+            f"hashes and settings match)"
+        )
+        prepared[c] = (loaded, reference)
+
+    results = {}
+    for c in cohorts:
+        loaded, reference = prepared[c]
+        cohort_dir = input_dir / c
+        final = out_dir / c
+        ref_record = reference["record"]
+        ref_rank = ref_record["latent"]["selected_lv"]
+        tmp = out_dir / f"{c}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+
+        runs = {}
+        for k in ladder:
+            name = RANK_SENSITIVITY_DIR_TEMPLATE.format(k)
+            params = TrajectoryAnalysisParams(
+                permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k
+            )
+            runs[k] = _analyze_cohort(
+                c, cohort_dir, loaded, params,
+                out_dir=tmp, final_name=name, published_dir=final / name, n_jobs=n_jobs,
+                findings=[
+                    f"forced rank {k} (dimensionality sensitivity): the CV-selected analysis in "
+                    f"{reference['dir']} is primary"
+                ],
+                log_prefix="rank-sensitivity",
+            )
+            rec = runs[k]["record"]
+            print(
+                f"[rank-sensitivity] {c}: rank {k}: "
+                + ", ".join(f"{s} {_fmt(rec['statistics'].get(s))} (p {_fmt(rec['p_values'].get(s), '.4g')})"
+                            for s in ANALYSIS_STATISTICS)
+            )
+
+        rows = [_sensitivity_row(ref_record, cohort=c, component_selection="cv", directory=str(reference["dir"]))]
+        rows += [
+            _sensitivity_row(runs[k]["record"], cohort=c, component_selection="forced",
+                             directory=RANK_SENSITIVITY_DIR_TEMPLATE.format(k))
+            for k in ladder
+        ]
+        table = pd.DataFrame(rows).drop(columns=list(_RANK_SENSITIVITY_CSV_EXCLUDED))
+        table.to_csv(tmp / RANK_SENSITIVITY_TABLE, index=False, float_format=_csv_float)
+        (tmp / RANK_SENSITIVITY_MARKDOWN).write_text(
+            render_rank_sensitivity(rows, cohort=c, seed=ANALYSIS_SEED, permutations=ANALYSIS_PERMUTATIONS)
         )
 
         findings = []
-        n_capped = export_manifest.get("covariates", {}).get("n_age_capped")
-        if n_capped:
+        at_cv_rank = None
+        if ref_rank in ladder:
+            forced_rec = runs[ref_rank]["record"]
+            stats_equal = all(
+                np.isclose(forced_rec["statistics"][s], ref_record["statistics"][s], rtol=1e-9, atol=0.0)
+                for s in ANALYSIS_STATISTICS
+            )
+            p_equal = forced_rec["p_values"] == ref_record["p_values"]
+            at_cv_rank = {"rank": ref_rank, "statistics_equal": bool(stats_equal), "p_values_equal": bool(p_equal)}
+            if not (stats_equal and p_equal):
+                findings.append(
+                    f"the forced run at the CV-selected rank {ref_rank} differs from the reference analysis "
+                    f"(statistics equal: {stats_equal}; p-values equal: {p_equal}); the same data, rank and "
+                    "seed should give the same record"
+                )
+        elif ref_rank == 1:
+            findings.append(f"CV-selected rank 1 is not in the ladder {ladder}: {RANK_1_NOTE}")
+        else:
             findings.append(
-                f"{n_capped} donor(s) have capped ages but age_capped is not entered "
-                "(the covariate set assumed it constant); revisit the covariate set"
+                f"CV-selected rank {ref_rank} is not in the ladder {ladder}; the reference row stands in for it"
             )
         if n_jobs != 1:
             findings.append(
                 f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
-                "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
-                "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+                "draws, p-values and null summaries differ from an n_jobs = 1 run at every rank; the "
+                "case-study results are reported at n_jobs = 1"
             )
-        if record["latent"]["selected_lv"] == 1:
-            findings.append(
-                "CV selected rank 1: in a one-dimensional latent space the net displacements are parallel "
-                "or antiparallel, so angle is 0° or 180° by construction and carries no orientation information"
-            )
+        for k in ladder:
+            for s in ANALYSIS_STATISTICS:
+                p_ref, p_k = ref_record["p_values"].get(s), runs[k]["record"]["p_values"].get(s)
+                if p_ref is not None and p_k is not None and (p_ref <= ANALYSIS_ALPHA) != (p_k <= ANALYSIS_ALPHA):
+                    findings.append(
+                        f"{s}: rejection status at forced rank {k} (p = {_fmt(p_k, '.4g')}) differs from the "
+                        f"CV-selected analysis (p = {_fmt(p_ref, '.4g')}); rank dependence of the sensitivity "
+                        "analysis, the CV-selected result stays primary"
+                    )
 
-        tmp = out_dir / f"{c}.tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        written = write_analysis_outputs(result, tmp)
-        (tmp / "analysis_metadata.csv").write_text(metadata_csv)
-        (tmp / "summary.md").write_text(render_analysis_summary(record, cohort=c))
         software = _software_versions()
         software["motco"] = motco_version
         try:
@@ -3087,76 +3645,61 @@ def run_analysis(
         manifest = {
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "cohort": c,
-            "n_donors": int(len(metadata)),
-            "inputs": {
-                "dir": str(cohort_dir),
-                "files": loaded["inputs"],
-                "export_manifest_sha256": loaded["inputs"]["manifest.json"]["sha256"],
-                "export_manifest_created_at": export_manifest.get("created_at"),
-                "export_git": export_manifest.get("git"),
+            "n_donors": int(len(loaded["metadata"])),
+            "forced_ranks": list(ladder),
+            "rank_1_note": RANK_1_NOTE,
+            "seed": ANALYSIS_SEED,
+            "permutations": ANALYSIS_PERMUTATIONS,
+            "same_seed_note": (
+                "the same seed and permutation count at every rank, so every rank draws the same permutation "
+                "indices and between-rank differences are measurement differences"
+            ),
+            "alpha": ANALYSIS_ALPHA,
+            "rejection_rule": ANALYSIS_REJECTION_RULE,
+            "n_jobs": n_jobs,
+            "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+            "inputs": {"dir": str(cohort_dir), "files": loaded["inputs"]},
+            "reference": {
+                "dir": str(reference["dir"]),
+                "files": reference["files"],
+                "component_selection": ref_record["latent"]["component_selection"],
+                "selected_lv": ref_rank,
+                "cv_mean_auroc": ref_record["latent"].get("cv_mean_auroc"),
+                "motco": reference["manifest"]["software"]["motco"],
+                "seed": reference["manifest"]["measurement"]["seed"],
+                "permutations": reference["manifest"]["measurement"]["permutations"],
+                "in_ladder": ref_rank in ladder,
+                "forced_run_at_cv_rank": at_cv_rank,
+                "note": "read and checked (export hashes, MOTCO version, seed, permutations), never rerun or modified",
             },
-            "model": {
-                "entry_point": "motco.analysis.analyze_trajectories",
-                "blocks": [
-                    {"name": o, "file": f"{o}.csv", "transform": "identity", "n_features": int(blocks[o].shape[1])}
-                    for o in ANALYSIS_BLOCKS
-                ],
-                "metadata_file": "analysis_metadata.csv",
-                "sample_col": "donor_id",
-                "group_col": "sex",
-                "group_levels": record["design"]["group_levels"],
-                "stage_col": "stage",
-                "stage_order": list(STAGES),
-                "stage_labels": STAGE_LABELS,
+            "ranks": {
+                str(k): {
+                    "dir": str(final / RANK_SENSITIVITY_DIR_TEMPLATE.format(k)),
+                    "selected_lv": runs[k]["record"]["latent"]["selected_lv"],
+                    "component_selection": runs[k]["record"]["latent"]["component_selection"],
+                    "runtime_seconds": runs[k]["record"]["measurement"]["runtime_seconds"],
+                }
+                for k in ladder
             },
-            "preprocessing": {
-                "source": "export manifest",
-                "thresholds": export_manifest.get("thresholds"),
-                "feature_counts": export_manifest.get("feature_counts"),
-                "n_age_capped": n_capped,
-                "export_findings": export_manifest.get("findings", []),
-            },
-            "covariates": {
-                "entered": list(ANALYSIS_COVARIATES),
-                "derived": {name: f"log10({src})" for name, src in ANALYSIS_LOG10_COLUMNS.items()},
-                "excluded": dict(ANALYSIS_EXCLUDED_COVARIATES),
-                "missing_policy": ANALYSIS_MISSING_COVARIATES,
-                "imputed": False,
-            },
-            "measurement": {
-                "orientation_estimator": params.orientation_estimator,
-                "component_selection": record["latent"]["component_selection"],
-                "forced_components": params.forced_components,
-                "cv": {
-                    "cv1_splits": params.cv1_splits, "cv2_splits": params.cv2_splits,
-                    "n_repeats": params.n_repeats, "max_components": params.max_components,
-                    "random_state": params.random_state,
-                },
-                "permutations": params.permutations,
-                "seed": params.seed,
-                "alpha": ANALYSIS_ALPHA,
-                "rejection_rule": ANALYSIS_REJECTION_RULE,
-                "n_jobs": n_jobs,
-                "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
-                "attribution": False,
-            },
-            "cli_equivalent": _cli_equivalent(cohort_dir, out_dir / c / "analysis_metadata.csv", params, n_jobs),
-            "outputs": sorted([p.name for p in written.values()] + [
-                "analysis_metadata.csv", "summary.md", "analysis_manifest.json",
-            ]),
+            "outputs": sorted(
+                [RANK_SENSITIVITY_DIR_TEMPLATE.format(k) + "/" for k in ladder]
+                + [RANK_SENSITIVITY_TABLE, RANK_SENSITIVITY_MARKDOWN, RANK_SENSITIVITY_MANIFEST]
+            ),
             "software": software,
             "git": _git_revision(),
             "findings": findings,
         }
-        (tmp / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        final = out_dir / c
+        (tmp / RANK_SENSITIVITY_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
         if final.exists():
             shutil.rmtree(final)
         os.replace(tmp, final)
-        print(f"[analyze] Wrote {final}")
+        print(f"[rank-sensitivity] Wrote {final}")
         for msg in findings:
-            print(f"[analyze] FINDING: {c}: {msg}")
-        results[c] = {"dir": final, "record": record, "findings": findings}
+            print(f"[rank-sensitivity] FINDING: {c}: {msg}")
+        results[c] = {
+            "dir": final, "reference": reference, "ranks": runs, "table": table,
+            "manifest": manifest, "findings": findings,
+        }
     return results
 
 
@@ -3184,4 +3727,6 @@ __all__ = [
     "load_analysis_inputs",
     "render_analysis_summary",
     "run_analysis",
+    "render_rank_sensitivity",
+    "run_rank_sensitivity",
 ]
