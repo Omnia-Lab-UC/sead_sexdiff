@@ -2894,6 +2894,38 @@ STAGE_LABELS: dict[str, str] = {"0": "Not AD + Low", "1": "Intermediate", "2": "
 TMM_LOGRATIO_TRIM = 0.3
 TMM_SUM_TRIM = 0.05
 EXPORT_FLOAT_FORMAT = "%.10g"
+# Selection rules of the export's step 6 (``preprocess_block``): the primary's
+# ``variance`` and the two rules of the preprocessing-sensitivity registry.
+# ``trend_ratio`` divides each feature's log2-CPM variance by a mean–variance
+# trend: the median variance of TREND_N_BINS equal-count bins of mean log2-CPM
+# (np.array_split of the features sorted by mean), each placed at its median
+# mean, linearly interpolated (np.interp; flat beyond the end bins). ``mean``
+# ranks by mean log2-CPM. Ties by name under every rule. Constants of the
+# feature-selection sensitivity change; flag and ask before changing them.
+SELECTION_RULES = ("variance", "trend_ratio", "mean")
+TREND_N_BINS = 20
+# Residualization (the ``residualized`` and ``revised_candidate`` variants):
+# after log2-CPM and before the selection step each abundance-passing feature
+# is replaced by its mean plus the residual of its OLS regression on an
+# intercept and RESIDUALIZATION_COVARIATES. The per-omic log10 library sizes
+# are the export's own (the step-3 library sizes: each donor's counts over the
+# features kept at step 2); the gene-set pseudobulk fractions come from
+# ``donor_technical.csv``, minus the fractions the technical-axis report
+# classifies as cell state under its fixed rule (within-donor supertype share
+# above the between-donor share), recorded here with the report's section as
+# the reason. Sex, stage and the analysis covariates never enter the set.
+RESIDUALIZATION_CANDIDATE_FRACTIONS = ("ribosomal_pseudobulk", "mitochondrial_pseudobulk", "hemoglobin_pseudobulk")
+RESIDUALIZATION_CELL_STATE_EXCLUSIONS: dict[str, str] = {
+    "hemoglobin_pseudobulk": (
+        "reports/motco-astrocyte-technical-axis-2026-10-19.md, section 2, 'Classification under the spec's rule': "
+        "median within-donor supertype share 0.00394 above the between-donor share 0.00285 (both negligible; "
+        "median pseudobulk fraction 6.7e-07 of UMIs); not a residualization candidate"
+    ),
+}
+RESIDUALIZATION_COVARIATES = ("log10_lib_rna", "log10_lib_atac") + tuple(
+    f for f in RESIDUALIZATION_CANDIDATE_FRACTIONS if f not in RESIDUALIZATION_CELL_STATE_EXCLUSIONS
+)
+RESIDUALIZATION_FILE = "residualization.csv"
 
 # GENCODE v32 = the annotation of the 10x GRCh38-2020-A reference (Cell Ranger 6.0)
 GENCODE_RELEASE = "32"
@@ -3145,6 +3177,139 @@ def smallest_cell(table: pd.DataFrame) -> tuple[int, str, dict]:
     return cells[name], name, cells
 
 
+def _excluded_features(
+    names, chromosomes, *, excluded_chromosomes: Iterable[str], excluded_gene_sets: Iterable[str] = ()
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Step 2 of the export: features on excluded chromosomes, then features of excluded gene sets.
+
+    Parameters
+    ----------
+    names, chromosomes:
+        Feature names and chromosome per feature.
+    excluded_chromosomes:
+        Chromosomes whose features are removed (status ``sex_chromosome``).
+    excluded_gene_sets:
+        Names of ``TECHNICAL_GENE_SETS`` whose matching features are removed
+        next (status ``excluded_gene_set``); a matched feature already on an
+        excluded chromosome keeps ``sex_chromosome``. ATAC names match no set.
+
+    Returns
+    -------
+    (on_chromosome, in_gene_set, matched)
+        Boolean masks over the input features (``in_gene_set`` excludes the
+        features already removed by chromosome) and, per excluded set, the
+        matched names, the names removed at this step and the matched names
+        already on an excluded chromosome.
+    """
+    names = np.asarray(names, dtype=str)
+    chromosomes = np.asarray(chromosomes, dtype=object)
+    on_chrom = np.isin(chromosomes, tuple(excluded_chromosomes))
+    in_set = np.zeros(names.size, dtype=bool)
+    matched: dict[str, dict] = {}
+    for set_name in excluded_gene_sets:
+        if set_name not in TECHNICAL_GENE_SETS:
+            raise ValueError(f"unknown gene set {set_name!r}; TECHNICAL_GENE_SETS holds {list(TECHNICAL_GENE_SETS)}")
+        compiled = [re.compile(p) for p in TECHNICAL_GENE_SETS[set_name]]
+        hit = np.array([any(c.search(n) for c in compiled) for n in names], dtype=bool)
+        matched[set_name] = {
+            "n_matched": int(hit.sum()),
+            "n_removed": int((hit & ~on_chrom).sum()),
+            "matched": names[hit].tolist(),
+            "removed": names[hit & ~on_chrom].tolist(),
+            "on_excluded_chromosome": names[hit & on_chrom].tolist(),
+        }
+        in_set |= hit & ~on_chrom
+    return on_chrom, in_set, matched
+
+
+def trend_ratio(mean, variance, *, n_bins: int = TREND_N_BINS) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """Variance over a binned-median mean–variance trend (the ``trend_ratio`` selection rule).
+
+    Parameters
+    ----------
+    mean, variance:
+        Mean and population variance of log2-CPM per abundance-passing feature.
+    n_bins:
+        Number of equal-count bins of the mean (``TREND_N_BINS``).
+
+    Returns
+    -------
+    (trend, ratio, bins)
+        The trend at each feature's mean, ``variance / trend`` and the bins
+        (``n``, ``lower``, ``upper``, ``median_mean``, ``median_variance``).
+
+    Notes
+    -----
+    The features sorted by mean are cut with ``np.array_split`` into ``n_bins``
+    bins (sizes differing by at most one); each bin's median variance is placed
+    at its median mean and the trend is ``np.interp`` through these points,
+    flat beyond the end bins. The ratio is undefined, and an error, when the
+    bins' median means are not strictly increasing or a median variance is not
+    positive.
+    """
+    mean = np.asarray(mean, dtype=float)
+    variance = np.asarray(variance, dtype=float)
+    if mean.size < n_bins:
+        raise ValueError(f"trend_ratio needs at least {n_bins} features, got {mean.size}")
+    order = np.argsort(mean, kind="stable")
+    bins = []
+    for chunk in np.array_split(order, n_bins):
+        bins.append({
+            "n": int(chunk.size),
+            "lower": float(mean[chunk].min()),
+            "upper": float(mean[chunk].max()),
+            "median_mean": float(np.median(mean[chunk])),
+            "median_variance": float(np.median(variance[chunk])),
+        })
+    xp = np.array([b["median_mean"] for b in bins])
+    fp = np.array([b["median_variance"] for b in bins])
+    if np.any(np.diff(xp) <= 0):
+        raise ValueError("trend_ratio: the bins' median means are not strictly increasing (tied means); the trend is undefined")
+    if np.any(fp <= 0):
+        raise ValueError("trend_ratio: a bin's median variance is not positive; the trend is undefined")
+    trend = np.interp(mean, xp, fp)
+    return trend, variance / trend, bins
+
+
+def residualize_values(values, design) -> tuple[np.ndarray, np.ndarray]:
+    """Replace each column by its mean plus the residual of its OLS fit on an intercept and ``design``.
+
+    Parameters
+    ----------
+    values:
+        Donors × features (log2-CPM).
+    design:
+        Donors × covariates, aligned to the rows of ``values``; finite and of
+        full column rank together with the intercept.
+
+    Returns
+    -------
+    (residualized, r_squared)
+        The residualized values (same means as the input, each column
+        orthogonal to every design column and the intercept) and the per-feature
+        R² of the fit (NaN for a constant column).
+    """
+    values = np.asarray(values, dtype=float)
+    design = np.asarray(design, dtype=float)
+    if design.ndim == 1:
+        design = design[:, None]
+    if design.shape[0] != values.shape[0]:
+        raise ValueError(f"residualization design has {design.shape[0]} rows for {values.shape[0]} donors")
+    if not np.all(np.isfinite(design)):
+        raise ValueError("residualization design contains non-finite values")
+    X = np.column_stack([np.ones(values.shape[0]), design])
+    if np.linalg.matrix_rank(X) < X.shape[1]:
+        raise ValueError("residualization design is rank deficient (a constant or collinear covariate)")
+    beta = np.linalg.lstsq(X, values, rcond=None)[0]
+    resid = values - X @ beta
+    mean = values.mean(axis=0)
+    ss_tot = ((values - mean) ** 2).sum(axis=0)
+    ss_res = (resid ** 2).sum(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r2 = np.where(ss_tot > 0, 1.0 - ss_res / ss_tot, np.nan)
+    return resid + mean, r2
+
+
 def preprocess_block(
     counts: np.ndarray,
     names: np.ndarray,
@@ -3155,6 +3320,9 @@ def preprocess_block(
     prior_count: float = EXPORT_PRIOR_COUNT,
     top_n: int = EXPORT_TOP_N,
     excluded_chromosomes: Iterable[str] = EXPORT_EXCLUDED_CHROMOSOMES,
+    excluded_gene_sets: Iterable[str] = (),
+    selection_rule: str = "variance",
+    residualize=None,
 ) -> dict:
     """Preprocess one omic block of one cohort (steps 2–6 of the export).
 
@@ -3168,37 +3336,68 @@ def preprocess_block(
         Minimum number of donors with CPM ≥ ``min_cpm`` (smallest sex × stage cell).
     min_cpm, prior_count, top_n, excluded_chromosomes:
         Thresholds; defaults are the module constants.
+    excluded_gene_sets:
+        Names of ``TECHNICAL_GENE_SETS`` whose matching features are removed at
+        step 2 after the chromosome removal (status ``excluded_gene_set``; a
+        matched feature already on an excluded chromosome keeps
+        ``sex_chromosome``). Empty for the primary export; ATAC names match no set.
+    selection_rule:
+        One of ``SELECTION_RULES``: ``variance`` (the primary's; dropped
+        features carry status ``variance``), ``trend_ratio`` or ``mean``
+        (dropped features carry ``selection``).
+    residualize:
+        ``None`` (the primary's) or a donors × covariates design aligned to the
+        rows of ``counts``: after step 5 every abundance-passing feature is
+        replaced by its mean plus the residual of its OLS fit on an intercept
+        and the design (``residualize_values``), so units stay log2-CPM, and
+        step 6 ranks the residualized values.
 
     Returns
     -------
     dict
         ``values`` (donors × kept features, log2-CPM, input feature order),
-        ``kept`` (names), ``status`` and ``variance`` per input feature,
-        ``steps`` (feature counts after each step), ``removed_by_chromosome``,
-        ``lib_size_filter``, ``lib_size``, ``tmm_factors``,
-        ``mean_log_cpm_range`` of the kept features, ``findings``, and the
-        filtered ``filtered_counts`` / ``filtered_log_cpm`` / ``filtered_names``.
+        ``kept`` (names), ``status``, ``variance`` (of the values step 6 ranks:
+        the residualized values when residualizing), ``mean`` and
+        ``selection_score`` (equal to ``variance`` under ``variance``) per input
+        feature, ``trend`` and ``ratio`` (``trend_ratio`` only, else ``None``),
+        ``trend_bins`` (``trend_ratio`` only), ``r_squared`` (residualizing
+        only, else ``None``), ``removed_by_gene_set``, ``selection_rule``,
+        ``steps`` (feature counts after each step; ``after_gene_set`` only when
+        sets were excluded), ``removed_by_chromosome``, ``lib_size_filter``,
+        ``lib_size``, ``tmm_factors``, ``mean_log_cpm_range`` of the kept
+        features, ``findings``, and the filtered ``filtered_counts`` /
+        ``filtered_log_cpm`` / ``filtered_names``.
 
     Notes
     -----
-    Labels are never used: ``k`` is the only cohort-derived input.
+    Labels are never used: ``k`` is the only cohort-derived input. With the
+    default keywords the computation is the primary export's, unchanged.
     """
     counts = np.asarray(counts, dtype=float)
     names = np.asarray(names, dtype=str)
     chromosomes = np.asarray(chromosomes, dtype=object)
+    if selection_rule not in SELECTION_RULES:
+        raise ValueError(f"unknown selection rule {selection_rule!r}; expected one of {SELECTION_RULES}")
+    excluded_gene_sets = tuple(excluded_gene_sets)
     n_feat = counts.shape[1]
     excluded = tuple(excluded_chromosomes)
     status = np.full(n_feat, "kept", dtype=object)
     variance = np.full(n_feat, np.nan)
+    mean = np.full(n_feat, np.nan)
+    score = np.full(n_feat, np.nan)
+    trend = ratio = r_squared = trend_bins = None
     findings: list[str] = []
 
-    # (2) sex chromosomes
-    on_sex = np.isin(chromosomes, excluded)
+    # (2) excluded chromosomes, then excluded gene sets
+    on_sex, in_set, matched = _excluded_features(
+        names, chromosomes, excluded_chromosomes=excluded, excluded_gene_sets=excluded_gene_sets
+    )
     status[on_sex] = "sex_chromosome"
+    status[in_set] = "excluded_gene_set"
     removed_by_chrom = {c: int((chromosomes == c).sum()) for c in excluded}
-    idx2 = np.flatnonzero(~on_sex)
+    idx2 = np.flatnonzero(~on_sex & ~in_set)
 
-    # (3) abundance: CPM over the post-chromosome library sizes
+    # (3) abundance: CPM over the post-step-2 library sizes
     c2 = counts[:, idx2]
     lib_filter = c2.sum(axis=1)
     cpm = c2 / lib_filter[:, None] * 1e6
@@ -3212,31 +3411,57 @@ def preprocess_block(
     factors = tmm_factors(c3, lib_size=lib)
     lcpm = log_cpm(c3, lib * factors, prior_count=prior_count)
 
-    # (6) top-N by population variance, ties by name; output keeps input order
+    # (5b) residualization on an intercept and the design; means kept
+    if residualize is not None:
+        lcpm, r2 = residualize_values(lcpm, residualize)
+        r_squared = np.full(n_feat, np.nan)
+        r_squared[idx3] = r2
+
+    # (6) top-N by the selection rule, ties by name; output keeps input order
     var3 = lcpm.var(axis=0, ddof=0)
+    mean3 = lcpm.mean(axis=0)
     variance[idx3] = var3
-    order = np.lexsort((names[idx3], -var3))
+    mean[idx3] = mean3
+    if selection_rule == "variance":
+        score3, dropped_status = var3, "variance"
+    elif selection_rule == "mean":
+        score3, dropped_status = mean3, "selection"
+    else:
+        trend3, ratio3, trend_bins = trend_ratio(mean3, var3)
+        trend, ratio = np.full(n_feat, np.nan), np.full(n_feat, np.nan)
+        trend[idx3], ratio[idx3] = trend3, ratio3
+        score3, dropped_status = ratio3, "selection"
+    score[idx3] = score3
+    order = np.lexsort((names[idx3], -score3))
     if idx3.size < top_n:
         findings.append(f"only {idx3.size} features pass the abundance filter (< N = {top_n}); all are kept")
     sel = np.sort(order[:top_n])
     dropped = np.setdiff1d(np.arange(idx3.size), sel)
-    status[idx3[dropped]] = "variance"
+    status[idx3[dropped]] = dropped_status
     values = lcpm[:, sel]
     if not np.all(np.isfinite(values)):
         raise ValueError("log2-CPM contains non-finite values")
 
+    steps = {"input": int(n_feat), "after_sex_chromosome": int((~on_sex).sum())}
+    if excluded_gene_sets:
+        steps["after_gene_set"] = int(idx2.size)
+    steps["after_abundance"] = int(idx3.size)
+    steps["after_variance"] = int(sel.size)
     mean_lcpm = values.mean(axis=0) if values.size else np.array([np.nan])
     return {
         "values": values,
         "kept": names[idx3[sel]],
         "status": status,
         "variance": variance,
-        "steps": {
-            "input": int(n_feat),
-            "after_sex_chromosome": int(idx2.size),
-            "after_abundance": int(idx3.size),
-            "after_variance": int(sel.size),
-        },
+        "mean": mean,
+        "selection_score": score,
+        "trend": trend,
+        "ratio": ratio,
+        "trend_bins": trend_bins,
+        "r_squared": r_squared,
+        "removed_by_gene_set": matched,
+        "selection_rule": selection_rule,
+        "steps": steps,
         "removed_by_chromosome": removed_by_chrom,
         "lib_size_filter": lib_filter,
         "lib_size": lib,
@@ -3296,6 +3521,13 @@ def _features_frame(names, chromosomes, res: dict, gene_ids=None) -> pd.DataFram
     df["chromosome"] = chromosomes
     df["status"] = res["status"]
     df["variance"] = res["variance"]
+    if res.get("selection_rule", "variance") != "variance" or res.get("r_squared") is not None:
+        df["mean"] = res["mean"]
+    if res.get("trend") is not None:
+        df["trend"] = res["trend"]
+        df["ratio"] = res["ratio"]
+    if res.get("r_squared") is not None:
+        df["r_squared"] = res["r_squared"]
     return df
 
 
@@ -3366,6 +3598,78 @@ def _cohort_rows(table: pd.DataFrame, covariates: pd.DataFrame, cohort: str, pse
     return sub
 
 
+def _residualization_design(
+    donors: np.ndarray,
+    counts: dict[str, np.ndarray],
+    blocks: dict,
+    technical: pd.DataFrame,
+    *,
+    excluded_chromosomes: Iterable[str],
+    excluded_gene_sets: Iterable[str],
+    pseudobulk_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """The residualization design of one cohort: ``RESIDUALIZATION_COVARIATES`` per donor, in export order.
+
+    Parameters
+    ----------
+    donors:
+        The cohort's donors in export order.
+    counts:
+        Omic → cohort donors × features raw counts (the rows ``_export_cohort``
+        passes to ``preprocess_block``).
+    blocks:
+        Omic → ``{"names", "chrom", ...}`` (``_load_export_inputs``).
+    technical:
+        ``donor_technical.csv`` indexed by ``donor_id`` (or with that column).
+    excluded_chromosomes, excluded_gene_sets:
+        The export's step-2 settings; ``log10_lib_<omic>`` is the log10 of the
+        donor's counts over the features kept at step 2 (the step-3 library
+        size, ``lib_size_filter``).
+    pseudobulk_dir:
+        Named in error messages.
+
+    Returns
+    -------
+    pd.DataFrame
+        Donors × ``RESIDUALIZATION_COVARIATES`` (exactly these columns, in
+        this order), indexed by ``donor_id``. No sex, stage or analysis
+        covariate.
+
+    Raises
+    ------
+    ValueError
+        A technical column is absent, or missing for a cohort donor (the
+        message names the donor and the column); a library size is not
+        positive.
+    """
+    tech = technical.set_index("donor_id") if "donor_id" in technical.columns else technical
+    label = f"{Path(pseudobulk_dir) / TECHNICAL_OUTPUTS['table']}" if pseudobulk_dir is not None else TECHNICAL_OUTPUTS["table"]
+    design = pd.DataFrame(index=pd.Index(donors, name="donor_id"))
+    for col in RESIDUALIZATION_COVARIATES:
+        if col.startswith("log10_lib_"):
+            o = col[len("log10_lib_"):]
+            on_chrom, in_set, _ = _excluded_features(
+                blocks[o]["names"], blocks[o]["chrom"],
+                excluded_chromosomes=excluded_chromosomes, excluded_gene_sets=excluded_gene_sets,
+            )
+            lib = np.asarray(counts[o], dtype=float)[:, ~on_chrom & ~in_set].sum(axis=1)
+            if np.any(lib <= 0):
+                raise ValueError(f"{o}: a cohort donor has no counts on the features kept at step 2; log10 library size undefined")
+            design[col] = np.log10(lib)
+        else:
+            if col not in tech.columns:
+                raise ValueError(f"{label} lacks column {col!r} (RESIDUALIZATION_COVARIATES)")
+            absent = sorted(set(donors) - set(tech.index))
+            if absent:
+                raise ValueError(f"{label} has no row for cohort donor(s) {absent}")
+            values = pd.to_numeric(tech.loc[donors, col], errors="coerce").to_numpy(dtype=float)
+            bad = [d for d, v in zip(donors, values) if not np.isfinite(v)]
+            if bad:
+                raise ValueError(f"{label}: column {col!r} is missing for cohort donor(s) {bad}; the residualized variant needs every covariate for every cohort donor")
+            design[col] = values
+    return design
+
+
 def _export_cohort(
     cohort: str,
     sub: pd.DataFrame,
@@ -3377,6 +3681,9 @@ def _export_cohort(
     out_dir: Path,
     final_name: str,
     excluded_chromosomes: Iterable[str],
+    excluded_gene_sets: Iterable[str] = (),
+    selection_rule: dict[str, str] | str | None = None,
+    residualize: pd.DataFrame | None = None,
     variant: dict | None = None,
     debug_dir: Path | None = None,
     log_prefix: str = "export",
@@ -3410,6 +3717,23 @@ def _export_cohort(
     excluded_chromosomes:
         Chromosomes whose features are removed before the abundance filter
         (recorded in ``thresholds.excluded_chromosomes``).
+    excluded_gene_sets:
+        Names of ``TECHNICAL_GENE_SETS`` removed from the RNA block at step 2
+        after the chromosome removal (``preprocess_block``); every set must
+        match at least one RNA gene. Empty for the primary export (recorded as
+        ``excluded_gene_sets: []``; ``removed_by_gene_set`` is written only when
+        sets were excluded).
+    selection_rule:
+        The step-6 rule per omic (``{"rna": ..., "atac": ...}``), one rule for
+        both, or ``None`` for the primary's ``variance`` (recorded as
+        ``selection_rule: {rna: variance, atac: variance}``; ``trend_bins`` is
+        added for an omic ranked by ``trend_ratio``).
+    residualize:
+        ``None`` (the primary's; recorded as ``residualization: null``) or
+        ``donor_technical.csv`` (indexed by ``donor_id`` or with that column):
+        the design ``RESIDUALIZATION_COVARIATES`` is built per cohort
+        (``_residualization_design``), written as ``residualization.csv`` and
+        passed to ``preprocess_block`` for both omics.
     variant:
         For a preprocessing-sensitivity variant, ``{"name", "description",
         "settings", "reference_export_dir"}``, written as the manifest's
@@ -3429,6 +3753,23 @@ def _export_cohort(
     import shutil
 
     excluded = tuple(excluded_chromosomes)
+    gene_sets = tuple(excluded_gene_sets)
+    for set_name in gene_sets:
+        if set_name not in TECHNICAL_GENE_SETS:
+            raise ValueError(f"unknown gene set {set_name!r}; TECHNICAL_GENE_SETS holds {list(TECHNICAL_GENE_SETS)}")
+    if selection_rule is None:
+        rules = {o: "variance" for o in ("rna", "atac")}
+    elif isinstance(selection_rule, str):
+        rules = {o: selection_rule for o in ("rna", "atac")}
+    else:
+        rules = {o: "variance" for o in ("rna", "atac")}
+        unknown = sorted(set(selection_rule) - set(rules))
+        if unknown:
+            raise ValueError(f"selection_rule names unknown omic(s) {unknown}; expected rna and/or atac")
+        rules.update(selection_rule)
+    for o, rule in rules.items():
+        if rule not in SELECTION_RULES:
+            raise ValueError(f"unknown selection rule {rule!r} for {o}; expected one of {SELECTION_RULES}")
     donors = sub["donor_id"].to_numpy()
     k, k_cell, cells = smallest_cell(sub)
     print(f"[{log_prefix}] {cohort}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
@@ -3439,19 +3780,44 @@ def _export_cohort(
             f"rna: {n_unmapped} of {blocks['rna']['names'].size} genes are absent from "
             f"{annotation['release']}; they are kept (chromosome '{UNMAPPED_CHROMOSOME}')"
         )
-    res = {}
+    counts_by_omic = {}
     for o, blk in blocks.items():
         pos = pd.Index(blk["donors"]).get_indexer(donors)
         if (pos < 0).any():
             raise ValueError(f"{o}_counts.h5ad lacks cohort {cohort} donor(s) {list(donors[pos < 0])}")
-        counts = blk["X"][pos].toarray()
-        res[o] = preprocess_block(counts, blk["names"], blk["chrom"], k=k, excluded_chromosomes=excluded)
+        counts_by_omic[o] = blk["X"][pos].toarray()
+    if gene_sets:
+        _, _, matched_rna = _excluded_features(
+            blocks["rna"]["names"], blocks["rna"]["chrom"], excluded_chromosomes=excluded, excluded_gene_sets=gene_sets
+        )
+        for set_name, info in matched_rna.items():
+            if info["n_matched"] == 0:
+                raise ValueError(
+                    f"gene set {set_name!r} matches no RNA gene name (patterns "
+                    f"{list(TECHNICAL_GENE_SETS[set_name])}); the feature index is not the expected one"
+                )
+    design = None
+    if residualize is not None:
+        design = _residualization_design(
+            donors, counts_by_omic, blocks, residualize,
+            excluded_chromosomes=excluded, excluded_gene_sets=gene_sets, pseudobulk_dir=pb_info.get("pseudobulk_dir"),
+        )
+        print(f"[{log_prefix}] {cohort}: residualization design {design.shape[0]} donors × "
+              f"{design.shape[1]} covariates ({', '.join(design.columns)})")
+    res = {}
+    for o, blk in blocks.items():
+        res[o] = preprocess_block(
+            counts_by_omic[o], blk["names"], blk["chrom"], k=k, excluded_chromosomes=excluded,
+            excluded_gene_sets=gene_sets, selection_rule=rules[o],
+            residualize=None if design is None else design.to_numpy(dtype=float),
+        )
         findings += [f"{o}: {msg}" for msg in res[o]["findings"]]
         s = res[o]["steps"]
-        print(f"[{log_prefix}] {cohort} {o}: {s['input']} → {s['after_sex_chromosome']} → "
-              f"{s['after_abundance']} → {s['after_variance']}")
+        print(f"[{log_prefix}] {cohort} {o}: " + " → ".join(str(v) for v in s.values())
+              + ("" if rules[o] == "variance" else f" (selection rule {rules[o]})"))
         if debug_dir is not None:
             _write_debug(Path(debug_dir), cohort, o, donors, res[o])
+    del counts_by_omic
 
     tmp = out_dir / f"{final_name}.tmp"
     if tmp.exists():
@@ -3463,6 +3829,10 @@ def _export_cohort(
         _features_frame(blocks[o]["names"], blocks[o]["chrom"], res[o], blocks[o]["gene_ids"]).to_csv(
             tmp / f"features_{o}.csv", index=False, float_format=EXPORT_FLOAT_FORMAT
         )
+    design_sha256 = None
+    if design is not None:
+        design.to_csv(tmp / RESIDUALIZATION_FILE, float_format="%.17g")
+        design_sha256 = _sha256_file(tmp / RESIDUALIZATION_FILE)
     meta = pd.DataFrame({
         "donor_id": donors,
         "sex": sub["sex"].to_numpy(),
@@ -3479,6 +3849,68 @@ def _export_cohort(
     missingness = {
         col: sorted(cov.loc[cov[col].isna(), "donor_id"]) for col in cov_cols
     }
+    rule_text = {
+        "variance": "population variance (ddof 0)",
+        "trend_ratio": (
+            f"variance over a mean–variance trend (median variance of {TREND_N_BINS} equal-count bins of mean "
+            "log2-CPM, linearly interpolated at the feature's mean, flat beyond the end bins)"
+        ),
+        "mean": "mean log2-CPM",
+    }
+    order_lines = ["restrict to cohort donors", "remove features on excluded chromosomes"]
+    if gene_sets:
+        order_lines.append(f"remove RNA features of the excluded gene sets ({', '.join(gene_sets)}; TECHNICAL_GENE_SETS)")
+        order_lines.append("keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome and gene-set removal)")
+    else:
+        order_lines.append("keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome removal)")
+    order_lines += [
+        "TMM factors on the filtered counts (library size = filtered column sums)",
+        "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
+    ]
+    if design is not None:
+        order_lines.append(
+            "replace each feature by its mean plus the residual of its OLS fit on an intercept and the "
+            f"residualization covariates ({', '.join(design.columns)}); units stay log2-CPM"
+        )
+    if all(rule == "variance" for rule in rules.values()):
+        order_lines.append("keep the N features with the highest population variance (ddof 0), ties by name; input order kept")
+    else:
+        order_lines.append(
+            "keep the N features with the highest selection score per omic ("
+            + "; ".join(f"{o}: {rules[o]}, {rule_text[rules[o]]}" for o in ("rna", "atac"))
+            + "), ties by name; input order kept"
+        )
+    selection_block: dict = dict(rules)
+    trend_bins = {o: res[o]["trend_bins"] for o in ("rna", "atac") if res[o]["trend_bins"] is not None}
+    if trend_bins:
+        selection_block["trend_bins"] = {
+            o: {"n_bins": TREND_N_BINS, "bins": bins, "note": "equal-count bins of mean log2-CPM (np.array_split of the "
+                "abundance-passing features sorted by mean); median_mean and median_variance are the interpolation nodes"}
+            for o, bins in trend_bins.items()
+        }
+    residualization_block = None
+    if design is not None:
+        residualization_block = {
+            "covariates": list(design.columns),
+            "candidate_fractions": list(RESIDUALIZATION_CANDIDATE_FRACTIONS),
+            "cell_state_exclusions": dict(RESIDUALIZATION_CELL_STATE_EXCLUSIONS),
+            "design_file": RESIDUALIZATION_FILE,
+            "design_sha256": design_sha256,
+            "derivation": {
+                "log10_lib_<omic>": "log10 of the donor's counts over the features kept at step 2 of this export "
+                                    "(the step-3 library size, tmm.<omic>.<donor>.lib_size_filter)",
+                "<set>_pseudobulk": "donor_technical.csv: the UMI-weighted pseudobulk fraction of the gene set over the donor's astrocyte nuclei",
+            },
+            "position": "after log2-CPM (step 5), before the selection step (step 6)",
+            "model": "per feature, OLS on an intercept and the covariates; exported value = feature mean + residual; "
+                     "variance in features_<omic>.csv and the selection score are those of the residualized values",
+            "degrees_of_freedom": int(design.shape[1] + 1),
+            "label_free": "no sex, stage or analysis covariate enters the design",
+            "r_squared_quantiles": {
+                o: {f"q{int(round(q * 100)):02d}": float(np.nanquantile(res[o]["r_squared"], q)) for q in DIAGNOSTIC_QUANTILES}
+                for o in ("rna", "atac")
+            },
+        }
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "cohort": cohort,
@@ -3498,14 +3930,7 @@ def _export_cohort(
             "stage_labels": STAGE_LABELS,
             "cells": cells,
         },
-        "preprocessing_order": [
-            "restrict to cohort donors",
-            "remove features on excluded chromosomes",
-            "keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome removal)",
-            "TMM factors on the filtered counts (library size = filtered column sums)",
-            "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
-            "keep the N features with the highest population variance (ddof 0), ties by name; input order kept",
-        ],
+        "preprocessing_order": order_lines,
         "thresholds": {
             "excluded_chromosomes": list(excluded),
             "min_cpm": EXPORT_MIN_CPM,
@@ -3520,6 +3945,16 @@ def _export_cohort(
         **({"variant": dict(variant)} if variant is not None else {}),
         "feature_counts": {o: res[o]["steps"] for o in ("rna", "atac")},
         "removed_by_chromosome": {o: res[o]["removed_by_chromosome"] for o in ("rna", "atac")},
+        "excluded_gene_sets": list(gene_sets),
+        **({"removed_by_gene_set": {
+            o: {
+                s: {key: val for key, val in info.items() if key != "matched"}
+                for s, info in res[o]["removed_by_gene_set"].items()
+            }
+            for o in ("rna", "atac")
+        }} if gene_sets else {}),
+        "selection_rule": selection_block,
+        "residualization": residualization_block,
         "kept_mean_log_cpm_range": {o: res[o]["mean_log_cpm_range"] for o in ("rna", "atac")},
         "tmm": {
             o: {
@@ -4103,6 +4538,14 @@ def _analyze_cohort(
         "preprocessing": {
             "source": "export manifest",
             "thresholds": export_manifest.get("thresholds"),
+            "excluded_gene_sets": export_manifest.get("excluded_gene_sets"),
+            "selection_rule": {
+                o: rule for o, rule in (export_manifest.get("selection_rule") or {}).items() if o in ANALYSIS_BLOCKS
+            } or None,
+            "residualization": (
+                None if not export_manifest.get("residualization")
+                else {key: export_manifest["residualization"].get(key) for key in ("covariates", "design_sha256", "degrees_of_freedom")}
+            ),
             "feature_counts": export_manifest.get("feature_counts"),
             "n_age_capped": n_capped,
             "export_findings": export_manifest.get("findings", []),
@@ -4703,8 +5146,84 @@ PREPROCESSING_VARIANTS: dict[str, dict] = {
         "description": "chrX kept; chrY and chrM removed; every other export setting equal to the primary",
         "export": {"excluded_chromosomes": ("chrY", "chrM")},
     },
+    "exclude_families": {
+        "description": (
+            "RNA genes of the ribosomal, mitochondrial and hemoglobin sets (TECHNICAL_GENE_SETS) removed before the "
+            "abundance filter; the ATAC block and every other export setting equal to the primary"
+        ),
+        "export": {"excluded_gene_sets": ("ribosomal", "mitochondrial", "hemoglobin")},
+    },
+    "rna_trend_ratio": {
+        "description": (
+            "RNA features ranked at the selection step by the ratio of their log2-CPM variance to a binned-median "
+            "mean–variance trend instead of by raw variance; the ATAC block and every other export setting equal to "
+            "the primary"
+        ),
+        "export": {"selection_rule": {"rna": "trend_ratio", "atac": "variance"}},
+    },
+    "atac_mean_accessibility": {
+        "description": (
+            "ATAC peaks ranked at the selection step by mean log2-CPM (total accessibility) instead of by variance; "
+            "the RNA block and every other export setting equal to the primary"
+        ),
+        "export": {"selection_rule": {"rna": "variance", "atac": "mean"}},
+    },
+    "residualized": {
+        "description": (
+            "after log2-CPM and before the selection step, each abundance-passing feature replaced by its mean plus "
+            "the residual of its regression on an intercept and RESIDUALIZATION_COVARIATES (the export's log10 "
+            "library sizes and the technical table's gene-set fractions); the selection ranks the residual variance; "
+            "every other export setting equal to the primary"
+        ),
+        "export": {"residualize": True},
+    },
+    "revised_candidate": {
+        "description": (
+            "the four settings together in the primary's order: gene sets removed before the abundance filter, "
+            "residualization after log2-CPM, trend-ratio ranking for RNA and mean-accessibility ranking for ATAC at "
+            "the selection step; the adoption rule ADOPTION_RULE is evaluated for this variant"
+        ),
+        "export": {
+            "excluded_gene_sets": ("ribosomal", "mitochondrial", "hemoglobin"),
+            "residualize": True,
+            "selection_rule": {"rna": "trend_ratio", "atac": "mean"},
+        },
+        "adoption_check": True,
+    },
 }
 PREPROCESSING_PRIMARY_LABEL = "primary"
+# The primary export's value of every registry setting (named in the comparison)
+PREPROCESSING_PRIMARY_SETTINGS: dict = {
+    "excluded_chromosomes": list(EXPORT_EXCLUDED_CHROMOSOMES),
+    "excluded_gene_sets": [],
+    "selection_rule": {"rna": "variance", "atac": "variance"},
+    "residualize": None,
+}
+# The adoption rule of the revised candidate (design D7): a constant over
+# generated numbers, evaluated by the step from the candidate's latent scores
+# and written to comparison/<cohort>/adoption_check.csv. The check variables
+# are technical variables that are not regressors of the residualization: the
+# primary export's TMM factors (the normalization by-product that proxies the
+# composition effect), the nucleus QC means of the technical table, RIN and
+# PMI. No p-value, rejection status or CV AUROC is read. Never chosen from
+# results; flag and ask before changing.
+ADOPTION_CHECK_VARIABLES = (
+    "tmm_rna",
+    "tmm_atac",
+    "fraction_mitochondrial_umis_mean",
+    "doublet_score_mean",
+    "gex_reads_mapped_confidently_to_intronic_regions_mean",
+    "gex_fraction_of_transcriptomic_reads_in_cells_mean",
+    "rin",
+    "pmi",
+)
+ADOPTION_RULE = (
+    "holds when no latent component of the candidate's CV-selected analysis reaches |Spearman| >= "
+    "DIAGNOSTIC_CORRELATION_THRESHOLD against any variable of ADOPTION_CHECK_VARIABLES, in both cohorts; "
+    "p-values, rejection statuses and CV AUROC are not read. If it holds, a later change may propose the candidate "
+    "as a revised primary with the current primary kept as the reference; if not, the variants stay sensitivity analyses"
+)
+PREPROCESSING_ADOPTION_TABLE = "adoption_check.csv"
 # Layout under <out_dir>/<variant>/: mirrors results/motco_input and
 # results/motco_analysis so the rank sweep can read a variant with no code change
 PREPROCESSING_INPUT_DIR = "motco_input"
@@ -4823,6 +5342,121 @@ def _check_export_reference(
     return {"dir": d, "manifest": manifest, "files": files}
 
 
+def _variant_needs_technical(spec: dict) -> bool:
+    """Whether a registry entry reads the technical table (gene sets excluded, residualized, or the adoption check)."""
+    export = spec.get("export", {})
+    return bool(export.get("excluded_gene_sets")) or bool(export.get("residualize")) or bool(spec.get("adoption_check"))
+
+
+def _technical_columns_needed(spec: dict) -> list[str]:
+    """The technical-table columns a registry entry needs complete for every cohort donor."""
+    columns: list[str] = []
+    if spec.get("export", {}).get("residualize"):
+        columns += [c for c in RESIDUALIZATION_COVARIATES if not c.startswith("log10_lib_")]
+    if spec.get("adoption_check"):
+        columns += [c for c in ADOPTION_CHECK_VARIABLES if not c.startswith("tmm_") and c not in ("rin", "pmi")]
+    return list(dict.fromkeys(columns))
+
+
+def _check_technical_reference(pseudobulk_dir: str | Path, *, donors: Iterable[str], columns: Iterable[str] = ()) -> dict:
+    """Read the technical table and check it was made from the pseudobulk now on disk and is complete for the donors.
+
+    Parameters
+    ----------
+    pseudobulk_dir:
+        Directory holding ``manifest.json`` (the pseudobulk manifest the export
+        reads), ``donor_technical.csv`` and ``technical_manifest.json``.
+    donors:
+        The cohort's donors; every one needs a row.
+    columns:
+        Technical columns that must be non-missing for every donor (the
+        residualization fractions, the adoption-check QC means).
+
+    Returns
+    -------
+    dict
+        ``table`` (``donor_technical.csv``), ``manifest``
+        (``technical_manifest.json``), ``files`` (both paths and sha256) and
+        ``pseudobulk_manifest_sha256`` (the pseudobulk manifest's sha256 now).
+
+    Raises
+    ------
+    FileNotFoundError
+        The table or its manifest is missing (the message names the file and
+        the ``technical-covariates`` command).
+    ValueError
+        The technical manifest records a pseudobulk manifest sha256 other than
+        the file's now (both named), its gene sets differ from
+        ``TECHNICAL_GENE_SETS``, a donor has no row, or a column is missing
+        for a donor (donor and column named). Nothing is written.
+    """
+    pb = Path(pseudobulk_dir)
+    table_path = pb / TECHNICAL_OUTPUTS["table"]
+    manifest_path = pb / TECHNICAL_OUTPUTS["manifest"]
+    hint = (
+        "run `sead-sexdiff technical-covariates --omic both` on the cluster and sync results/pseudobulk/ "
+        "(scripts/sync_pseudobulk.sh) to produce it"
+    )
+    for p in (table_path, manifest_path):
+        if not p.exists():
+            raise FileNotFoundError(f"{p} is missing; {hint}")
+    manifest = json.loads(manifest_path.read_text())
+    recorded = manifest.get("pseudobulk", {}).get("manifest_sha256")
+    now = _sha256_file(pb / "manifest.json")
+    if recorded != now:
+        raise ValueError(
+            f"{manifest_path} records the pseudobulk manifest sha256 {recorded} but {pb / 'manifest.json'} has sha256 "
+            f"{now}: the technical table was made from a different pseudobulk than the export reads; rerun "
+            "`sead-sexdiff technical-covariates --omic both` on the cluster and sync so both match; nothing was written"
+        )
+    recorded_sets = {
+        s: list(v.get("patterns", [])) if isinstance(v, dict) else list(v)
+        for s, v in (manifest.get("gene_sets") or {}).items()
+    }
+    expected_sets = {s: list(p) for s, p in TECHNICAL_GENE_SETS.items()}
+    if recorded_sets != expected_sets:
+        raise ValueError(
+            f"{manifest_path} records gene sets {recorded_sets} but TECHNICAL_GENE_SETS is {expected_sets}; the "
+            "gene-set exclusion and the technical fractions must use the same sets; rerun `sead-sexdiff "
+            "technical-covariates --omic both` and sync; nothing was written"
+        )
+    table = pd.read_csv(table_path, dtype={"donor_id": str})
+    if "donor_id" not in table.columns:
+        raise ValueError(f"{table_path} lacks a donor_id column")
+    tech = table.set_index("donor_id")
+    donors = list(donors)
+    absent = sorted(set(donors) - set(tech.index))
+    if absent:
+        raise ValueError(f"{table_path} has no row for cohort donor(s) {absent}; {hint}")
+    for col in columns:
+        if col not in tech.columns:
+            raise ValueError(f"{table_path} lacks column {col!r}; {hint}")
+        values = pd.to_numeric(tech.loc[donors, col], errors="coerce").to_numpy(dtype=float)
+        bad = [d for d, v in zip(donors, values) if not np.isfinite(v)]
+        if bad:
+            raise ValueError(
+                f"{table_path}: column {col!r} is missing for cohort donor(s) {bad}; a variant that reads the "
+                "technical table needs every value for every cohort donor (nothing is imputed); nothing was written"
+            )
+    files = {
+        p.name: {"path": str(p), "sha256": _sha256_file(p)} for p in (table_path, manifest_path)
+    }
+    return {"table": table, "manifest": manifest, "files": files, "pseudobulk_manifest_sha256": now}
+
+
+def _variant_settings_record(spec: dict) -> dict:
+    """The registry entry's export settings as the manifests record them (tuples as lists; ``residualize`` as the covariates)."""
+    out = {}
+    for key, val in spec["export"].items():
+        if key == "residualize":
+            out[key] = list(RESIDUALIZATION_COVARIATES) if val else None
+        elif isinstance(val, (list, tuple)):
+            out[key] = list(val)
+        else:
+            out[key] = val
+    return out
+
+
 def _variant_row(record: dict, *, variant: str, cohort: str, directory: str) -> dict:
     """``_sensitivity_row`` with a leading ``variant`` column (``primary`` or the variant name)."""
     row = _sensitivity_row(
@@ -4831,33 +5465,49 @@ def _variant_row(record: dict, *, variant: str, cohort: str, directory: str) -> 
     return {"variant": variant, **row}
 
 
+def _kept_mean_quantiles(export_dir: Path, omic: str) -> dict[str, float]:
+    """Quantiles (``DIAGNOSTIC_QUANTILES``) of the kept features' mean log2-CPM, from the block CSV."""
+    block = pd.read_csv(export_dir / f"{omic}.csv", index_col=0)
+    means = block.mean(axis=0).to_numpy(dtype=float)
+    return {f"q{int(round(q * 100)):02d}": float(np.quantile(means, q)) for q in DIAGNOSTIC_QUANTILES}
+
+
 def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str | Path) -> dict:
     """Compare the feature filtering of the primary and a variant export.
 
     Parameters
     ----------
     primary_export_dir, variant_export_dir:
-        Export directories of one cohort (``features_<omic>.csv`` and
-        ``manifest.json`` are read).
+        Export directories of one cohort (``features_<omic>.csv``,
+        ``manifest.json`` and, for the kept-mean quantiles, ``<omic>.csv``).
 
     Returns
     -------
     dict
         Omic → ``feature_counts`` and ``removed_by_chromosome`` of both exports,
-        ``chrx`` (input count, the variant's status counts, kept count and
-        kept feature names), ``kept`` (both kept counts; shared, primary-only
-        and variant-only) and ``named`` (status of
-        ``PREPROCESSING_NAMED_FEATURES`` in both exports, when present).
+        ``selection_rule`` of both, ``kept`` (both kept counts; shared,
+        primary-only and variant-only) and, when the variant's settings call
+        for them: ``chrx`` and ``named`` (when the excluded chromosomes differ:
+        chrX input count, the variant's status counts, kept chrX count and
+        names, and the status of ``PREPROCESSING_NAMED_FEATURES`` in both
+        exports), ``gene_sets`` (sets excluded: matched, removed and
+        already-on-an-excluded-chromosome counts per set), ``selection``
+        (rules differ: rule and kept-mean quantiles of both exports) and
+        ``residualization`` (covariates, degrees of freedom and R² quantiles).
 
     Raises
     ------
     ValueError
-        The two exports list different input features, or a chrX feature of
-        the variant carries the ``sex_chromosome`` status.
+        The two exports list different input features; a chrX feature of a
+        variant that keeps chrX carries ``sex_chromosome``; the gene-set or
+        residualization records disagree with ``features_<omic>.csv``.
     """
     p, v = Path(primary_export_dir), Path(variant_export_dir)
     pm = json.loads((p / "manifest.json").read_text())
     vm = json.loads((v / "manifest.json").read_text())
+    p_excluded = list(pm.get("thresholds", {}).get("excluded_chromosomes", []))
+    v_excluded = list(vm.get("thresholds", {}).get("excluded_chromosomes", []))
+    chromosomes_differ = p_excluded != v_excluded
     dtypes = {"feature": str, "chromosome": str, "status": str}
     out = {}
     for o in ANALYSIS_BLOCKS:
@@ -4867,35 +5517,15 @@ def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str 
             raise ValueError(f"{p / f'features_{o}.csv'} and {v / f'features_{o}.csv'} list different input features")
         p_kept = set(pf.loc[pf["status"] == "kept", "feature"])
         v_kept = set(vf.loc[vf["status"] == "kept", "feature"])
-        v_chrx = vf[vf["chromosome"] == "chrX"]
-        bad = v_chrx.loc[v_chrx["status"] == "sex_chromosome", "feature"].tolist()
-        if bad:
-            raise ValueError(
-                f"{v / f'features_{o}.csv'}: {len(bad)} chrX feature(s) carry status sex_chromosome "
-                f"(e.g. {bad[0]!r}) although the variant keeps chrX"
-            )
-        kept_chrx = sorted(v_chrx.loc[v_chrx["status"] == "kept", "feature"])
-        named = {}
-        for name in PREPROCESSING_NAMED_FEATURES:
-            rows_p, rows_v = pf[pf["feature"] == name], vf[vf["feature"] == name]
-            if len(rows_p) == 1 and len(rows_v) == 1:
-                named[name] = {
-                    "chromosome": rows_v["chromosome"].iloc[0],
-                    "primary": rows_p["status"].iloc[0],
-                    "variant": rows_v["status"].iloc[0],
-                }
-        out[o] = {
+        p_rule = (pm.get("selection_rule") or {}).get(o, "variance")
+        v_rule = (vm.get("selection_rule") or {}).get(o, "variance")
+        entry = {
             "feature_counts": {"primary": pm["feature_counts"][o], "variant": vm["feature_counts"][o]},
             "removed_by_chromosome": {
                 "primary": pm.get("removed_by_chromosome", {}).get(o),
                 "variant": vm.get("removed_by_chromosome", {}).get(o),
             },
-            "chrx": {
-                "input": int(len(v_chrx)),
-                "status_counts_variant": {s: int(n) for s, n in sorted(v_chrx["status"].value_counts().items())},
-                "kept": len(kept_chrx),
-                "kept_features": kept_chrx,
-            },
+            "selection_rule": {"primary": p_rule, "variant": v_rule},
             "kept": {
                 "primary": len(p_kept),
                 "variant": len(v_kept),
@@ -4903,9 +5533,171 @@ def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str 
                 "primary_only": len(p_kept - v_kept),
                 "variant_only": len(v_kept - p_kept),
             },
-            "named": named,
         }
+        if chromosomes_differ:
+            v_chrx = vf[vf["chromosome"] == "chrX"]
+            if "chrX" not in v_excluded:
+                bad = v_chrx.loc[v_chrx["status"] == "sex_chromosome", "feature"].tolist()
+                if bad:
+                    raise ValueError(
+                        f"{v / f'features_{o}.csv'}: {len(bad)} chrX feature(s) carry status sex_chromosome "
+                        f"(e.g. {bad[0]!r}) although the variant keeps chrX"
+                    )
+            kept_chrx = sorted(v_chrx.loc[v_chrx["status"] == "kept", "feature"])
+            named = {}
+            for name in PREPROCESSING_NAMED_FEATURES:
+                rows_p, rows_v = pf[pf["feature"] == name], vf[vf["feature"] == name]
+                if len(rows_p) == 1 and len(rows_v) == 1:
+                    named[name] = {
+                        "chromosome": rows_v["chromosome"].iloc[0],
+                        "primary": rows_p["status"].iloc[0],
+                        "variant": rows_v["status"].iloc[0],
+                    }
+            entry["chrx"] = {
+                "input": int(len(v_chrx)),
+                "status_counts_variant": {s: int(n) for s, n in sorted(v_chrx["status"].value_counts().items())},
+                "kept": len(kept_chrx),
+                "kept_features": kept_chrx,
+            }
+            entry["named"] = named
+        if vm.get("excluded_gene_sets"):
+            removed = (vm.get("removed_by_gene_set") or {}).get(o, {})
+            n_status = int((vf["status"] == "excluded_gene_set").sum())
+            n_removed = sum(int(info.get("n_removed", 0)) for info in removed.values())
+            if n_status != n_removed:
+                raise ValueError(
+                    f"{v / f'features_{o}.csv'} has {n_status} features with status excluded_gene_set but the manifest "
+                    f"records {n_removed} removed by gene set"
+                )
+            entry["gene_sets"] = {
+                "excluded": list(vm["excluded_gene_sets"]),
+                "removed": {
+                    s: {
+                        "n_matched": int(info.get("n_matched", 0)),
+                        "n_removed": int(info.get("n_removed", 0)),
+                        "n_on_excluded_chromosome": len(info.get("on_excluded_chromosome", [])),
+                    }
+                    for s, info in removed.items()
+                },
+            }
+        if p_rule != v_rule:
+            entry["selection"] = {
+                "primary": {"rule": p_rule, "kept_mean_quantiles": _kept_mean_quantiles(p, o)},
+                "variant": {"rule": v_rule, "kept_mean_quantiles": _kept_mean_quantiles(v, o)},
+            }
+        if vm.get("residualization"):
+            resid = vm["residualization"]
+            if "r_squared" not in vf.columns or vf.loc[vf["status"] == "kept", "r_squared"].isna().any():
+                raise ValueError(f"{v / f'features_{o}.csv'} lacks an R² for a kept feature although the export residualized")
+            entry["residualization"] = {
+                "covariates": list(resid.get("covariates", [])),
+                "degrees_of_freedom": resid.get("degrees_of_freedom"),
+                "design_file": resid.get("design_file"),
+                "design_sha256": resid.get("design_sha256"),
+                "r_squared_quantiles": (resid.get("r_squared_quantiles") or {}).get(o),
+            }
+        out[o] = entry
     return out
+
+
+def _adoption_variables(primary_export_dir: str | Path, technical: pd.DataFrame, donors: list[str]) -> tuple[pd.DataFrame, dict[str, str]]:
+    """``ADOPTION_CHECK_VARIABLES`` per donor: the primary export's TMM factors, its RIN and PMI, the technical table's QC means.
+
+    Raises
+    ------
+    ValueError
+        A variable is absent, or missing for a donor (donor and column named);
+        no cell is skipped.
+    """
+    d = Path(primary_export_dir)
+    manifest = json.loads((d / "manifest.json").read_text())
+    cov = pd.read_csv(d / "covariates.csv", dtype={"donor_id": str, "education_level": str}).set_index("donor_id")
+    tech = technical.set_index("donor_id") if "donor_id" in technical.columns else technical
+    table = pd.DataFrame(index=pd.Index(donors, name="donor_id"))
+    sources: dict[str, str] = {}
+    for name in ADOPTION_CHECK_VARIABLES:
+        if name.startswith("tmm_"):
+            o = name[len("tmm_"):]
+            per_donor = manifest.get("tmm", {}).get(o, {})
+            absent = [x for x in donors if x not in per_donor]
+            if absent:
+                raise ValueError(f"{d / 'manifest.json'} tmm[{o!r}] lacks donor(s) {absent}")
+            values = np.array([float(per_donor[x]["factor"]) for x in donors])
+            sources[name] = "manifest.json (primary export, TMM factor)"
+        elif name in ("rin", "pmi"):
+            if name not in cov.columns:
+                raise ValueError(f"{d / 'covariates.csv'} lacks column {name!r}")
+            values = pd.to_numeric(cov.reindex(donors)[name], errors="coerce").to_numpy(dtype=float)
+            sources[name] = "covariates.csv (primary export)"
+        else:
+            if name not in tech.columns:
+                raise ValueError(f"{TECHNICAL_OUTPUTS['table']} lacks column {name!r} (ADOPTION_CHECK_VARIABLES)")
+            values = pd.to_numeric(tech.reindex(donors)[name], errors="coerce").to_numpy(dtype=float)
+            sources[name] = TECHNICAL_OUTPUTS["table"]
+        bad = [x for x, val in zip(donors, values) if not np.isfinite(val)]
+        if bad:
+            raise ValueError(
+                f"adoption check variable {name!r} is missing for cohort donor(s) {bad}; every check variable is "
+                "needed for every cohort donor (no cell is skipped)"
+            )
+        table[name] = values
+    return table, sources
+
+
+def adoption_check(
+    scores: pd.DataFrame, variables: pd.DataFrame, *, sources: dict[str, str] | None = None, threshold: float | None = None
+) -> pd.DataFrame:
+    """Evaluate ``ADOPTION_RULE`` for one cohort from the candidate's latent scores and the check variables.
+
+    Parameters
+    ----------
+    scores:
+        ``latent_scores.csv`` indexed by ``donor_id`` (columns ``pls_<k>``).
+    variables:
+        ``_adoption_variables`` output, same donors.
+    sources:
+        Variable → source, recorded per row.
+    threshold:
+        ``DIAGNOSTIC_CORRELATION_THRESHOLD`` by default.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per component × variable (``component``, ``variable``,
+        ``source``, ``n``, ``spearman``, ``flag`` = |rho| ≥ threshold, ``holds``
+        empty) and a final row (``component = all``, ``variable = all``) whose
+        ``flag`` is whether any cell is flagged and whose ``holds`` is true
+        only when none is. Reads no p-value, rejection status or CV AUROC.
+
+    Raises
+    ------
+    ValueError
+        The donors differ, or a correlation is undefined (constant values).
+    """
+    if threshold is None:
+        threshold = DIAGNOSTIC_CORRELATION_THRESHOLD
+    sources = sources or {}
+    if sorted(scores.index) != sorted(variables.index):
+        raise ValueError("adoption check: the latent scores and the check variables list different donors")
+    variables = variables.loc[scores.index]
+    comps = sorted([col for col in scores.columns if col.startswith("pls_")], key=_component_order)
+    rows = []
+    for comp in comps:
+        s = scores[comp].to_numpy(dtype=float)
+        for var in variables.columns:
+            rho, n = spearman(s, variables[var].to_numpy(dtype=float))
+            if not np.isfinite(rho):
+                raise ValueError(f"adoption check: the Spearman correlation of {comp} with {var} is undefined (constant values)")
+            rows.append({
+                "component": comp, "variable": var, "source": sources.get(var, ""), "n": n,
+                "spearman": rho, "flag": bool(abs(rho) >= threshold), "holds": "",
+            })
+    any_flag = any(r["flag"] for r in rows)
+    rows.append({
+        "component": "all", "variable": "all", "source": "", "n": int(len(scores)),
+        "spearman": float("nan"), "flag": any_flag, "holds": not any_flag,
+    })
+    return pd.DataFrame(rows, columns=["component", "variable", "source", "n", "spearman", "flag", "holds"])
 
 
 def render_preprocessing_sensitivity(
@@ -4920,6 +5712,7 @@ def render_preprocessing_sensitivity(
     permutations: int = ANALYSIS_PERMUTATIONS,
     alpha: float = ANALYSIS_ALPHA,
     findings: list[str] | None = None,
+    adoption: pd.DataFrame | None = None,
 ) -> str:
     """Render ``sensitivity.md`` from the rows of ``sensitivity.csv`` and the feature accounting.
 
@@ -4930,40 +5723,49 @@ def render_preprocessing_sensitivity(
     features:
         ``_feature_accounting`` output.
     variant, settings, description:
-        The variant's name, the export settings it changes and its description
-        (from ``PREPROCESSING_VARIANTS``).
+        The variant's name, the export settings it changes (as the manifests
+        record them) and its description (from ``PREPROCESSING_VARIANTS``).
     cohort:
         Cohort name for the title.
     seed, permutations, alpha:
         Named in the header; a statistic is rejected when ``p <= alpha``.
     findings:
         The comparison's findings, listed at the end.
+    adoption:
+        ``adoption_check`` output for the registry entry with the adoption
+        check; ``None`` otherwise.
 
     Returns
     -------
     str
-        Markdown: a header naming the variant, its settings, seed,
-        permutations, α and both ranks and the reading rules; one table per
-        statistic (two rows); the feature table per omic and export; a run
-        table (rank selection, CV AUROC, runtime, directory); the findings.
-        Every number comes from the rows and the accounting; the runtimes are
-        the one thing here that is not in ``sensitivity.csv``.
+        Markdown: a header naming the variant, its settings beside the
+        primary's, seed, permutations, α and both ranks and the reading rules;
+        one table per statistic (two rows); the feature table per omic and
+        export and, when the variant calls for them, the chrX, gene-set,
+        selection-rule, residualization and adoption-check blocks; a run table
+        (rank selection, CV AUROC, runtime, directory); the findings. Every
+        number comes from the rows, the accounting and the adoption table; the
+        runtimes are the one thing here that is not in ``sensitivity.csv``.
     """
     primary, var = rows[0], rows[1]
-    changed = ", ".join(f"`{key}` = {list(val) if isinstance(val, (list, tuple)) else val}" for key, val in settings.items())
+    changed = ", ".join(f"`{key}` = {val}" for key, val in settings.items())
+    primary_values = ", ".join(f"`{key}` = {PREPROCESSING_PRIMARY_SETTINGS.get(key)}" for key in settings)
+    has = lambda key: any(key in acc for acc in features.values())  # noqa: E731
     lines = [
         f"# MOTCO preprocessing sensitivity: {cohort}, variant `{variant}`",
         "",
-        f"{description}. Export setting(s) changed: {changed} (primary: `excluded_chromosomes` = "
-        f"{list(EXPORT_EXCLUDED_CHROMOSOMES)}); every other export setting and every analysis setting equal "
-        f"the primary's. The `{primary['variant']}` row is the CV-selected primary analysis at rank "
-        f"{primary['rank']}, which stays the primary result; the `{variant}` row (CV-selected rank "
-        f"{var['rank']}) is read as sensitivity to it, never as its replacement, and no variant is chosen from "
-        f"the results. {permutations} RRPP permutations with seed {seed} in both rows (the same permutation "
-        f"indices); α = {alpha} (rejected when p ≤ α). `angle` and `shape` non-rejections are uninformative in "
-        "both rows; a `delta` rejection is a difference, not specifically of size; a rejection status that "
-        "differs between the rows is preprocessing dependence of the sensitivity analysis, not a result of "
-        "the variant; a CV-selected rank that differs is reported beside `angle`, not read as better or worse.",
+        f"{description}. Export setting(s) changed: {changed} (primary: {primary_values}); every other export "
+        f"setting and every analysis setting equal the primary's. The `{primary['variant']}` row is the CV-selected "
+        f"primary analysis at rank {primary['rank']}, which stays the primary result; the `{variant}` row "
+        f"(CV-selected rank {var['rank']}) is read as sensitivity to it, never as its replacement, and no variant is "
+        f"chosen from the results. {permutations} RRPP permutations with seed {seed} in both rows (the same "
+        f"permutation indices); α = {alpha} (rejected when p ≤ α). `angle` and `shape` non-rejections are "
+        "uninformative in both rows; a `delta` rejection is a difference, not specifically of size; a rejection "
+        "status that differs between the rows is preprocessing dependence of the sensitivity analysis, not a result "
+        "of the variant; a CV-selected rank that differs is reported beside `angle`, not read as better or worse. "
+        "MOTCO's operating characteristics were measured on none of the variant blocks (neither chrX-kept, "
+        "family-excluded, trend- or mean-selected nor residualized), so the variant carries no Type I or power "
+        "claim of its own.",
     ]
     for s in ANALYSIS_STATISTICS:
         lines += [
@@ -4980,28 +5782,35 @@ def render_preprocessing_sensitivity(
                 f"{_fmt(r[f'{s}_p'], '.4g')} | {'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
-    lines += [
-        "",
-        "## Features",
-        "",
-        "Counts after each export step per omic; `kept on chrX` and `kept only here` are per export, "
-        "`kept shared` is the number of kept features common to both exports.",
-        "",
-        "| omic | export | input | after chromosome removal | after abundance | kept (after variance) | "
-        "kept on chrX | kept shared | kept only here |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+
+    show_chrx, show_sets = has("chrx"), has("gene_sets")
+    header = ["omic", "export", "input", "after chromosome removal"]
+    if show_sets:
+        header.append("after gene-set removal")
+    header += ["after abundance", "kept (after selection)"]
+    if show_chrx:
+        header.append("kept on chrX")
+    header += ["kept shared", "kept only here"]
+    align = ["---", "---"] + ["---:"] * (len(header) - 2)
+    note = "Counts after each export step per omic; `kept only here` is per export, `kept shared` is the number of kept features common to both exports"
+    if show_chrx:
+        note += "; `kept on chrX` is per export"
+    lines += ["", "## Features", "", note + ".", "", "| " + " | ".join(header) + " |", "|" + "|".join(align) + "|"]
     for o, acc in features.items():
-        for label, key, chrx, only in (
-            (primary["variant"], "primary", 0, acc["kept"]["primary_only"]),
-            (variant, "variant", acc["chrx"]["kept"], acc["kept"]["variant_only"]),
+        for label, key, only in (
+            (primary["variant"], "primary", acc["kept"]["primary_only"]),
+            (variant, "variant", acc["kept"]["variant_only"]),
         ):
             fc = acc["feature_counts"][key]
-            lines.append(
-                f"| {o} | {label} | {fc['input']} | {fc['after_sex_chromosome']} | {fc['after_abundance']} | "
-                f"{fc['after_variance']} | {chrx} | {acc['kept']['shared']} | {only} |"
-            )
-    named = [(o, name, info) for o, acc in features.items() for name, info in acc["named"].items()]
+            cells = [o, label, str(fc["input"]), str(fc["after_sex_chromosome"])]
+            if show_sets:
+                cells.append(str(fc.get("after_gene_set", fc["after_sex_chromosome"])))
+            cells += [str(fc["after_abundance"]), str(fc["after_variance"])]
+            if show_chrx:
+                cells.append(str(acc["chrx"]["kept"] if key == "variant" else 0))
+            cells += [str(acc["kept"]["shared"]), str(only)]
+            lines.append("| " + " | ".join(cells) + " |")
+    named = [(o, name, info) for o, acc in features.items() for name, info in acc.get("named", {}).items()]
     if named:
         lines.append("")
         for o, name, info in named:
@@ -5009,6 +5818,94 @@ def render_preprocessing_sensitivity(
                 f"- `{name}` ({info['chromosome']}, {o}): status `{info['primary']}` in the "
                 f"{primary['variant']} export, `{info['variant']}` in the {variant} export."
             )
+
+    if show_sets:
+        lines += [
+            "",
+            "## Gene sets removed",
+            "",
+            "RNA genes matched by the excluded sets of `TECHNICAL_GENE_SETS` are removed at step 2 after the chromosome "
+            "removal (status `excluded_gene_set` in `features_rna.csv`); a matched gene on an excluded chromosome keeps "
+            "`sex_chromosome` and is counted under `already on an excluded chromosome`. ATAC names match no set.",
+            "",
+            "| omic | set | matched | removed here | already on an excluded chromosome |",
+            "|---|---|---:|---:|---:|",
+        ]
+        for o, acc in features.items():
+            for s, info in acc.get("gene_sets", {}).get("removed", {}).items():
+                lines.append(f"| {o} | {s} | {info['n_matched']} | {info['n_removed']} | {info['n_on_excluded_chromosome']} |")
+    if has("selection"):
+        lines += [
+            "",
+            "## Selection rule",
+            "",
+            f"`variance`: population variance (ddof 0) of log2-CPM, the primary's rule. `trend_ratio`: variance over a "
+            f"mean–variance trend, the median variance of {TREND_N_BINS} equal-count bins of mean log2-CPM placed at "
+            "each bin's median mean and linearly interpolated (flat beyond the end bins; the bins are in the variant "
+            "export's manifest). `mean`: mean log2-CPM. Ties by name under every rule; the quantiles are of the kept "
+            "features' mean log2-CPM.",
+            "",
+            "| omic | export | rule | kept mean q05 | q25 | q50 | q75 | q95 |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+        for o, acc in features.items():
+            sel = acc.get("selection")
+            if not sel:
+                continue
+            for label, key in ((primary["variant"], "primary"), (variant, "variant")):
+                q = sel[key]["kept_mean_quantiles"]
+                lines.append(
+                    f"| {o} | {label} | {sel[key]['rule']} | " + " | ".join(_fmt(q[k], ".3f") for k in ("q05", "q25", "q50", "q75", "q95")) + " |"
+                )
+    if has("residualization"):
+        resid = next(acc["residualization"] for acc in features.values() if "residualization" in acc)
+        covs = resid["covariates"]
+        exclusions = ", ".join(f"`{name}` ({reason})" for name, reason in RESIDUALIZATION_CELL_STATE_EXCLUSIONS.items()) or "none"
+        lines += [
+            "",
+            "## Residualization",
+            "",
+            f"After log2-CPM and before the selection step, each abundance-passing feature was replaced by its mean plus "
+            f"the residual of its OLS fit on an intercept and {len(covs)} covariates: {', '.join(f'`{c}`' for c in covs)} "
+            f"(`RESIDUALIZATION_COVARIATES`: the export's own log10 library sizes after step 2 and the technical table's "
+            f"gene-set pseudobulk fractions; excluded as cell state under the technical-axis report's rule: {exclusions}). "
+            f"The design (`{resid['design_file']}` beside the variant blocks, sha256 `{str(resid['design_sha256'])[:12]}…`) "
+            "holds no sex, stage or analysis covariate. Limitations: the fit spends "
+            f"{resid['degrees_of_freedom']} degrees of freedom per feature (intercept plus covariates) before the "
+            "permutation null, which does not see them; it removes whatever part of the stage and sex signal the "
+            "covariates carry; the analysis covariates were left unchanged, so the library-size proxies are adjusted "
+            "twice (log10 library sizes here, log10 nuclei counts in the RRPP model); and no Type I check exists for "
+            "the residualized blocks.",
+            "",
+            "| omic | R² q05 | q25 | q50 | q75 | q95 |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for o, acc in features.items():
+            q = acc.get("residualization", {}).get("r_squared_quantiles") or {}
+            if q:
+                lines.append(f"| {o} | " + " | ".join(_fmt(q[k], ".3f") for k in ("q05", "q25", "q50", "q75", "q95")) + " |")
+    if adoption is not None:
+        last = adoption.iloc[-1]
+        holds = bool(last["holds"])
+        body = adoption[adoption["component"] != "all"]
+        flagged = body[body["flag"]]
+        lines += [
+            "",
+            "## Adoption check",
+            "",
+            f"`ADOPTION_RULE`: {ADOPTION_RULE}. Threshold {DIAGNOSTIC_CORRELATION_THRESHOLD} (`DIAGNOSTIC_CORRELATION_THRESHOLD`). "
+            f"In this cohort the rule {'holds' if holds else 'does not hold'}"
+            + ("" if holds else ": flagged " + ", ".join(f"{r['component']} × `{r['variable']}` ({_fmt(r['spearman'], '.2f')})" for _, r in flagged.iterrows()))
+            + ". The rule needs both cohorts; whether the candidate becomes a revised primary is a later change with the "
+            "current primary kept as the reference, and the candidate's statistics above are sensitivity, not the result.",
+            "",
+            "| component | variable | source | n | Spearman | flagged |",
+            "|---|---|---|---:|---:|:---:|",
+        ]
+        for _, r in body.iterrows():
+            lines.append(f"| {r['component']} | `{r['variable']}` | {r['source']} | {r['n']} | {_fmt(r['spearman'], '.3f')} | {'yes' if r['flag'] else 'no'} |")
+        lines.append(f"| all | all | | {last['n']} | | {'yes' if last['flag'] else 'no'} → holds = {'true' if holds else 'false'} |")
+
     lines += [
         "",
         "## Runs",
@@ -5066,13 +5963,17 @@ def run_preprocessing_sensitivity(
         ``run_analysis``, values other than 1 change the permutation draws and
         are recorded as a finding. The reported results use 1.
     force:
-        Replace a cohort's three directories under the variant.
+        Replace a cohort's three directories under the variant. Without it,
+        ``variant = "all"`` skips (with a message) every variant × cohort whose
+        comparison directory already exists, so ``all`` is resumable; an
+        explicitly named variant with existing output is an error, as is a
+        partial tree (export or analysis without the comparison).
 
     Returns
     -------
     dict
         Variant → cohort → ``{"export", "analysis", "comparison", "rows", "table",
-        "manifest", "findings"}``.
+        "manifest", "findings"}`` (skipped variant × cohort pairs are absent).
 
     Raises
     ------
@@ -5090,18 +5991,24 @@ def run_preprocessing_sensitivity(
     Every check (registered variant, existing output, inputs present, primary
     export vs the pseudobulk manifest, covariates manifest, annotation,
     thresholds, ``k``, cells and donor count, primary analysis vs the export
-    hashes, MOTCO version, seed, permutations and CV selection) runs for every
-    requested variant and cohort before anything is written. Per cohort the
-    variant export is one ``_export_cohort`` call with the variant's keyword(s)
-    (the primary pipeline with one setting changed: library sizes, the
-    abundance filter, TMM, log2-CPM and the variance ranking recomputed), its
-    ``metadata.csv`` and ``covariates.csv`` must be byte-identical to the
-    primary's, and the variant analysis is one ``_analyze_cohort`` call with
-    the primary's parameters (CV rank selection, ``ANALYSIS_PERMUTATIONS``,
+    hashes, MOTCO version, seed, permutations and CV selection; for a variant
+    that excludes gene sets, residualizes or runs the adoption check, the
+    technical table vs the pseudobulk manifest, ``TECHNICAL_GENE_SETS`` and
+    completeness for the cohort donors, ``_check_technical_reference``) runs
+    for every requested variant and cohort before anything is written. Per
+    cohort the variant export is one ``_export_cohort`` call with the
+    variant's keyword(s) (the primary pipeline with the registered setting(s)
+    changed: library sizes, the abundance filter, TMM, log2-CPM, the optional
+    residualization and the selection recomputed), its ``metadata.csv`` and
+    ``covariates.csv`` must be byte-identical to the primary's, and the
+    variant analysis is one ``_analyze_cohort`` call with the primary's
+    parameters (CV rank selection, ``ANALYSIS_PERMUTATIONS``,
     ``ANALYSIS_SEED``, so RRPP draws the same permutation indices as the
     primary). The comparison holds the primary row first and the variant row
     second; a rejection status that differs is preprocessing dependence of the
-    sensitivity analysis and the primary analysis stays primary.
+    sensitivity analysis and the primary analysis stays primary. For the
+    registry entry with ``adoption_check`` the comparison also holds
+    ``adoption_check.csv`` (``ADOPTION_RULE`` over ``ADOPTION_CHECK_VARIABLES``).
     """
     import shutil
     from importlib.metadata import PackageNotFoundError, version
@@ -5124,14 +6031,28 @@ def run_preprocessing_sensitivity(
         if c not in EXPORT_COHORTS:
             raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
     subdirs = (PREPROCESSING_INPUT_DIR, PREPROCESSING_ANALYSIS_DIR, PREPROCESSING_COMPARISON_DIR)
+    skipped: list[tuple[str, str]] = []
     for v in variants:
         for c in cohorts:
-            for sub in subdirs:
-                if (out_dir / v / sub / c).exists() and not force:
-                    raise FileExistsError(
-                        f"{out_dir / v / sub / c} exists; rerun with --force to replace the variant's export, "
-                        f"analysis and comparison of {c}"
-                    )
+            existing = [sub for sub in subdirs if (out_dir / v / sub / c).exists()]
+            if not existing or force:
+                continue
+            if variant == "all" and PREPROCESSING_COMPARISON_DIR in existing:
+                skipped.append((v, c))
+                continue
+            raise FileExistsError(
+                f"{out_dir / v / existing[0] / c} exists; rerun with --force to replace the variant's export, "
+                f"analysis and comparison of {c}"
+            )
+    todo = {v: [c for c in cohorts if (v, c) not in skipped] for v in variants}
+    for v, c in skipped:
+        print(f"[{log}] {v} {c}: comparison directory {out_dir / v / PREPROCESSING_COMPARISON_DIR / c} exists; "
+              "skipped (rerun with --force to replace it)")
+    variants = [v for v in variants if todo[v]]
+    if not variants:
+        print(f"[{log}] Nothing to run: every requested variant and cohort is complete under {out_dir}")
+        return {}
+    cohorts = [c for c in cohorts if any(c in todo[v] for v in variants)]
     check_export_inputs(pb, cohorts)
     for c in cohorts:
         if not (input_dir / c).is_dir():
@@ -5152,7 +6073,8 @@ def run_preprocessing_sensitivity(
 
     inputs = _load_export_inputs(pb, data_root, log_prefix=log)
     annotation = inputs["annotation"]
-    # Check every cohort's primary export and analysis before writing anything
+    # Check every cohort's primary export and analysis (and, when a requested
+    # variant reads it, the technical table) before writing anything
     prepared = {}
     for c in cohorts:
         sub = _cohort_rows(inputs["table"], inputs["covariates"], c, pb)
@@ -5166,7 +6088,21 @@ def run_preprocessing_sensitivity(
             f"covariates, annotation and thresholds match) and primary analysis {reference['dir']} "
             f"(CV-selected rank {ref_rank}; hashes and settings match)"
         )
-        prepared[c] = {"sub": sub, "k": k, "cells": cells, "export": ref_export, "analysis": reference}
+        needing = [v for v in variants if c in todo[v] and _variant_needs_technical(PREPROCESSING_VARIANTS[v])]
+        technical = None
+        if needing:
+            columns = list(dict.fromkeys(
+                col for v in needing for col in _technical_columns_needed(PREPROCESSING_VARIANTS[v])
+            ))
+            technical = _check_technical_reference(pb, donors=sub["donor_id"].tolist(), columns=columns)
+            print(
+                f"[{log}] {c}: technical table {pb / TECHNICAL_OUTPUTS['table']} matches the pseudobulk manifest and "
+                f"TECHNICAL_GENE_SETS and is complete for {len(sub)} donors × {len(columns)} column(s) "
+                f"(needed by {', '.join(needing)})"
+            )
+        prepared[c] = {
+            "sub": sub, "k": k, "cells": cells, "export": ref_export, "analysis": reference, "technical": technical,
+        }
 
     software = _software_versions()
     software["motco"] = motco_version
@@ -5179,13 +6115,15 @@ def run_preprocessing_sensitivity(
     for v in variants:
         spec = PREPROCESSING_VARIANTS[v]
         v_root = out_dir / v
-        settings = {"excluded_chromosomes": EXPORT_EXCLUDED_CHROMOSOMES, **spec["export"]}
-        recorded_settings = {
-            key: list(val) if isinstance(val, (list, tuple)) else val for key, val in spec["export"].items()
-        }
-        for c in cohorts:
+        recorded_settings = _variant_settings_record(spec)
+        for c in todo[v]:
             prep = prepared[c]
             primary_export, primary_analysis = prep["export"], prep["analysis"]
+            settings = {"excluded_chromosomes": EXPORT_EXCLUDED_CHROMOSOMES, **spec["export"]}
+            if settings.get("residualize"):
+                settings["residualize"] = prep["technical"]["table"]
+            else:
+                settings.pop("residualize", None)
             for sub in subdirs:  # with force, all three are replaced before the first is rewritten
                 if (v_root / sub / c).exists():
                     shutil.rmtree(v_root / sub / c)
@@ -5229,12 +6167,44 @@ def run_preprocessing_sensitivity(
                 )
             features = _feature_accounting(primary_export["dir"], exp["dir"])
             for o, acc in features.items():
+                extra = ""
+                if "chrx" in acc:
+                    extra += f"; {acc['chrx']['kept']} of {acc['chrx']['input']} chrX features kept by {v}"
+                if "gene_sets" in acc:
+                    extra += "; removed by gene set " + ", ".join(f"{s} {i['n_removed']}" for s, i in acc["gene_sets"]["removed"].items())
+                if "selection" in acc:
+                    extra += (f"; rule {acc['selection']['variant']['rule']} (median kept mean "
+                              f"{acc['selection']['variant']['kept_mean_quantiles']['q50']:.3f} vs "
+                              f"{acc['selection']['primary']['kept_mean_quantiles']['q50']:.3f})")
+                if "residualization" in acc and acc["residualization"].get("r_squared_quantiles"):
+                    extra += f"; median R² {acc['residualization']['r_squared_quantiles']['q50']:.3f}"
                 print(
                     f"[{log}] {c} {o}: kept {acc['kept']['shared']} shared, {acc['kept']['primary_only']} primary-only, "
-                    f"{acc['kept']['variant_only']} {v}-only; {acc['chrx']['kept']} of {acc['chrx']['input']} chrX "
-                    f"features kept by {v}"
+                    f"{acc['kept']['variant_only']} {v}-only{extra}"
                 )
+            adoption = None
+            if spec.get("adoption_check"):
+                scores = pd.read_csv(ana["dir"] / "latent_scores.csv", dtype={"donor_id": str}).set_index("donor_id")
+                variables, sources = _adoption_variables(primary_export["dir"], prep["technical"]["table"], scores.index.tolist())
+                adoption = adoption_check(scores, variables, sources=sources)
+                adoption_holds = bool(adoption.iloc[-1]["holds"])
+                flagged = adoption[(adoption["component"] != "all") & adoption["flag"]]
+                print(f"[{log}] {c}: adoption check {'holds' if adoption_holds else 'does not hold'} "
+                      f"({len(flagged)} of {len(adoption) - 1} cells at |rho| >= {DIAGNOSTIC_CORRELATION_THRESHOLD})")
             findings: list[str] = []
+            if adoption is not None:
+                if adoption_holds:
+                    findings.append(
+                        f"adoption check holds in {c}: no candidate component reaches |Spearman| >= "
+                        f"{DIAGNOSTIC_CORRELATION_THRESHOLD} against any of {len(ADOPTION_CHECK_VARIABLES)} check variables "
+                        "(the rule needs both cohorts; a revised primary is a later change)"
+                    )
+                else:
+                    findings.append(
+                        f"adoption check does not hold in {c}: " + ", ".join(
+                            f"{r['component']} x {r['variable']} ({_fmt(r['spearman'], '.2f')})" for _, r in flagged.iterrows()
+                        ) + "; the variants stay sensitivity analyses"
+                    )
             ref_rank, var_rank = ref_record["latent"]["selected_lv"], var_record["latent"]["selected_lv"]
             if ref_rank != var_rank:
                 findings.append(
@@ -5264,17 +6234,24 @@ def run_preprocessing_sensitivity(
             tmp.mkdir(parents=True)
             table = pd.DataFrame(rows).drop(columns=list(_RANK_SENSITIVITY_CSV_EXCLUDED))
             table.to_csv(tmp / PREPROCESSING_SENSITIVITY_TABLE, index=False, float_format=_csv_float)
+            if adoption is not None:
+                adoption.to_csv(tmp / PREPROCESSING_ADOPTION_TABLE, index=False, float_format=_csv_float)
             (tmp / PREPROCESSING_SENSITIVITY_MARKDOWN).write_text(
                 render_preprocessing_sensitivity(
                     rows, features, variant=v, cohort=c, settings=recorded_settings,
                     description=spec["description"], seed=ANALYSIS_SEED, permutations=ANALYSIS_PERMUTATIONS,
-                    alpha=ANALYSIS_ALPHA, findings=findings,
+                    alpha=ANALYSIS_ALPHA, findings=findings, adoption=adoption,
                 )
             )
             variant_files = {
                 name: {"path": str(exp["dir"] / name), "sha256": _sha256_file(exp["dir"] / name)}
                 for name in _ANALYSIS_INPUTS
             }
+            if (exp["dir"] / RESIDUALIZATION_FILE).exists():
+                variant_files[RESIDUALIZATION_FILE] = {
+                    "path": str(exp["dir"] / RESIDUALIZATION_FILE), "sha256": _sha256_file(exp["dir"] / RESIDUALIZATION_FILE),
+                    "note": "the residualization design; not an analysis input (load_analysis_inputs reads the five files above)",
+                }
             variant_analysis_files = {
                 name: {"path": str(ana["dir"] / name), "sha256": _sha256_file(ana["dir"] / name)}
                 for name in _REFERENCE_FILES
@@ -5297,6 +6274,11 @@ def run_preprocessing_sensitivity(
                 "inputs": {
                     **inputs["pb_info"],
                     "annotation": {key: annotation.get(key) for key in ("release", "file", "sha256")},
+                    "technical": None if prep["technical"] is None or not _variant_needs_technical(spec) else {
+                        **prep["technical"]["files"],
+                        "pseudobulk_manifest_sha256": prep["technical"]["pseudobulk_manifest_sha256"],
+                        "note": "checked against manifest.json and TECHNICAL_GENE_SETS, complete for the cohort donors",
+                    },
                 },
                 "primary": {
                     "export": {
@@ -5329,6 +6311,14 @@ def run_preprocessing_sensitivity(
                         "files": variant_files,
                         "manifest_sha256": variant_files["manifest.json"]["sha256"],
                         "thresholds": exp["manifest"]["thresholds"],
+                        "excluded_gene_sets": exp["manifest"].get("excluded_gene_sets"),
+                        "selection_rule": {
+                            o: rule for o, rule in (exp["manifest"].get("selection_rule") or {}).items() if o in ANALYSIS_BLOCKS
+                        },
+                        "residualization": None if not exp["manifest"].get("residualization") else {
+                            key: exp["manifest"]["residualization"].get(key)
+                            for key in ("covariates", "cell_state_exclusions", "design_file", "design_sha256", "degrees_of_freedom", "r_squared_quantiles")
+                        },
                         "feature_counts": exp["manifest"]["feature_counts"],
                         "findings": exp["findings"],
                     },
@@ -5343,10 +6333,26 @@ def run_preprocessing_sensitivity(
                     },
                 },
                 "features": features,
+                "adoption_check": None if adoption is None else {
+                    "rule": ADOPTION_RULE,
+                    "threshold": DIAGNOSTIC_CORRELATION_THRESHOLD,
+                    "variables": [{"name": name, "source": sources[name]} for name in ADOPTION_CHECK_VARIABLES],
+                    "components": sorted({r for r in adoption["component"] if r != "all"}, key=_component_order),
+                    "holds": adoption_holds,
+                    "n_flagged": int(len(flagged)),
+                    "flagged": [
+                        {"component": r["component"], "variable": r["variable"], "spearman": float(r["spearman"])}
+                        for _, r in flagged.iterrows()
+                    ],
+                    "file": PREPROCESSING_ADOPTION_TABLE,
+                    "sha256": _sha256_file(tmp / PREPROCESSING_ADOPTION_TABLE),
+                    "reads": "latent_scores.csv of the candidate analysis, the primary export's manifest (tmm) and "
+                             "covariates.csv (rin, pmi), donor_technical.csv; no p-value, rejection status or CV AUROC",
+                },
                 "outputs": sorted([
                     PREPROCESSING_SENSITIVITY_TABLE, PREPROCESSING_SENSITIVITY_MARKDOWN,
                     PREPROCESSING_SENSITIVITY_MANIFEST,
-                ]),
+                ] + ([PREPROCESSING_ADOPTION_TABLE] if adoption is not None else [])),
                 "software": software,
                 "git": _git_revision(),
                 "findings": findings,
@@ -5361,7 +6367,7 @@ def run_preprocessing_sensitivity(
                 print(f"[{log}] FINDING: {v} {c}: {msg}")
             results[v][c] = {
                 "export": exp, "analysis": ana, "comparison": final, "rows": rows, "table": table,
-                "manifest": manifest, "findings": findings,
+                "manifest": manifest, "findings": findings, "adoption": adoption,
             }
     return results
 
@@ -6374,6 +7380,12 @@ __all__ = [
     "render_rank_sensitivity",
     "run_rank_sensitivity",
     "PREPROCESSING_VARIANTS",
+    "RESIDUALIZATION_COVARIATES",
+    "ADOPTION_CHECK_VARIABLES",
+    "ADOPTION_RULE",
+    "trend_ratio",
+    "residualize_values",
+    "adoption_check",
     "render_preprocessing_sensitivity",
     "run_preprocessing_sensitivity",
     "TECHNICAL_GENE_SETS",

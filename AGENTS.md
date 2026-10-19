@@ -73,20 +73,31 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
    (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
-8. `preprocessing-sensitivity` – from `results/pseudobulk/`, the annotation,
+8. `preprocessing-sensitivity` – from `results/pseudobulk/` (incl.
+   `donor_technical.csv` + `technical_manifest.json` for the gene-set,
+   residualized and candidate variants), the annotation,
    `results/motco_input/` and `results/motco_analysis/`, per variant of the
-   registry `PREPROCESSING_VARIANTS` (now `keep_chrx`) and per cohort: the
-   export rerun with the variant's one setting changed (`_export_cohort`,
-   shared with `export`) and the analysis rerun unchanged on the variant
-   blocks (`_analyze_cohort` with the `analyze` parameters), compared with
-   the primary analysis. The primary export and analysis are read and
-   checked (pseudobulk, covariates and annotation hashes, thresholds, `k`,
-   cells; export hashes, MOTCO version, seed, permutations, CV selection),
-   never rerun or modified. Writes `results/motco_sensitivity/<variant>/`
-   (`motco_input/<cohort>/`, `motco_analysis/<cohort>/`, mirroring the primary
-   layout so `rank-sensitivity` can read a variant, and
-   `comparison/<cohort>/` with `sensitivity.csv`, `sensitivity.md`,
-   `sensitivity_manifest.json`).
+   registry `PREPROCESSING_VARIANTS` (`keep_chrx`, `exclude_families`,
+   `rna_trend_ratio`, `atac_mean_accessibility`, `residualized`,
+   `revised_candidate`) and per cohort: the export rerun with the variant's
+   registered setting(s) changed (`_export_cohort`, shared with `export`:
+   `excluded_chromosomes`, `excluded_gene_sets`, `selection_rule` per omic,
+   `residualize`) and the analysis rerun unchanged on the variant blocks
+   (`_analyze_cohort` with the `analyze` parameters), compared with the
+   primary analysis. The primary export and analysis are read and checked
+   (pseudobulk, covariates and annotation hashes, thresholds, `k`, cells;
+   export hashes, MOTCO version, seed, permutations, CV selection; the
+   technical table against the pseudobulk manifest, `TECHNICAL_GENE_SETS`
+   and completeness for the cohort donors), never rerun or modified. For
+   `revised_candidate` the predeclared `ADOPTION_RULE` is evaluated from the
+   generated files into `adoption_check.csv` (no p-value read). Writes
+   `results/motco_sensitivity/<variant>/` (`motco_input/<cohort>/` plus
+   `residualization.csv` when residualizing, `motco_analysis/<cohort>/`,
+   mirroring the primary layout so `rank-sensitivity` and `axis-diagnostics`
+   can read a variant, and `comparison/<cohort>/` with `sensitivity.csv`,
+   `sensitivity.md`, `sensitivity_manifest.json` and, for the candidate,
+   `adoption_check.csv`). `--variant all` skips complete variant × cohort
+   pairs without `--force` (resumable).
 9. `axis-diagnostics` – from `results/motco_input/`, `results/motco_analysis/`,
    `results/pseudobulk/donor_technical.csv` and, when present,
    `results/motco_rank_sensitivity/<cohort>/rank_*/` only (any workstation),
@@ -245,19 +256,58 @@ when behavior or defaults change.
   them): `PREPROCESSING_VARIANTS`, a registry keyed by variant name with a
   `description` and the `_export_cohort` keyword(s) it changes (`keep_chrx`:
   `excluded_chromosomes = ("chrY", "chrM")`, so chrX is kept and the whole
-  export pipeline is recomputed with it present; never a flag, never chosen
-  from results, entries only added by a change proposal), the rule that a
-  variant reruns the whole export at the primary's thresholds and N and the
-  analysis at the primary's settings (same `ANALYSIS_SEED` and
-  `ANALYSIS_PERMUTATIONS`, CV rank selection), the output names
+  export pipeline is recomputed with it present; `exclude_families`:
+  `excluded_gene_sets = ("ribosomal", "mitochondrial", "hemoglobin")` of
+  `TECHNICAL_GENE_SETS`, removed at step 2 after the chromosome removal with
+  status `excluded_gene_set`, RNA only; `rna_trend_ratio`: `selection_rule =
+  {rna: trend_ratio, atac: variance}`; `atac_mean_accessibility`:
+  `selection_rule = {rna: variance, atac: mean}`; `residualized`:
+  `residualize = True`, the technical table substituted at run time;
+  `revised_candidate`: the four together, with `adoption_check: True`; never
+  a flag, never chosen from results, entries only added by a change
+  proposal), `SELECTION_RULES` and `TREND_N_BINS` (20 equal-count bins of
+  mean log2-CPM via `np.array_split`, median variance at the median mean,
+  `np.interp` flat beyond the end bins, ratio = variance / trend, ties by
+  name; dropped status `selection` under a non-variance rule, `variance`
+  under the primary's), the residualization position (after log2-CPM, before
+  the selection; exported value = mean + residual; `np.linalg.lstsq` once
+  for all features; R² per feature) and set (`RESIDUALIZATION_COVARIATES` =
+  the export's own `log10_lib_<omic>` after step 2 plus
+  `RESIDUALIZATION_CANDIDATE_FRACTIONS` minus
+  `RESIDUALIZATION_CELL_STATE_EXCLUSIONS`, now `hemoglobin_pseudobulk` with
+  the technical-axis report's section 2 as the reason; sex, stage and the
+  analysis covariates never enter; the design written as `residualization.csv`,
+  `RESIDUALIZATION_FILE`, never an analysis input), the rule that the variant
+  analysis keeps the six analysis covariates (double adjustment of the
+  library-size proxies accepted and stated), `ADOPTION_CHECK_VARIABLES` (the
+  primary export's TMM factors, four technical QC means, RIN, PMI: technical
+  variables that are no regressor) and `ADOPTION_RULE` (holds when no
+  candidate component reaches `|Spearman| ≥ DIAGNOSTIC_CORRELATION_THRESHOLD`
+  against any check variable in both cohorts; p-values, rejections and CV
+  AUROC never read; a missing variable is an error, not a skipped cell;
+  written to `PREPROCESSING_ADOPTION_TABLE` for the candidate only), the rule
+  that a variant reruns the whole export at the primary's thresholds and N
+  and the analysis at the primary's settings (same `ANALYSIS_SEED` and
+  `ANALYSIS_PERMUTATIONS`, CV rank selection), the technical reference check
+  (`_check_technical_reference`: pseudobulk manifest hash, gene sets,
+  completeness; only for variants that read the table), the output names
   (`PREPROCESSING_*`), `n_jobs = 1` for reported results, and the rule that
-  the primary analysis stays primary. The variant is read as sensitivity
+  the primary analysis stays primary. Every variant is read as sensitivity
   only: a rejection status that differs between the variant and the primary
   is preprocessing dependence (not a result of the variant), a CV-selected
   rank that differs is reported beside `angle` (not better or worse), the
-  non-rejection rules hold in the variant, and with chrX kept X-dosage
-  features enter the blocks that MOTCO's operating characteristics never
-  covered, so the variant carries no Type I or power claim of its own.
+  non-rejection rules hold in every variant, MOTCO's operating
+  characteristics were measured on none of the variant blocks (chrX-kept,
+  family-excluded, trend- or mean-selected, residualized), so no variant
+  carries a Type I or power claim of its own, and the residualized variants
+  carry the stated limitations (degrees of freedom spent before the
+  permutation null, stage and sex signal carried by the technical set
+  removed, library-size proxies adjusted twice). If the adoption check holds
+  in both cohorts a later change may propose the candidate as a revised
+  primary with the current primary kept as the reference; otherwise the
+  variants stay sensitivity analyses. The first latent axis's technical
+  correlations per variant (`axis-diagnostics` on a variant root) may be
+  attributed to each single setting as a measurement-space finding only.
 - Axis-diagnostic constants (flag and ask before changing any of them):
   `DIAGNOSTIC_VARIABLES` (the variable sources; resolved at run time and
   recorded with sources, never chosen or extended from results),
