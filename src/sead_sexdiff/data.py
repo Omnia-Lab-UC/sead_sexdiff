@@ -2662,6 +2662,504 @@ def _write_debug(debug_dir: Path, cohort: str, omic: str, donors: np.ndarray, re
         f"{stem}_logcpm.csv", float_format="%.17g"
     )
 
+
+# ---------------------------------------------------------------------------
+# MOTCO trajectory analysis (covariate-adjusted, per cohort)
+# ---------------------------------------------------------------------------
+
+ANALYSIS_BLOCKS = ("rna", "atac")
+# Entered additively, in this order
+ANALYSIS_COVARIATES = (
+    "age_at_death", "pmi", "rin", "years_education", "log10_n_rna", "log10_n_atac",
+)
+# Derived column → exported column it is the base-10 logarithm of
+ANALYSIS_LOG10_COLUMNS: dict[str, str] = {"log10_n_rna": "n_rna", "log10_n_atac": "n_atac"}
+# Exported covariate columns that do not enter the model, with the reason
+ANALYSIS_EXCLUDED_COVARIATES: dict[str, str] = {
+    "education_level": "not entered by decision: categorical, it would spend one design column per level",
+    "age_capped": "constant in this release (no capped ages); MOTCO rejects a constant covariate",
+}
+ANALYSIS_MISSING_COVARIATES = "error"
+ANALYSIS_PERMUTATIONS = 999
+ANALYSIS_SEED = 20261019
+ANALYSIS_ALPHA = 0.05
+# As in MOTCO's covariate Type I check; exact size alpha for (1 + b) / (1 + B) p-values
+ANALYSIS_REJECTION_RULE = "p <= alpha"
+ANALYSIS_MOTCO_MIN_VERSION = "0.8.0"
+ANALYSIS_STATISTICS = ("delta", "angle", "shape")
+
+_ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "manifest.json")
+_ANALYSIS_DESIGN_COLUMNS = ("donor_id", "sex", "stage", "stage_label")
+
+
+def check_motco_version() -> str:
+    """Return the installed MOTCO version; raise if it is older than the minimum.
+
+    Raises
+    ------
+    RuntimeError
+        The installed MOTCO is older than ``ANALYSIS_MOTCO_MIN_VERSION``.
+    """
+    import motco
+
+    installed = str(motco.__version__)
+    required = ANALYSIS_MOTCO_MIN_VERSION
+    try:
+        from packaging.version import Version
+
+        too_old = Version(installed) < Version(required)
+    except ImportError:
+        def key(v: str) -> tuple[int, ...]:
+            return tuple(int(p) for p in re.findall(r"\d+", v)[:3])
+
+        too_old = key(installed) < key(required)
+    if too_old:
+        raise RuntimeError(
+            f"MOTCO {installed} is installed but the analysis needs MOTCO >= {required} "
+            "(covariate-adjusted analyze_trajectories); run `uv sync --locked`"
+        )
+    return installed
+
+
+def load_analysis_inputs(cohort_dir: str | Path) -> dict:
+    """Read one cohort's export, cross-check it and build the model's metadata table.
+
+    Parameters
+    ----------
+    cohort_dir:
+        ``<export root>/<cohort>/`` as written by ``run_export``.
+
+    Returns
+    -------
+    dict
+        ``blocks`` (omic → donors × features DataFrame, read as ``motco analyze``
+        reads ``--block`` files), ``metadata`` (design columns plus
+        ``ANALYSIS_COVARIATES``, one row per donor sorted by ``donor_id``),
+        ``export_manifest`` and ``inputs`` (file → path and sha256).
+
+    Raises
+    ------
+    FileNotFoundError
+        The cohort directory or one of its five files is missing.
+    ValueError
+        The tables list different donors or disagree with the export manifest.
+
+    Notes
+    -----
+    Missing covariate values are passed through: MOTCO's
+    ``missing_covariates="error"`` rejects them, naming the column and donors.
+    """
+    d = Path(cohort_dir)
+    if not d.is_dir():
+        raise FileNotFoundError(f"{d} does not exist; run `sead-sexdiff export` to produce it")
+    for name in _ANALYSIS_INPUTS:
+        if not (d / name).exists():
+            raise FileNotFoundError(f"{d / name} is missing; run `sead-sexdiff export` to produce it")
+    inputs = {name: {"path": str(d / name), "sha256": _sha256_file(d / name)} for name in _ANALYSIS_INPUTS}
+    manifest = json.loads((d / "manifest.json").read_text())
+    meta = pd.read_csv(d / "metadata.csv", dtype={"donor_id": str, "sex": str, "stage": str})
+    cov = pd.read_csv(d / "covariates.csv", dtype={"donor_id": str, "education_level": str})
+    blocks = {}
+    for o in ANALYSIS_BLOCKS:
+        values = pd.read_csv(d / f"{o}.csv", index_col=0)
+        values.index = values.index.astype(str)
+        blocks[o] = values
+
+    tables = {
+        "metadata.csv": meta["donor_id"].tolist(),
+        "covariates.csv": cov["donor_id"].tolist(),
+        **{f"{o}.csv": b.index.tolist() for o, b in blocks.items()},
+    }
+    for name, ids in tables.items():
+        repeated = sorted({i for i in ids if ids.count(i) > 1})
+        if repeated:
+            raise ValueError(f"{d / name}: repeated donor_id(s) {repeated}")
+    reference = set(tables["metadata.csv"])
+    for name, ids in tables.items():
+        if set(ids) != reference:
+            raise ValueError(
+                f"{d / 'metadata.csv'} and {d / name} list different donors "
+                f"(only in metadata.csv: {sorted(reference - set(ids))}; "
+                f"only in {name}: {sorted(set(ids) - reference)})"
+            )
+    donors = sorted(reference)
+    for o, b in blocks.items():
+        # analysis_metadata.csv is sorted by donor_id and `motco analyze` needs the
+        # block rows in metadata order, so the blocks must already be sorted
+        if b.index.tolist() != donors:
+            raise ValueError(f"{d / f'{o}.csv'}: rows are not sorted by donor_id (as `export` writes them)")
+    if manifest.get("n_donors") != len(donors):
+        raise ValueError(
+            f"{d / 'manifest.json'} records n_donors = {manifest.get('n_donors')} "
+            f"but {d / 'metadata.csv'} lists {len(donors)} donors"
+        )
+    for o, b in blocks.items():
+        n = manifest.get("blocks", {}).get(o, {}).get("n_features")
+        if n != b.shape[1]:
+            raise ValueError(
+                f"{d / 'manifest.json'} records n_features = {n} for {o} but {d / f'{o}.csv'} has {b.shape[1]}"
+            )
+
+    needed = [c for c in ANALYSIS_COVARIATES if c not in ANALYSIS_LOG10_COLUMNS]
+    needed += list(ANALYSIS_LOG10_COLUMNS.values())
+    absent = [c for c in needed if c not in cov.columns]
+    if absent:
+        raise ValueError(f"{d / 'covariates.csv'} lacks column(s) {absent}")
+    absent = [c for c in _ANALYSIS_DESIGN_COLUMNS if c not in meta.columns]
+    if absent:
+        raise ValueError(f"{d / 'metadata.csv'} lacks column(s) {absent}")
+    merged = meta.merge(cov, on="donor_id", how="inner", validate="one_to_one")
+    for derived, source in ANALYSIS_LOG10_COLUMNS.items():
+        counts = merged[source].astype(float)
+        bad = merged.loc[counts <= 0, "donor_id"]
+        if len(bad):
+            raise ValueError(f"{d / 'covariates.csv'}: {source} must be positive for log10; donor(s) {sorted(bad)}")
+        merged[derived] = np.log10(counts)
+    merged = merged[list(_ANALYSIS_DESIGN_COLUMNS) + list(ANALYSIS_COVARIATES)]
+    merged = merged.sort_values("donor_id").reset_index(drop=True)
+    return {"blocks": blocks, "metadata": merged, "export_manifest": manifest, "inputs": inputs}
+
+
+def _fmt(value, spec: str = ".6g") -> str:
+    return "n/a" if value is None else format(value, spec)
+
+
+def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA) -> str:
+    """Render ``summary.md`` from a MOTCO analysis record (``result.json``).
+
+    Parameters
+    ----------
+    record:
+        The parsed ``result.json``.
+    cohort:
+        Cohort name for the title.
+    alpha:
+        Significance level; a statistic is rejected when ``p <= alpha``.
+
+    Returns
+    -------
+    str
+        Markdown: statistics (observed, RRPP p, null mean/sd/q95, CV-selected
+        rank in the ``angle`` row), cell sizes, latent block and covariate block.
+    """
+    design = record["design"]
+    meas = record["measurement"]
+    latent = record["latent"]
+    stages = design["stage_levels"]
+    lines = [
+        f"# MOTCO trajectory analysis: {cohort}",
+        "",
+        f"MOTCO {record['software']['motco']}; n = {design['n_samples']}; groups "
+        f"{' vs '.join(design['group_levels'])}; stages {' → '.join(stages)}; orientation "
+        f"`{meas['orientation_estimator']}`; {meas['permutations']} RRPP permutations, seed {meas['seed']}; "
+        f"α = {alpha} (rejected when p ≤ α).",
+        "",
+        "## Statistics",
+        "",
+        "| statistic | observed | p (RRPP) | rejected | null mean | null sd | null q95 | note |",
+        "|---|---:|---:|:---:|---:|---:|---:|---|",
+    ]
+    for s in ANALYSIS_STATISTICS:
+        p = record["p_values"].get(s)
+        null = record["null_summary"].get(s, {})
+        rejected = "n/a" if p is None else ("yes" if p <= alpha else "no")
+        note = ""
+        if s == "angle":
+            note = f"degrees; CV-selected rank {latent['selected_lv']}"
+            if latent["selected_lv"] == 1:
+                note += " (at rank 1 the angle is 0° or 180° by construction)"
+        lines.append(
+            f"| {s} | {_fmt(record['statistics'].get(s))} | {_fmt(p, '.4g')} | {rejected} | "
+            f"{_fmt(null.get('mean'))} | {_fmt(null.get('sd'))} | {_fmt(null.get('q95'))} | {note} |"
+        )
+    lines += [
+        "",
+        "## Cell sizes",
+        "",
+        "| group | " + " | ".join(f"stage {s}" for s in stages) + " | total |",
+        "|---|" + "---:|" * (len(stages) + 1),
+    ]
+    for g in design["group_levels"]:
+        cells = design["cell_sizes"][g]
+        lines.append(f"| {g} | " + " | ".join(str(cells[s]) for s in stages) + f" | {sum(cells.values())} |")
+    cv = latent.get("integration_params", {})
+    lines += [
+        "",
+        "## Latent space",
+        "",
+        f"- PLS-DA rank: {latent['selected_lv']} (`{latent['component_selection']}`)",
+        f"- cv_mean_auroc: {_fmt(latent.get('cv_mean_auroc'), '.4f')}",
+        f"- CV: cv2_splits {cv.get('cv2_splits')}, cv1_splits {cv.get('cv1_splits')}, n_repeats "
+        f"{cv.get('n_repeats')} ({latent.get('cv_repeats_completed')} completed), max_components "
+        f"{cv.get('max_components')}, random_state {cv.get('random_state')}",
+        "- blocks: " + ", ".join(
+            f"{b['name']} ({b['n_features']} features, {b['transform']})" for b in record["blocks"]
+        ),
+    ]
+    cov = record.get("covariates")
+    lines += ["", "## Covariates", ""]
+    if cov is None:
+        lines.append("None entered.")
+    else:
+        dropped = cov["dropped_sample_ids"]
+        lines += [
+            "- entered (in order): " + ", ".join(f"`{c}` ({cov['kinds'][c]})" for c in cov["columns"]),
+            f"- design columns: {len(cov['design_columns'])} (" + ", ".join(cov["design_columns"]) + ")",
+            f"- missing policy: `{cov['missing_policy']}`; dropped donors: {cov['n_dropped']}"
+            + (f" ({', '.join(dropped)})" if dropped else ""),
+            f"- LS-means evaluated at the reference row (`{cov['lsmean_reference']}`):",
+            "",
+            "| design column | reference value |",
+            "|---|---:|",
+        ]
+        lines += [f"| {c} | {_fmt(v)} |" for c, v in cov["reference_row"].items()]
+    return "\n".join(lines) + "\n"
+
+
+def _cli_equivalent(cohort_dir: Path, metadata_path: Path, params, n_jobs: int) -> dict:
+    """The ``motco analyze`` command that reproduces ``run_analysis`` for one cohort."""
+    import shlex
+
+    argv = ["motco", "analyze"]
+    for o in ANALYSIS_BLOCKS:
+        argv += ["--block", f"{o}={cohort_dir / f'{o}.csv'}"]
+    argv += [
+        "--metadata", str(metadata_path),
+        "--sample-col", "donor_id", "--group-col", "sex", "--stage-col", "stage",
+        "--stage-order", ",".join(STAGES),
+    ]
+    for c in ANALYSIS_COVARIATES:
+        argv += ["--covariate", c]
+    argv += [
+        "--missing-covariates", ANALYSIS_MISSING_COVARIATES,
+        "--permutations", str(params.permutations), "--seed", str(params.seed), "--n-jobs", str(n_jobs),
+        "--orientation-estimator", params.orientation_estimator,
+        "--cv1-splits", str(params.cv1_splits), "--cv2-splits", str(params.cv2_splits),
+        "--n-repeats", str(params.n_repeats), "--max-components", str(params.max_components),
+        "--cv-random-state", str(params.random_state),
+        "--out-dir", "OUT_DIR",
+    ]
+    return {
+        "command": shlex.join(argv),
+        "argv": argv,
+        "note": "replace OUT_DIR with a new directory; paths are relative to the directory run_analysis ran in",
+    }
+
+
+def run_analysis(
+    cohort: str = "all",
+    *,
+    input_dir: str | Path = "results/motco_input",
+    out_dir: str | Path = "results/motco_analysis",
+    n_jobs: int = 1,
+    force: bool = False,
+) -> dict:
+    """Run the covariate-adjusted MOTCO trajectory analysis per cohort.
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    input_dir:
+        Export root; each cohort is read from ``<input_dir>/<cohort>/``.
+    out_dir:
+        Analysis root; each cohort goes to ``<out_dir>/<cohort>/``.
+    n_jobs:
+        Parallel jobs for MOTCO's CV and RRPP (``-1`` = all CPUs). MOTCO 0.8.0
+        seeds one RRPP stream per worker, so values other than 1 change the
+        permutation draws (p-values, null summaries) but not the statistics,
+        rank or latent space; the reported results use 1.
+    force:
+        Replace existing cohort directories.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir": Path, "record": dict, "findings": [...]}``.
+
+    Notes
+    -----
+    Blocks ``rna`` and ``atac`` in identity units, group ``sex``, stage
+    ``stage`` in the order 0, 1, 2, covariates ``ANALYSIS_COVARIATES``
+    (missing policy ``error``), MOTCO's default net-displacement orientation
+    and double-CV rank, ``ANALYSIS_PERMUTATIONS`` RRPP permutations with
+    ``ANALYSIS_SEED``. The model's metadata table is serialized to
+    ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
+    parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
+    run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete.
+    """
+    import io
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    motco_version = check_motco_version()
+    from motco.analysis import (
+        OmicsBlock,
+        TrajectoryAnalysisParams,
+        TrajectoryDataset,
+        analyze_trajectories,
+        write_analysis_outputs,
+    )
+
+    input_dir = Path(input_dir)
+    out_dir = Path(out_dir)
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    for c in cohorts:
+        if (out_dir / c).exists() and not force:
+            raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+    for c in cohorts:
+        if not (input_dir / c).is_dir():
+            raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce it")
+    print(f"[analyze] MOTCO {motco_version}")
+    print(f"[analyze] Input directory: {input_dir}")
+    print(f"[analyze] Output directory: {out_dir}")
+
+    results = {}
+    for c in cohorts:
+        cohort_dir = input_dir / c
+        loaded = load_analysis_inputs(cohort_dir)
+        blocks = loaded["blocks"]
+        export_manifest = loaded["export_manifest"]
+        # Parse the table back as `motco analyze --metadata` does, so the
+        # CLI-equivalent run sees exactly what this one sees
+        metadata_csv = loaded["metadata"].to_csv(index=False)
+        metadata = pd.read_csv(io.StringIO(metadata_csv))
+        metadata["donor_id"] = metadata["donor_id"].astype(str)
+        print(
+            f"[analyze] {c}: {len(metadata)} donors, "
+            + " + ".join(f"{b.shape[1]} {o}" for o, b in blocks.items())
+            + f" features, covariates {', '.join(ANALYSIS_COVARIATES)}"
+        )
+
+        dataset = TrajectoryDataset(
+            blocks=[OmicsBlock(o, blocks[o], "identity") for o in ANALYSIS_BLOCKS],
+            metadata=metadata,
+            sample_col="donor_id",
+            group_col="sex",
+            stage_col="stage",
+            stage_order=STAGES,
+            covariate_cols=ANALYSIS_COVARIATES,
+            missing_covariates=ANALYSIS_MISSING_COVARIATES,
+        )
+        params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+        print(f"[analyze] {c}: CV rank selection + {params.permutations} RRPP permutations (n_jobs {n_jobs})...")
+        result = analyze_trajectories(dataset, params)
+        record = result.record
+        print(
+            f"[analyze] {c}: rank {record['latent']['selected_lv']} ({record['latent']['component_selection']}), "
+            f"{record['measurement']['runtime_seconds']:.1f} s"
+        )
+
+        findings = []
+        n_capped = export_manifest.get("covariates", {}).get("n_age_capped")
+        if n_capped:
+            findings.append(
+                f"{n_capped} donor(s) have capped ages but age_capped is not entered "
+                "(the covariate set assumed it constant); revisit the covariate set"
+            )
+        if n_jobs != 1:
+            findings.append(
+                f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
+                "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
+                "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+            )
+        if record["latent"]["selected_lv"] == 1:
+            findings.append(
+                "CV selected rank 1: in a one-dimensional latent space the net displacements are parallel "
+                "or antiparallel, so angle is 0° or 180° by construction and carries no orientation information"
+            )
+
+        tmp = out_dir / f"{c}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        written = write_analysis_outputs(result, tmp)
+        (tmp / "analysis_metadata.csv").write_text(metadata_csv)
+        (tmp / "summary.md").write_text(render_analysis_summary(record, cohort=c))
+        software = _software_versions()
+        software["motco"] = motco_version
+        try:
+            software["scikit-learn"] = version("scikit-learn")
+        except PackageNotFoundError:
+            software["scikit-learn"] = None
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cohort": c,
+            "n_donors": int(len(metadata)),
+            "inputs": {
+                "dir": str(cohort_dir),
+                "files": loaded["inputs"],
+                "export_manifest_sha256": loaded["inputs"]["manifest.json"]["sha256"],
+                "export_manifest_created_at": export_manifest.get("created_at"),
+                "export_git": export_manifest.get("git"),
+            },
+            "model": {
+                "entry_point": "motco.analysis.analyze_trajectories",
+                "blocks": [
+                    {"name": o, "file": f"{o}.csv", "transform": "identity", "n_features": int(blocks[o].shape[1])}
+                    for o in ANALYSIS_BLOCKS
+                ],
+                "metadata_file": "analysis_metadata.csv",
+                "sample_col": "donor_id",
+                "group_col": "sex",
+                "group_levels": record["design"]["group_levels"],
+                "stage_col": "stage",
+                "stage_order": list(STAGES),
+                "stage_labels": STAGE_LABELS,
+            },
+            "preprocessing": {
+                "source": "export manifest",
+                "thresholds": export_manifest.get("thresholds"),
+                "feature_counts": export_manifest.get("feature_counts"),
+                "n_age_capped": n_capped,
+                "export_findings": export_manifest.get("findings", []),
+            },
+            "covariates": {
+                "entered": list(ANALYSIS_COVARIATES),
+                "derived": {name: f"log10({src})" for name, src in ANALYSIS_LOG10_COLUMNS.items()},
+                "excluded": dict(ANALYSIS_EXCLUDED_COVARIATES),
+                "missing_policy": ANALYSIS_MISSING_COVARIATES,
+                "imputed": False,
+            },
+            "measurement": {
+                "orientation_estimator": params.orientation_estimator,
+                "component_selection": record["latent"]["component_selection"],
+                "forced_components": params.forced_components,
+                "cv": {
+                    "cv1_splits": params.cv1_splits, "cv2_splits": params.cv2_splits,
+                    "n_repeats": params.n_repeats, "max_components": params.max_components,
+                    "random_state": params.random_state,
+                },
+                "permutations": params.permutations,
+                "seed": params.seed,
+                "alpha": ANALYSIS_ALPHA,
+                "rejection_rule": ANALYSIS_REJECTION_RULE,
+                "n_jobs": n_jobs,
+                "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+                "attribution": False,
+            },
+            "cli_equivalent": _cli_equivalent(cohort_dir, out_dir / c / "analysis_metadata.csv", params, n_jobs),
+            "outputs": sorted([p.name for p in written.values()] + [
+                "analysis_metadata.csv", "summary.md", "analysis_manifest.json",
+            ]),
+            "software": software,
+            "git": _git_revision(),
+            "findings": findings,
+        }
+        (tmp / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        final = out_dir / c
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(tmp, final)
+        print(f"[analyze] Wrote {final}")
+        for msg in findings:
+            print(f"[analyze] FINDING: {c}: {msg}")
+        results[c] = {"dir": final, "record": record, "findings": findings}
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -2683,4 +3181,7 @@ __all__ = [
     "log_cpm",
     "preprocess_block",
     "run_export",
+    "load_analysis_inputs",
+    "render_analysis_summary",
+    "run_analysis",
 ]
