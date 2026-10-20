@@ -27,6 +27,7 @@ dependencies = [
   "decoupler>=2.1.2",
   "pydeseq2>=0.5.3",
   "motco",
+  "statsmodels>=0.14.5",
 ]
 
 [project.scripts]
