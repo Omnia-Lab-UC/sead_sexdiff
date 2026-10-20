@@ -1293,6 +1293,7 @@ dependencies = [
     { name = "pydeseq2" },
     { name = "rpy2" },
     { name = "scanpy" },
+    { name = "statsmodels" },
 ]
 
 [package.metadata]
@@ -1311,6 +1312,7 @@ requires-dist = [
     { name = "pydeseq2", specifier = ">=0.5.3" },
     { name = "rpy2", specifier = ">=3.6.4" },
     { name = "scanpy", specifier = ">=1.11.5" },
+    { name = "statsmodels", specifier = ">=0.14.5" },
 ]
 provides-extras = ["dev"]
 

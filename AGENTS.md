@@ -75,13 +75,14 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
 8. `preprocessing-sensitivity` – from `results/pseudobulk/` (incl.
    `donor_technical.csv` + `technical_manifest.json` for the gene-set,
-   residualized and candidate variants), the annotation,
+   residualized, trend-normalized and candidate variants), the annotation,
    `results/motco_input/` and `results/motco_analysis/`, per variant of the
    registry `PREPROCESSING_VARIANTS` (`keep_chrx`, `exclude_families`,
    `rna_trend_ratio`, `atac_mean_accessibility`, `residualized`,
-   `revised_candidate`) and per cohort: the export rerun with the variant's
-   registered setting(s) changed (`_export_cohort`, shared with `export`:
-   `excluded_chromosomes`, `excluded_gene_sets`, `selection_rule` per omic,
+   `revised_candidate`, `trend_normalized`, `revised_candidate_trend`) and
+   per cohort: the export rerun with the variant's registered setting(s)
+   changed (`_export_cohort`, shared with `export`: `excluded_chromosomes`,
+   `excluded_gene_sets`, `selection_rule` per omic, `normalization` per omic,
    `residualize`) and the analysis rerun unchanged on the variant blocks
    (`_analyze_cohort` with the `analyze` parameters), compared with the
    primary analysis. The primary export and analysis are read and checked
@@ -89,13 +90,16 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    export hashes, MOTCO version, seed, permutations, CV selection; the
    technical table against the pseudobulk manifest, `TECHNICAL_GENE_SETS`
    and completeness for the cohort donors), never rerun or modified. For
-   `revised_candidate` the predeclared `ADOPTION_RULE` is evaluated from the
-   generated files into `adoption_check.csv` (no p-value read). Writes
+   `revised_candidate`, `trend_normalized` and `revised_candidate_trend` the
+   predeclared `ADOPTION_RULE` is evaluated from the generated files into
+   `adoption_check.csv` (no p-value read), and `ADOPTION_PRECEDENCE` between
+   the last two is written into their comparison manifests. Writes
    `results/motco_sensitivity/<variant>/` (`motco_input/<cohort>/` plus
-   `residualization.csv` when residualizing, `motco_analysis/<cohort>/`,
+   `residualization.csv` when residualizing and `normalization_trend.csv`
+   when trend-normalizing, `motco_analysis/<cohort>/`,
    mirroring the primary layout so `rank-sensitivity` and `axis-diagnostics`
    can read a variant, and `comparison/<cohort>/` with `sensitivity.csv`,
-   `sensitivity.md`, `sensitivity_manifest.json` and, for the candidate,
+   `sensitivity.md`, `sensitivity_manifest.json` and, for the candidates,
    `adoption_check.csv`). `--variant all` skips complete variant × cohort
    pairs without `--force` (resumable).
 9. `axis-diagnostics` – from `results/motco_input/`, `results/motco_analysis/`,
@@ -130,8 +134,10 @@ when behavior or defaults change.
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
   `sync_pseudobulk.sh` (rsync of `results/pseudobulk/` to a workstation,
-  per-donor caches excluded) and `check_tmm_edger.R`
-  (one-off edgeR cross-check of the export's TMM / log2-CPM).
+  per-donor caches excluded), `check_tmm_edger.R`
+  (one-off edgeR cross-check of the export's TMM / log2-CPM) and
+  `check_cyclic_loess_limma.R` (limma cross-check of the variants' cyclic
+  loess on `_export_cohort` debug files).
 - `data/`, `results/` – gitignored; never commit their contents.
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
   Their numbers are pasted from generated outputs (`summary.md`, manifests),
@@ -142,7 +148,7 @@ when behavior or defaults change.
 
 - Python `>=3.12,<3.14`, managed with **uv** (`uv.lock` is committed).
 - Setup: the Nix flake (`flake.nix`) provides Python 3.12, uv, R, and the R
-  packages used by `DEG.R` and `check_tmm_edger.R`; its shell hook runs `uv sync --locked`. Enter it
+  packages used by `DEG.R`, `check_tmm_edger.R` and `check_cyclic_loess_limma.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
 - Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|subset|de> [options]`.
@@ -263,9 +269,12 @@ when behavior or defaults change.
   {rna: trend_ratio, atac: variance}`; `atac_mean_accessibility`:
   `selection_rule = {rna: variance, atac: mean}`; `residualized`:
   `residualize = True`, the technical table substituted at run time;
-  `revised_candidate`: the four together, with `adoption_check: True`; never
-  a flag, never chosen from results, entries only added by a change
-  proposal), `SELECTION_RULES` and `TREND_N_BINS` (20 equal-count bins of
+  `revised_candidate`: the four together, with `adoption_check: True`;
+  `trend_normalized`: `normalization = cyclic_loess` for both omics, with
+  `adoption_check: True`; `revised_candidate_trend`: `revised_candidate`'s
+  four plus the cyclic loess, with `adoption_check: True`; never a flag,
+  never chosen from results, entries only added by a change proposal),
+  `SELECTION_RULES` and `TREND_N_BINS` (20 equal-count bins of
   mean log2-CPM via `np.array_split`, median variance at the median mean,
   `np.interp` flat beyond the end bins, ratio = variance / trend, ties by
   name; dropped status `selection` under a non-variance rule, `variance`
@@ -277,7 +286,20 @@ when behavior or defaults change.
   `RESIDUALIZATION_CELL_STATE_EXCLUSIONS`, now `hemoglobin_pseudobulk` with
   the technical-axis report's section 2 as the reason; sex, stage and the
   analysis covariates never enter; the design written as `residualization.csv`,
-  `RESIDUALIZATION_FILE`, never an analysis input), the rule that the variant
+  `RESIDUALIZATION_FILE`, never an analysis input), the trend normalization
+  (`NORMALIZATION_RULES` = `none` (the primary's) / `cyclic_loess`: limma's
+  fast `normalizeCyclicLoess` reimplemented with statsmodels' `lowess`;
+  position after log2-CPM and before the residualization and the selection;
+  fitting set all abundance-passing features of the block; reference the
+  per-feature mean over donors, recomputed at each of `LOESS_ITERATIONS` (3);
+  `LOESS_ROBUSTNESS_ITERATIONS` (3, `loessFit`'s default), `delta` =
+  `LOESS_DELTA_FRACTION` (0.01) of the range of A; span by `LOESS_SPAN_RULE`,
+  limma's adaptive `chooseLowessSpan` defaults, per block; label-free; the
+  per-donor tilt accounting over `NORMALIZATION_TILT_BINS` (20) bins written
+  as `NORMALIZATION_TREND_FILE`, never an analysis input; the primary export
+  byte-identical with `normalization = none`; changes to the numpy cyclic
+  loess must be re-checked with `scripts/check_cyclic_loess_limma.R`,
+  tolerance 1e-6), the rule that the variant
   analysis keeps the six analysis covariates (double adjustment of the
   library-size proxies accepted and stated), `ADOPTION_CHECK_VARIABLES` (the
   primary export's TMM factors, four technical QC means, RIN, PMI: technical
@@ -285,7 +307,16 @@ when behavior or defaults change.
   candidate component reaches `|Spearman| ≥ DIAGNOSTIC_CORRELATION_THRESHOLD`
   against any check variable in both cohorts; p-values, rejections and CV
   AUROC never read; a missing variable is an error, not a skipped cell;
-  written to `PREPROCESSING_ADOPTION_TABLE` for the candidate only), the rule
+  written to `PREPROCESSING_ADOPTION_TABLE` for the entries with
+  `adoption_check` only), `ADOPTION_PRECEDENCE` with
+  `ADOPTION_PRECEDENCE_CANDIDATES` (`trend_normalized`,
+  `revised_candidate_trend`: if `trend_normalized` meets `ADOPTION_RULE` in
+  both cohorts it is the candidate whatever the other gives, because it
+  changes the least; if only `revised_candidate_trend` does, that one; if
+  neither, the variants stay sensitivity; only the `holds` values are read;
+  written as `adoption_precedence` into both candidates' comparison
+  manifests, `null` with reason `incomplete` until both have run in both
+  cohorts), the rule
   that a variant reruns the whole export at the primary's thresholds and N
   and the analysis at the primary's settings (same `ANALYSIS_SEED` and
   `ANALYSIS_PERMUTATIONS`, CV rank selection), the technical reference check
@@ -298,14 +329,20 @@ when behavior or defaults change.
   rank that differs is reported beside `angle` (not better or worse), the
   non-rejection rules hold in every variant, MOTCO's operating
   characteristics were measured on none of the variant blocks (chrX-kept,
-  family-excluded, trend- or mean-selected, residualized), so no variant
-  carries a Type I or power claim of its own, and the residualized variants
-  carry the stated limitations (degrees of freedom spent before the
+  family-excluded, trend- or mean-selected, residualized, trend-normalized),
+  so no variant carries a Type I or power claim of its own, the residualized
+  variants carry the stated limitations (degrees of freedom spent before the
   permutation null, stage and sex signal carried by the technical set
-  removed, library-size proxies adjusted twice). If the adoption check holds
-  in both cohorts a later change may propose the candidate as a revised
-  primary with the current primary kept as the reference; otherwise the
-  variants stay sensitivity analyses. The first latent axis's technical
+  removed, library-size proxies adjusted twice), and the trend-normalized
+  variants carry theirs (the cyclic loess assumes most features do not
+  change at any abundance level, so a stage or sex effect shaped like a tilt
+  is removed with the artefact; the curve is least determined at the rare
+  end, where the selection draws most features; the lncRNA-versus-coding
+  offset at matched abundance is not corrected; no Type I check). If the
+  adoption check holds in both cohorts a later change may propose the
+  candidate (between the two trend candidates, the one `ADOPTION_PRECEDENCE`
+  names) as a revised primary with the current primary kept as the
+  reference; otherwise the variants stay sensitivity analyses. The first latent axis's technical
   correlations per variant (`axis-diagnostics` on a variant root) may be
   attributed to each single setting as a measurement-space finding only.
 - Axis-diagnostic constants (flag and ask before changing any of them):

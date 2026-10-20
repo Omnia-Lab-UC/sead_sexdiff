@@ -2926,6 +2926,34 @@ RESIDUALIZATION_COVARIATES = ("log10_lib_rna", "log10_lib_atac") + tuple(
     f for f in RESIDUALIZATION_CANDIDATE_FRACTIONS if f not in RESIDUALIZATION_CELL_STATE_EXCLUSIONS
 )
 RESIDUALIZATION_FILE = "residualization.csv"
+# Trend normalization (the ``trend_normalized`` and ``revised_candidate_trend``
+# variants): after log2-CPM and before the residualization and the selection
+# step, limma's fast cyclic loess (``normalizeCyclicLoess(method = "fast")``)
+# over the abundance-passing features of a block. At each of LOESS_ITERATIONS
+# iterations the reference is the per-feature mean over donors (A); each
+# donor's deviation from it (M) is fitted by a lowess curve of M on A and the
+# fit is subtracted. The lowess is statsmodels' (Cleveland's algorithm, as R's
+# ``lowess``, which limma's ``loessFit`` calls without weights): frac = span,
+# LOESS_ROBUSTNESS_ITERATIONS robustifying iterations (``loessFit``'s default
+# ``iterations = 4`` passes ``iter = 3``), delta = LOESS_DELTA_FRACTION of the
+# range of A (R's default). The span is limma's adaptive default,
+# ``chooseLowessSpan(n, small.n, min.span, power)`` = min(min_span + (1 −
+# min_span) · (small_n / n) ** power, 1) with n the block's number of
+# abundance-passing features, so each block gets its own span. No label and
+# no donor covariate enters; ``none`` is the primary's. The per-donor tilt
+# accounting (slope of M on A, median M of the lowest and highest of
+# NORMALIZATION_TILT_BINS equal-count bins of A, before and after) is
+# label-free. Cross-checked against limma by
+# ``scripts/check_cyclic_loess_limma.R``. Constants of the trend-normalization
+# sensitivity change; flag and ask before changing them.
+NORMALIZATION_RULES = ("none", "cyclic_loess")
+LOESS_ITERATIONS = 3
+LOESS_SPAN_RULE: dict[str, float] = {"small_n": 50, "min_span": 0.3, "power": 1 / 3}
+LOESS_ROBUSTNESS_ITERATIONS = 3
+LOESS_DELTA_FRACTION = 0.01
+NORMALIZATION_TILT_BINS = 20
+NORMALIZATION_TREND_FILE = "normalization_trend.csv"
+NORMALIZATION_TILT_STATISTICS = ("slope", "low_bin", "high_bin")
 
 # GENCODE v32 = the annotation of the 10x GRCh38-2020-A reference (Cell Ranger 6.0)
 GENCODE_RELEASE = "32"
@@ -3310,6 +3338,136 @@ def residualize_values(values, design) -> tuple[np.ndarray, np.ndarray]:
     return resid + mean, r2
 
 
+def loess_span(n_features: int, *, rule: dict | None = None) -> float:
+    """limma's adaptive lowess span, ``chooseLowessSpan(n, small.n, min.span, power)``.
+
+    Parameters
+    ----------
+    n_features:
+        Number of features the curve is fitted over.
+    rule:
+        ``{"small_n", "min_span", "power"}``; ``LOESS_SPAN_RULE`` (limma's
+        defaults 50, 0.3, 1/3) by default.
+
+    Returns
+    -------
+    float
+        ``min(min_span + (1 − min_span) · (small_n / n) ** power, 1)``.
+    """
+    rule = LOESS_SPAN_RULE if rule is None else rule
+    if n_features < 1:
+        raise ValueError(f"loess_span needs at least one feature, got {n_features}")
+    span = rule["min_span"] + (1 - rule["min_span"]) * (rule["small_n"] / n_features) ** rule["power"]
+    return float(min(span, 1.0))
+
+
+def tilt_statistics(values, *, n_bins: int = NORMALIZATION_TILT_BINS) -> dict[str, np.ndarray]:
+    """Per-donor abundance tilt of a donors × features block of log2-CPM values.
+
+    Parameters
+    ----------
+    values:
+        Donors × features.
+    n_bins:
+        Number of equal-count bins of A (``NORMALIZATION_TILT_BINS``).
+
+    Returns
+    -------
+    dict
+        Per donor (arrays in row order): ``slope``, the OLS slope (with an
+        intercept) of M on A over all features; ``low_bin`` and ``high_bin``,
+        the median M over the lowest and the highest of ``n_bins`` equal-count
+        bins of A (``np.array_split`` of the features sorted by A, stable).
+        A is the per-feature mean over donors and M the donor's value minus A,
+        both of the values given. Label-free.
+    """
+    x = np.asarray(values, dtype=float)
+    if x.shape[1] < n_bins:
+        raise ValueError(f"tilt_statistics needs at least {n_bins} features, got {x.shape[1]}")
+    a = x.mean(axis=0)
+    m = x - a
+    ac = a - a.mean()
+    slope = (m * ac).sum(axis=1) / (ac ** 2).sum()
+    bins = np.array_split(np.argsort(a, kind="stable"), n_bins)
+    return {
+        "slope": slope,
+        "low_bin": np.median(m[:, bins[0]], axis=1),
+        "high_bin": np.median(m[:, bins[-1]], axis=1),
+    }
+
+
+def cyclic_loess(
+    values,
+    *,
+    iterations: int = LOESS_ITERATIONS,
+    span: float | None = None,
+) -> dict:
+    """limma's fast cyclic loess (``normalizeCyclicLoess(method = "fast")``) of a donors × features block.
+
+    Parameters
+    ----------
+    values:
+        Donors × features (log2-CPM over the abundance-passing features).
+    iterations:
+        Cyclic iterations (``LOESS_ITERATIONS``); each recomputes the reference.
+    span:
+        Lowess span; ``None`` for limma's adaptive span from the number of
+        features (``loess_span``).
+
+    Returns
+    -------
+    dict
+        ``values`` (the normalized block, same shape), ``span``,
+        ``iterations``, ``robustness_iterations``, ``delta`` (per iteration,
+        ``LOESS_DELTA_FRACTION`` of the range of A), ``n_features``,
+        ``tilt_before`` / ``tilt_after`` (``tilt_statistics`` of the input and
+        the normalized values) and ``max_abs_correction`` (per donor, the
+        largest absolute change of a value).
+
+    Notes
+    -----
+    At each iteration A is the per-feature mean over donors of the current
+    values; for each donor the lowess fit of M = value − A on A
+    (``statsmodels.nonparametric.smoothers_lowess.lowess`` with ``frac =
+    span``, ``it = LOESS_ROBUSTNESS_ITERATIONS``, ``delta``) is subtracted. As
+    in limma, A is fixed within an iteration, so the donor order does not
+    matter. Reads nothing but the values.
+    """
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+
+    original = np.asarray(values, dtype=float)
+    if original.ndim != 2:
+        raise ValueError("cyclic_loess expects a donors × features matrix")
+    if not np.all(np.isfinite(original)):
+        raise ValueError("cyclic_loess: the block contains non-finite values")
+    n_donors, n_feat = original.shape
+    span = loess_span(n_feat) if span is None else float(span)
+    x = original.copy()
+    deltas = []
+    for _ in range(iterations):
+        a = x.mean(axis=0)
+        delta = LOESS_DELTA_FRACTION * float(a.max() - a.min())
+        deltas.append(delta)
+        for i in range(n_donors):
+            fit = lowess(
+                x[i] - a, a, frac=span, it=LOESS_ROBUSTNESS_ITERATIONS, delta=delta, return_sorted=False
+            )
+            x[i] = x[i] - fit
+    if not np.all(np.isfinite(x)):
+        raise ValueError("cyclic_loess: the normalized block contains non-finite values")
+    return {
+        "values": x,
+        "span": span,
+        "iterations": int(iterations),
+        "robustness_iterations": LOESS_ROBUSTNESS_ITERATIONS,
+        "delta": deltas,
+        "n_features": int(n_feat),
+        "tilt_before": tilt_statistics(original),
+        "tilt_after": tilt_statistics(x),
+        "max_abs_correction": np.abs(x - original).max(axis=1),
+    }
+
+
 def preprocess_block(
     counts: np.ndarray,
     names: np.ndarray,
@@ -3322,6 +3480,7 @@ def preprocess_block(
     excluded_chromosomes: Iterable[str] = EXPORT_EXCLUDED_CHROMOSOMES,
     excluded_gene_sets: Iterable[str] = (),
     selection_rule: str = "variance",
+    normalization: str = "none",
     residualize=None,
 ) -> dict:
     """Preprocess one omic block of one cohort (steps 2–6 of the export).
@@ -3345,28 +3504,39 @@ def preprocess_block(
         One of ``SELECTION_RULES``: ``variance`` (the primary's; dropped
         features carry status ``variance``), ``trend_ratio`` or ``mean``
         (dropped features carry ``selection``).
+    normalization:
+        One of ``NORMALIZATION_RULES``: ``none`` (the primary's; the values
+        are left unchanged) or ``cyclic_loess``: after step 5 and before the
+        residualization, the abundance-passing features' log2-CPM is
+        normalized by limma's fast cyclic loess (``cyclic_loess``, adaptive
+        span), and the residualization and step 6 see the normalized values.
     residualize:
         ``None`` (the primary's) or a donors × covariates design aligned to the
-        rows of ``counts``: after step 5 every abundance-passing feature is
-        replaced by its mean plus the residual of its OLS fit on an intercept
-        and the design (``residualize_values``), so units stay log2-CPM, and
-        step 6 ranks the residualized values.
+        rows of ``counts``: after step 5 (and the normalization) every
+        abundance-passing feature is replaced by its mean plus the residual of
+        its OLS fit on an intercept and the design (``residualize_values``),
+        so units stay log2-CPM, and step 6 ranks the residualized values.
 
     Returns
     -------
     dict
         ``values`` (donors × kept features, log2-CPM, input feature order),
         ``kept`` (names), ``status``, ``variance`` (of the values step 6 ranks:
-        the residualized values when residualizing), ``mean`` and
-        ``selection_score`` (equal to ``variance`` under ``variance``) per input
-        feature, ``trend`` and ``ratio`` (``trend_ratio`` only, else ``None``),
-        ``trend_bins`` (``trend_ratio`` only), ``r_squared`` (residualizing
-        only, else ``None``), ``removed_by_gene_set``, ``selection_rule``,
-        ``steps`` (feature counts after each step; ``after_gene_set`` only when
-        sets were excluded), ``removed_by_chromosome``, ``lib_size_filter``,
-        ``lib_size``, ``tmm_factors``, ``mean_log_cpm_range`` of the kept
-        features, ``findings``, and the filtered ``filtered_counts`` /
-        ``filtered_log_cpm`` / ``filtered_names``.
+        the normalized and residualized values when those steps apply),
+        ``mean`` and ``selection_score`` (equal to ``variance`` under
+        ``variance``) per input feature, ``trend`` and ``ratio``
+        (``trend_ratio`` only, else ``None``), ``trend_bins`` (``trend_ratio``
+        only), ``r_squared`` (residualizing only, else ``None``),
+        ``removed_by_gene_set``, ``selection_rule``, ``normalization`` (the
+        rule), ``normalization_fit`` (``cyclic_loess`` output without the
+        values, else ``None``), ``steps`` (feature counts after each step;
+        ``after_gene_set`` only when sets were excluded),
+        ``removed_by_chromosome``, ``lib_size_filter``, ``lib_size``,
+        ``tmm_factors``, ``mean_log_cpm_range`` of the kept features,
+        ``findings``, and the filtered ``filtered_counts`` /
+        ``filtered_log_cpm`` (the step-5 log2-CPM, before normalization and
+        residualization) / ``filtered_normalized`` (the normalized log2-CPM
+        before residualization; ``None`` under ``none``) / ``filtered_names``.
 
     Notes
     -----
@@ -3378,6 +3548,8 @@ def preprocess_block(
     chromosomes = np.asarray(chromosomes, dtype=object)
     if selection_rule not in SELECTION_RULES:
         raise ValueError(f"unknown selection rule {selection_rule!r}; expected one of {SELECTION_RULES}")
+    if normalization not in NORMALIZATION_RULES:
+        raise ValueError(f"unknown normalization {normalization!r}; expected one of {NORMALIZATION_RULES}")
     excluded_gene_sets = tuple(excluded_gene_sets)
     n_feat = counts.shape[1]
     excluded = tuple(excluded_chromosomes)
@@ -3410,6 +3582,13 @@ def preprocess_block(
     lib = c3.sum(axis=1)
     factors = tmm_factors(c3, lib_size=lib)
     lcpm = log_cpm(c3, lib * factors, prior_count=prior_count)
+    lcpm_step5 = lcpm
+
+    # (5a) trend normalization (cyclic loess against the per-feature mean)
+    normalization_fit = normalized = None
+    if normalization == "cyclic_loess":
+        normalization_fit = cyclic_loess(lcpm)
+        lcpm = normalized = normalization_fit.pop("values")
 
     # (5b) residualization on an intercept and the design; means kept
     if residualize is not None:
@@ -3461,6 +3640,8 @@ def preprocess_block(
         "r_squared": r_squared,
         "removed_by_gene_set": matched,
         "selection_rule": selection_rule,
+        "normalization": normalization,
+        "normalization_fit": normalization_fit,
         "steps": steps,
         "removed_by_chromosome": removed_by_chrom,
         "lib_size_filter": lib_filter,
@@ -3469,7 +3650,8 @@ def preprocess_block(
         "mean_log_cpm_range": [float(np.min(mean_lcpm)), float(np.max(mean_lcpm))],
         "findings": findings,
         "filtered_counts": c3,
-        "filtered_log_cpm": lcpm,
+        "filtered_log_cpm": lcpm_step5,
+        "filtered_normalized": normalized,
         "filtered_names": names[idx3],
     }
 
@@ -3670,6 +3852,96 @@ def _residualization_design(
     return design
 
 
+def _quantiles(values) -> dict[str, float]:
+    """``DIAGNOSTIC_QUANTILES`` of the values, keyed ``q05`` … ``q95``."""
+    values = np.asarray(values, dtype=float)
+    return {f"q{int(round(q * 100)):02d}": float(np.quantile(values, q)) for q in DIAGNOSTIC_QUANTILES}
+
+
+def _normalization_trend_table(donors: np.ndarray, fits: dict[str, dict]) -> pd.DataFrame:
+    """``normalization_trend.csv``: per normalized omic and donor, the tilt statistics before and after and the largest correction."""
+    frames = []
+    for o, fit in fits.items():
+        frame = pd.DataFrame({"donor_id": donors, "omic": o})
+        for stat in NORMALIZATION_TILT_STATISTICS:
+            frame[f"{stat}_before"] = fit["tilt_before"][stat]
+            frame[f"{stat}_after"] = fit["tilt_after"][stat]
+        frame["max_abs_correction"] = fit["max_abs_correction"]
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
+def _normalization_fit_block(fits: dict[str, dict], *, trend_sha256: str | None) -> dict:
+    """The export manifest's ``normalization_fit`` block for the normalized omics."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        statsmodels_version = version("statsmodels")
+    except PackageNotFoundError:
+        statsmodels_version = None
+    block: dict = {}
+    for o, fit in fits.items():
+        block[o] = {
+            "rule": "cyclic_loess",
+            "reference": "feature_mean",
+            "n_features": fit["n_features"],
+            "span": fit["span"],
+            "adaptive_span": True,
+            "iterations": fit["iterations"],
+            "robustness_iterations": fit["robustness_iterations"],
+            "delta": fit["delta"],
+            "tilt_quantiles": {
+                stat: {"before": _quantiles(fit["tilt_before"][stat]), "after": _quantiles(fit["tilt_after"][stat])}
+                for stat in NORMALIZATION_TILT_STATISTICS
+            },
+            "max_abs_correction": {
+                "max": float(np.max(fit["max_abs_correction"])),
+                "quantiles": _quantiles(fit["max_abs_correction"]),
+            },
+        }
+    block.update({
+        "method": "limma normalizeCyclicLoess(method = \"fast\"): at each iteration the reference is the per-feature "
+                  "mean over donors (A); each donor's deviation from it (M) is fitted by lowess on A and subtracted",
+        "lowess": f"statsmodels.nonparametric.smoothers_lowess.lowess (statsmodels {statsmodels_version}); frac = span, "
+                  f"it = {LOESS_ROBUSTNESS_ITERATIONS}, delta = {LOESS_DELTA_FRACTION} x range(A), as R's lowess in limma's loessFit",
+        "span_rule": {**LOESS_SPAN_RULE, "formula": "min(min_span + (1 - min_span) * (small_n / n) ** power, 1), "
+                      "n = number of abundance-passing features (limma chooseLowessSpan)"},
+        "delta_fraction": LOESS_DELTA_FRACTION,
+        "position": "after log2-CPM (step 5), before the residualization (when declared) and the selection step (step 6)",
+        "fitting_set": "all abundance-passing features of the block (the features TMM is estimated on)",
+        "label_free": "reads only the block's log2-CPM; no sex, stage, analysis covariate or technical variable",
+        "tilt": {
+            "n_bins": NORMALIZATION_TILT_BINS,
+            "definition": "per donor, A = per-feature mean over donors and M = value - A of the values before or after "
+                          "normalization; slope = OLS slope of M on A; low_bin / high_bin = median M over the lowest / "
+                          f"highest of {NORMALIZATION_TILT_BINS} equal-count bins of A",
+            "quantiles_over": "donors",
+        },
+        "trend_file": NORMALIZATION_TREND_FILE,
+        "trend_sha256": trend_sha256,
+    })
+    return block
+
+
+def _per_omic_setting(value, *, default: str, name: str, label: str, allowed: Iterable[str]) -> dict[str, str]:
+    """Resolve an export setting given per omic, as one value for both omics, or ``None`` (the default for both)."""
+    if value is None:
+        out = {o: default for o in ("rna", "atac")}
+    elif isinstance(value, str):
+        out = {o: value for o in ("rna", "atac")}
+    else:
+        out = {o: default for o in ("rna", "atac")}
+        unknown = sorted(set(value) - set(out))
+        if unknown:
+            raise ValueError(f"{name} names unknown omic(s) {unknown}; expected rna and/or atac")
+        out.update(value)
+    allowed = tuple(allowed)
+    for o, rule in out.items():
+        if rule not in allowed:
+            raise ValueError(f"unknown {label} {rule!r} for {o}; expected one of {allowed}")
+    return out
+
+
 def _export_cohort(
     cohort: str,
     sub: pd.DataFrame,
@@ -3683,6 +3955,7 @@ def _export_cohort(
     excluded_chromosomes: Iterable[str],
     excluded_gene_sets: Iterable[str] = (),
     selection_rule: dict[str, str] | str | None = None,
+    normalization: dict[str, str] | str | None = None,
     residualize: pd.DataFrame | None = None,
     variant: dict | None = None,
     debug_dir: Path | None = None,
@@ -3728,6 +4001,16 @@ def _export_cohort(
         both, or ``None`` for the primary's ``variance`` (recorded as
         ``selection_rule: {rna: variance, atac: variance}``; ``trend_bins`` is
         added for an omic ranked by ``trend_ratio``).
+    normalization:
+        The trend normalization per omic (``{"rna": ..., "atac": ...}`` of
+        ``NORMALIZATION_RULES``), one rule for both, or ``None`` for the
+        primary's ``none`` (recorded as ``normalization: {rna: none, atac:
+        none}``). When an omic is normalized the manifest gains a
+        ``normalization_fit`` block (span, iterations, reference, tilt
+        quantiles per normalized omic), ``preprocessing_order`` gains the
+        step after log2-CPM, and ``normalization_trend.csv`` (per donor and
+        normalized omic, the tilt statistics before and after and the largest
+        absolute correction) is written beside the blocks.
     residualize:
         ``None`` (the primary's; recorded as ``residualization: null``) or
         ``donor_technical.csv`` (indexed by ``donor_id`` or with that column):
@@ -3741,7 +4024,8 @@ def _export_cohort(
         has no such key.
     debug_dir:
         If given, the filtered counts, TMM factors and log2-CPM per omic go
-        there (``_write_debug``).
+        there, plus the normalized log2-CPM and the loess settings of a
+        normalized omic (``_write_debug``).
     log_prefix:
         Prefix of the progress lines, ``[export]`` by default.
 
@@ -3757,19 +4041,9 @@ def _export_cohort(
     for set_name in gene_sets:
         if set_name not in TECHNICAL_GENE_SETS:
             raise ValueError(f"unknown gene set {set_name!r}; TECHNICAL_GENE_SETS holds {list(TECHNICAL_GENE_SETS)}")
-    if selection_rule is None:
-        rules = {o: "variance" for o in ("rna", "atac")}
-    elif isinstance(selection_rule, str):
-        rules = {o: selection_rule for o in ("rna", "atac")}
-    else:
-        rules = {o: "variance" for o in ("rna", "atac")}
-        unknown = sorted(set(selection_rule) - set(rules))
-        if unknown:
-            raise ValueError(f"selection_rule names unknown omic(s) {unknown}; expected rna and/or atac")
-        rules.update(selection_rule)
-    for o, rule in rules.items():
-        if rule not in SELECTION_RULES:
-            raise ValueError(f"unknown selection rule {rule!r} for {o}; expected one of {SELECTION_RULES}")
+    rules = _per_omic_setting(selection_rule, default="variance", name="selection_rule", label="selection rule", allowed=SELECTION_RULES)
+    norms = _per_omic_setting(normalization, default="none", name="normalization", label="normalization", allowed=NORMALIZATION_RULES)
+    normalized_omics = [o for o in ("rna", "atac") if norms[o] != "none"]
     donors = sub["donor_id"].to_numpy()
     k, k_cell, cells = smallest_cell(sub)
     print(f"[{log_prefix}] {cohort}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
@@ -3808,13 +4082,19 @@ def _export_cohort(
     for o, blk in blocks.items():
         res[o] = preprocess_block(
             counts_by_omic[o], blk["names"], blk["chrom"], k=k, excluded_chromosomes=excluded,
-            excluded_gene_sets=gene_sets, selection_rule=rules[o],
+            excluded_gene_sets=gene_sets, selection_rule=rules[o], normalization=norms[o],
             residualize=None if design is None else design.to_numpy(dtype=float),
         )
         findings += [f"{o}: {msg}" for msg in res[o]["findings"]]
         s = res[o]["steps"]
         print(f"[{log_prefix}] {cohort} {o}: " + " → ".join(str(v) for v in s.values())
               + ("" if rules[o] == "variance" else f" (selection rule {rules[o]})"))
+        fit = res[o]["normalization_fit"]
+        if fit is not None:
+            print(f"[{log_prefix}] {cohort} {o}: {norms[o]} over {fit['n_features']} features (span {fit['span']:.4f}, "
+                  f"{fit['iterations']} iterations); |slope of M on A| median "
+                  f"{np.median(np.abs(fit['tilt_before']['slope'])):.4g} → {np.median(np.abs(fit['tilt_after']['slope'])):.4g}, "
+                  f"largest absolute correction {fit['max_abs_correction'].max():.4g}")
         if debug_dir is not None:
             _write_debug(Path(debug_dir), cohort, o, donors, res[o])
     del counts_by_omic
@@ -3833,6 +4113,12 @@ def _export_cohort(
     if design is not None:
         design.to_csv(tmp / RESIDUALIZATION_FILE, float_format="%.17g")
         design_sha256 = _sha256_file(tmp / RESIDUALIZATION_FILE)
+    trend_sha256 = None
+    if normalized_omics:
+        _normalization_trend_table(donors, {o: res[o]["normalization_fit"] for o in normalized_omics}).to_csv(
+            tmp / NORMALIZATION_TREND_FILE, index=False, float_format="%.17g"
+        )
+        trend_sha256 = _sha256_file(tmp / NORMALIZATION_TREND_FILE)
     meta = pd.DataFrame({
         "donor_id": donors,
         "sex": sub["sex"].to_numpy(),
@@ -3867,6 +4153,13 @@ def _export_cohort(
         "TMM factors on the filtered counts (library size = filtered column sums)",
         "log2-CPM, prior count scaled by effective library size (edgeR cpm(log = TRUE))",
     ]
+    if normalized_omics:
+        order_lines.append(
+            "trend-normalize the log2-CPM of the abundance-passing features ("
+            + "; ".join(f"{o}: {norms[o]}" for o in ("rna", "atac"))
+            + f"; limma's fast cyclic loess: {LOESS_ITERATIONS} iterations, each fitting a lowess curve of every donor's "
+            "deviation from the per-feature mean over donors against that mean and subtracting it, adaptive span per block)"
+        )
     if design is not None:
         order_lines.append(
             "replace each feature by its mean plus the residual of its OLS fit on an intercept and the "
@@ -3901,7 +4194,10 @@ def _export_cohort(
                                     "(the step-3 library size, tmm.<omic>.<donor>.lib_size_filter)",
                 "<set>_pseudobulk": "donor_technical.csv: the UMI-weighted pseudobulk fraction of the gene set over the donor's astrocyte nuclei",
             },
-            "position": "after log2-CPM (step 5), before the selection step (step 6)",
+            "position": (
+                "after log2-CPM (step 5) and the trend normalization, before the selection step (step 6)"
+                if normalized_omics else "after log2-CPM (step 5), before the selection step (step 6)"
+            ),
             "model": "per feature, OLS on an intercept and the covariates; exported value = feature mean + residual; "
                      "variance in features_<omic>.csv and the selection score are those of the residualized values",
             "degrees_of_freedom": int(design.shape[1] + 1),
@@ -3954,6 +4250,10 @@ def _export_cohort(
             for o in ("rna", "atac")
         }} if gene_sets else {}),
         "selection_rule": selection_block,
+        "normalization": dict(norms),
+        **({"normalization_fit": _normalization_fit_block(
+            {o: res[o]["normalization_fit"] for o in normalized_omics}, trend_sha256=trend_sha256,
+        )} if normalized_omics else {}),
         "residualization": residualization_block,
         "kept_mean_log_cpm_range": {o: res[o]["mean_log_cpm_range"] for o in ("rna", "atac")},
         "tmm": {
@@ -4065,7 +4365,14 @@ def run_export(
 
 
 def _write_debug(debug_dir: Path, cohort: str, omic: str, donors: np.ndarray, res: dict) -> None:
-    """Write filtered counts, TMM factors and log2-CPM for the edgeR cross-check."""
+    """Write filtered counts, TMM factors and log2-CPM for the edgeR cross-check.
+
+    For a trend-normalized omic also ``<cohort>_<omic>_normalized.csv`` (the
+    normalized log2-CPM, before any residualization) and
+    ``<cohort>_<omic>_loess.csv`` (span, iterations, number of features) for
+    ``scripts/check_cyclic_loess_limma.R``. ``_logcpm.csv`` is always the
+    step-5 log2-CPM.
+    """
     debug_dir.mkdir(parents=True, exist_ok=True)
     stem = debug_dir / f"{cohort}_{omic}"
     idx = pd.Index(donors, name="donor_id")
@@ -4078,6 +4385,15 @@ def _write_debug(debug_dir: Path, cohort: str, omic: str, donors: np.ndarray, re
     pd.DataFrame(res["filtered_log_cpm"], index=idx, columns=res["filtered_names"]).to_csv(
         f"{stem}_logcpm.csv", float_format="%.17g"
     )
+    fit = res.get("normalization_fit")
+    if fit is not None:
+        pd.DataFrame(res["filtered_normalized"], index=idx, columns=res["filtered_names"]).to_csv(
+            f"{stem}_normalized.csv", float_format="%.17g"
+        )
+        pd.DataFrame([{
+            "rule": res["normalization"], "span": fit["span"], "iterations": fit["iterations"],
+            "robustness_iterations": fit["robustness_iterations"], "n_features": fit["n_features"],
+        }]).to_csv(f"{stem}_loess.csv", index=False, float_format="%.17g")
 
 
 # ---------------------------------------------------------------------------
@@ -4542,6 +4858,14 @@ def _analyze_cohort(
             "selection_rule": {
                 o: rule for o, rule in (export_manifest.get("selection_rule") or {}).items() if o in ANALYSIS_BLOCKS
             } or None,
+            "normalization": export_manifest.get("normalization"),
+            "normalization_fit": (
+                None if not export_manifest.get("normalization_fit")
+                else {
+                    o: {key: fit.get(key) for key in ("rule", "reference", "span", "iterations")}
+                    for o, fit in export_manifest["normalization_fit"].items() if o in ANALYSIS_BLOCKS
+                }
+            ),
             "residualization": (
                 None if not export_manifest.get("residualization")
                 else {key: export_manifest["residualization"].get(key) for key in ("covariates", "design_sha256", "degrees_of_freedom")}
@@ -5190,6 +5514,31 @@ PREPROCESSING_VARIANTS: dict[str, dict] = {
         },
         "adoption_check": True,
     },
+    "trend_normalized": {
+        "description": (
+            "after log2-CPM and before the selection step, each donor's log2-CPM over the abundance-passing features "
+            "corrected by limma's fast cyclic loess (a lowess curve of its deviation from the per-feature mean over "
+            "donors against that mean, three iterations, adaptive span) in both omics; every other export setting "
+            "equal to the primary; the adoption rule ADOPTION_RULE is evaluated for this variant"
+        ),
+        "export": {"normalization": "cyclic_loess"},
+        "adoption_check": True,
+    },
+    "revised_candidate_trend": {
+        "description": (
+            "the revised candidate's four settings plus the cyclic-loess trend normalization of both omics, in the "
+            "primary's order: gene sets removed before the abundance filter, cyclic loess after log2-CPM, "
+            "residualization after the normalization, trend-ratio ranking for RNA and mean-accessibility ranking for "
+            "ATAC at the selection step; the adoption rule ADOPTION_RULE is evaluated for this variant"
+        ),
+        "export": {
+            "excluded_gene_sets": ("ribosomal", "mitochondrial", "hemoglobin"),
+            "normalization": "cyclic_loess",
+            "residualize": True,
+            "selection_rule": {"rna": "trend_ratio", "atac": "mean"},
+        },
+        "adoption_check": True,
+    },
 }
 PREPROCESSING_PRIMARY_LABEL = "primary"
 # The primary export's value of every registry setting (named in the comparison)
@@ -5197,6 +5546,7 @@ PREPROCESSING_PRIMARY_SETTINGS: dict = {
     "excluded_chromosomes": list(EXPORT_EXCLUDED_CHROMOSOMES),
     "excluded_gene_sets": [],
     "selection_rule": {"rna": "variance", "atac": "variance"},
+    "normalization": {"rna": "none", "atac": "none"},
     "residualize": None,
 }
 # The adoption rule of the revised candidate (design D7): a constant over
@@ -5224,6 +5574,20 @@ ADOPTION_RULE = (
     "as a revised primary with the current primary kept as the reference; if not, the variants stay sensitivity analyses"
 )
 PREPROCESSING_ADOPTION_TABLE = "adoption_check.csv"
+# The precedence rule between the adoption candidates of the trend-normalization
+# change, written before any run: applied by the step from the ``holds`` values
+# of both candidates' adoption tables in both cohorts and written into each
+# candidate's comparison manifest (``adoption_precedence``); ``null`` with the
+# reason "incomplete" until both candidates have run in both cohorts.
+# ``trend_normalized`` wins ties because it changes the least. Never reads a
+# p-value, rank or CV AUROC; flag and ask before changing.
+ADOPTION_PRECEDENCE_CANDIDATES = ("trend_normalized", "revised_candidate_trend")
+ADOPTION_PRECEDENCE = (
+    "if trend_normalized meets ADOPTION_RULE in both cohorts it is the candidate a later revised-primary change "
+    "proposes, whatever revised_candidate_trend gives (no gene removed, no degrees of freedom spent, no technical "
+    "covariate read); if only revised_candidate_trend meets it in both cohorts, that one is; if neither does, the "
+    "variants stay sensitivity analyses. Only the holds values of the adoption tables are read"
+)
 # Layout under <out_dir>/<variant>/: mirrors results/motco_input and
 # results/motco_analysis so the rank sweep can read a variant with no code change
 PREPROCESSING_INPUT_DIR = "motco_input"
@@ -5445,11 +5809,19 @@ def _check_technical_reference(pseudobulk_dir: str | Path, *, donors: Iterable[s
 
 
 def _variant_settings_record(spec: dict) -> dict:
-    """The registry entry's export settings as the manifests record them (tuples as lists; ``residualize`` as the covariates)."""
+    """The registry entry's export settings as the manifests record them.
+
+    Tuples become lists, ``residualize`` the covariates and ``normalization``
+    the per-omic rules (as the export manifest records them).
+    """
     out = {}
     for key, val in spec["export"].items():
         if key == "residualize":
             out[key] = list(RESIDUALIZATION_COVARIATES) if val else None
+        elif key == "normalization":
+            out[key] = _per_omic_setting(
+                val, default="none", name="normalization", label="normalization", allowed=NORMALIZATION_RULES
+            )
         elif isinstance(val, (list, tuple)):
             out[key] = list(val)
         else:
@@ -5492,15 +5864,20 @@ def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str 
         names, and the status of ``PREPROCESSING_NAMED_FEATURES`` in both
         exports), ``gene_sets`` (sets excluded: matched, removed and
         already-on-an-excluded-chromosome counts per set), ``selection``
-        (rules differ: rule and kept-mean quantiles of both exports) and
-        ``residualization`` (covariates, degrees of freedom and R² quantiles).
+        (rules differ: rule and kept-mean quantiles of both exports),
+        ``residualization`` (covariates, degrees of freedom and R² quantiles)
+        and ``normalization`` (normalization rules differ: both rules, the
+        variant's span, iterations, reference, tilt quantiles over donors
+        before and after, the largest absolute correction and the trend file).
 
     Raises
     ------
     ValueError
         The two exports list different input features; a chrX feature of a
         variant that keeps chrX carries ``sex_chromosome``; the gene-set or
-        residualization records disagree with ``features_<omic>.csv``.
+        residualization records disagree with ``features_<omic>.csv``; or the
+        normalization record is missing or disagrees with
+        ``normalization_trend.csv``.
     """
     p, v = Path(primary_export_dir), Path(variant_export_dir)
     pm = json.loads((p / "manifest.json").read_text())
@@ -5595,6 +5972,38 @@ def _feature_accounting(primary_export_dir: str | Path, variant_export_dir: str 
                 "design_file": resid.get("design_file"),
                 "design_sha256": resid.get("design_sha256"),
                 "r_squared_quantiles": (resid.get("r_squared_quantiles") or {}).get(o),
+            }
+        p_norm = (pm.get("normalization") or {}).get(o, "none")
+        v_norm = (vm.get("normalization") or {}).get(o, "none")
+        if p_norm != v_norm:
+            fit_block = vm.get("normalization_fit") or {}
+            fit = fit_block.get(o)
+            if fit is None:
+                raise ValueError(f"{v / 'manifest.json'} records normalization {v_norm!r} for {o} but no normalization_fit for it")
+            trend_path = v / fit_block.get("trend_file", NORMALIZATION_TREND_FILE)
+            if not trend_path.exists():
+                raise ValueError(f"{trend_path} is missing although the export trend-normalized {o}")
+            trend = pd.read_csv(trend_path, dtype={"donor_id": str, "omic": str})
+            trend = trend[trend["omic"] == o]
+            if len(trend) != vm.get("n_donors"):
+                raise ValueError(f"{trend_path} has {len(trend)} rows for {o}, the export has {vm.get('n_donors')} donors")
+            for stat in NORMALIZATION_TILT_STATISTICS:
+                for when in ("before", "after"):
+                    recorded = fit["tilt_quantiles"][stat][when]
+                    if any(not np.isclose(q, recorded[key], rtol=0, atol=1e-12) for key, q in _quantiles(trend[f"{stat}_{when}"]).items()):
+                        raise ValueError(f"{trend_path}: the {stat}_{when} quantiles of {o} disagree with {v / 'manifest.json'}")
+            entry["normalization"] = {
+                "primary": p_norm,
+                "variant": v_norm,
+                "reference": fit.get("reference"),
+                "n_features": fit.get("n_features"),
+                "span": fit.get("span"),
+                "iterations": fit.get("iterations"),
+                "robustness_iterations": fit.get("robustness_iterations"),
+                "tilt_quantiles": fit.get("tilt_quantiles"),
+                "max_abs_correction": fit.get("max_abs_correction"),
+                "trend_file": fit_block.get("trend_file"),
+                "trend_sha256": fit_block.get("trend_sha256"),
             }
         out[o] = entry
     return out
@@ -5700,6 +6109,98 @@ def adoption_check(
     return pd.DataFrame(rows, columns=["component", "variable", "source", "n", "spearman", "flag", "holds"])
 
 
+def _read_adoption_table(path: Path) -> tuple[bool, list[str]]:
+    """The ``holds`` value of an ``adoption_check.csv`` and its flagged cells (``component × variable (rho)``)."""
+    table = pd.read_csv(path, dtype={"component": str, "variable": str, "flag": str, "holds": str}, keep_default_na=False)
+    last = table.iloc[-1]
+    if last["component"] != "all" or last["holds"].strip().lower() not in ("true", "false"):
+        raise ValueError(f"{path}: the last row is not the overall holds row")
+    body = table.iloc[:-1]
+    flagged = [
+        f"{r['component']} × {r['variable']} ({float(r['spearman']):.2f})"
+        for _, r in body.iterrows() if r["flag"].strip().lower() == "true"
+    ]
+    return last["holds"].strip().lower() == "true", flagged
+
+
+def adoption_precedence(holds: dict[str, dict[str, bool | None]], flagged: dict | None = None) -> dict:
+    """Apply ``ADOPTION_PRECEDENCE`` to the candidates' ``holds`` values.
+
+    Parameters
+    ----------
+    holds:
+        Candidate (``ADOPTION_PRECEDENCE_CANDIDATES``) → cohort
+        (``EXPORT_COHORTS``) → ``holds`` of its ``adoption_check.csv``, or
+        ``None`` (absent) when that candidate × cohort has not run.
+    flagged:
+        Candidate → cohort → flagged cells, recorded beside the decision
+        (never read by it).
+
+    Returns
+    -------
+    dict
+        ``rule``, ``candidates``, ``holds``, ``candidate`` (the named
+        candidate or ``None``), ``reason`` (``"incomplete"`` while a
+        candidate × cohort is missing, with ``missing`` listing them) and
+        ``flagged``. Only the ``holds`` values decide.
+    """
+    first, second = ADOPTION_PRECEDENCE_CANDIDATES
+    table = {v: {c: (holds.get(v) or {}).get(c) for c in EXPORT_COHORTS} for v in ADOPTION_PRECEDENCE_CANDIDATES}
+    out = {
+        "rule": ADOPTION_PRECEDENCE,
+        "candidates": list(ADOPTION_PRECEDENCE_CANDIDATES),
+        "holds": table,
+        "flagged": flagged or {},
+    }
+    missing = [f"{v} {c}" for v in ADOPTION_PRECEDENCE_CANDIDATES for c in EXPORT_COHORTS if table[v][c] is None]
+    if missing:
+        return {**out, "candidate": None, "reason": "incomplete", "missing": missing}
+    meets = {v: all(table[v].values()) for v in ADOPTION_PRECEDENCE_CANDIDATES}
+    if meets[first]:
+        reason = (
+            f"{first} meets ADOPTION_RULE in both cohorts; it is the candidate whatever {second} gives "
+            f"({second} {'also meets' if meets[second] else 'does not meet'} it), because it changes the least: no gene "
+            "removed, no degrees of freedom spent, no technical covariate read"
+        )
+        return {**out, "candidate": first, "reason": reason}
+    if meets[second]:
+        reason = f"only {second} meets ADOPTION_RULE in both cohorts ({first} does not), so {second} is the candidate"
+        return {**out, "candidate": second, "reason": reason}
+    reason = (
+        f"neither {first} nor {second} meets ADOPTION_RULE in both cohorts; no revised-primary change follows and the "
+        "variants stay sensitivity analyses"
+    )
+    return {**out, "candidate": None, "reason": reason}
+
+
+def _update_adoption_precedence(out_dir: Path) -> dict:
+    """Evaluate ``ADOPTION_PRECEDENCE`` from the candidates' adoption tables under ``out_dir`` and record it.
+
+    The result is written as ``adoption_precedence`` into every existing
+    comparison manifest of the candidates (``<out_dir>/<candidate>/comparison/
+    <cohort>/sensitivity_manifest.json``) and returned.
+    """
+    holds: dict[str, dict[str, bool | None]] = {}
+    flagged: dict[str, dict[str, list[str]]] = {}
+    for v in ADOPTION_PRECEDENCE_CANDIDATES:
+        holds[v], flagged[v] = {}, {}
+        for c in EXPORT_COHORTS:
+            path = out_dir / v / PREPROCESSING_COMPARISON_DIR / c / PREPROCESSING_ADOPTION_TABLE
+            if path.exists():
+                holds[v][c], flagged[v][c] = _read_adoption_table(path)
+            else:
+                holds[v][c] = None
+    result = adoption_precedence(holds, flagged)
+    for v in ADOPTION_PRECEDENCE_CANDIDATES:
+        for c in EXPORT_COHORTS:
+            path = out_dir / v / PREPROCESSING_COMPARISON_DIR / c / PREPROCESSING_SENSITIVITY_MANIFEST
+            if path.exists():
+                manifest = json.loads(path.read_text())
+                manifest["adoption_precedence"] = result
+                path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return result
+
+
 def render_preprocessing_sensitivity(
     rows: list[dict],
     features: dict,
@@ -5742,7 +6243,8 @@ def render_preprocessing_sensitivity(
         primary's, seed, permutations, α and both ranks and the reading rules;
         one table per statistic (two rows); the feature table per omic and
         export and, when the variant calls for them, the chrX, gene-set,
-        selection-rule, residualization and adoption-check blocks; a run table
+        selection-rule, residualization, normalization and adoption-check
+        blocks; a run table
         (rank selection, CV AUROC, runtime, directory); the findings. Every
         number comes from the rows, the accounting and the adoption table; the
         runtimes are the one thing here that is not in ``sensitivity.csv``.
@@ -5751,6 +6253,10 @@ def render_preprocessing_sensitivity(
     changed = ", ".join(f"`{key}` = {val}" for key, val in settings.items())
     primary_values = ", ".join(f"`{key}` = {PREPROCESSING_PRIMARY_SETTINGS.get(key)}" for key in settings)
     has = lambda key: any(key in acc for acc in features.values())  # noqa: E731
+    blocks_measured = (
+        "neither chrX-kept, family-excluded, trend- or mean-selected, residualized nor trend-normalized"
+        if has("normalization") else "neither chrX-kept, family-excluded, trend- or mean-selected nor residualized"
+    )
     lines = [
         f"# MOTCO preprocessing sensitivity: {cohort}, variant `{variant}`",
         "",
@@ -5763,9 +6269,8 @@ def render_preprocessing_sensitivity(
         "uninformative in both rows; a `delta` rejection is a difference, not specifically of size; a rejection "
         "status that differs between the rows is preprocessing dependence of the sensitivity analysis, not a result "
         "of the variant; a CV-selected rank that differs is reported beside `angle`, not read as better or worse. "
-        "MOTCO's operating characteristics were measured on none of the variant blocks (neither chrX-kept, "
-        "family-excluded, trend- or mean-selected nor residualized), so the variant carries no Type I or power "
-        "claim of its own.",
+        f"MOTCO's operating characteristics were measured on none of the variant blocks ({blocks_measured}), so the "
+        "variant carries no Type I or power claim of its own.",
     ]
     for s in ANALYSIS_STATISTICS:
         lines += [
@@ -5857,6 +6362,58 @@ def render_preprocessing_sensitivity(
                 lines.append(
                     f"| {o} | {label} | {sel[key]['rule']} | " + " | ".join(_fmt(q[k], ".3f") for k in ("q05", "q25", "q50", "q75", "q95")) + " |"
                 )
+    if has("normalization"):
+        norm_omics = [o for o, acc in features.items() if "normalization" in acc]
+        first = features[norm_omics[0]]["normalization"]
+        lines += [
+            "",
+            "## Normalization",
+            "",
+            f"After log2-CPM and before {'the residualization and ' if has('residualization') else ''}the selection step, "
+            "each donor's log2-CPM over the abundance-passing features was corrected by limma's fast cyclic loess "
+            f"(`normalizeCyclicLoess(method = \"fast\")`): at each of {first['iterations']} iterations the reference is "
+            "the per-feature mean over donors (A), and each donor's deviation from it (M) is fitted by a lowess curve on "
+            f"A ({first['robustness_iterations']} robustifying iterations, delta = {LOESS_DELTA_FRACTION:g} of the range "
+            "of A) and subtracted. The span is limma's adaptive default from the number of features "
+            f"(`LOESS_SPAN_RULE`: {LOESS_SPAN_RULE['min_span']} + (1 − {LOESS_SPAN_RULE['min_span']}) · "
+            f"({LOESS_SPAN_RULE['small_n']} / n)^(1/3)). Only the block's values are read (no label, covariate or "
+            "technical variable). The tilt statistics are per donor, with A and M taken against the per-feature mean "
+            "of the values before or after the normalization: the OLS slope of M on A and the median M of the lowest "
+            f"and highest of {NORMALIZATION_TILT_BINS} equal-count bins of A; the quantiles are over donors and the "
+            f"per-donor values are in `{first['trend_file']}` beside the variant blocks (sha256 "
+            f"`{str(first['trend_sha256'])[:12]}…`). Limitations: the normalization assumes that most features do not "
+            "change at any abundance level, so a stage or sex effect shaped like a tilt is removed with the artefact; "
+            "the curve is least determined at the rare end, where the selection draws most features; the "
+            "lncRNA-versus-coding offset at matched abundance is not corrected; and no Type I check exists for the "
+            "normalized blocks.",
+            "",
+            "| omic | primary | variant | features | span | iterations | largest absolute correction |",
+            "|---|---|---|---:|---:|---:|---:|",
+        ]
+        for o in norm_omics:
+            n = features[o]["normalization"]
+            lines.append(
+                f"| {o} | {n['primary']} | {n['variant']} | {n['n_features']} | {_fmt(n['span'], '.6f')} | "
+                f"{n['iterations']} | {_fmt(n['max_abs_correction']['max'], '.4f')} |"
+            )
+        lines += [
+            "",
+            "| omic | statistic | values | q05 | q25 | q50 | q75 | q95 |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+        labels = {"slope": "slope of M on A", "low_bin": "median M, lowest bin", "high_bin": "median M, highest bin"}
+        for o in norm_omics:
+            n = features[o]["normalization"]
+            for stat in NORMALIZATION_TILT_STATISTICS:
+                for when in ("before", "after"):
+                    q = n["tilt_quantiles"][stat][when]
+                    lines.append(
+                        f"| {o} | {labels[stat]} | {when} | " + " | ".join(_fmt(q[k], '.4f') for k in ("q05", "q25", "q50", "q75", "q95")) + " |"
+                    )
+            q = n["max_abs_correction"]["quantiles"]
+            lines.append(
+                f"| {o} | largest absolute correction | per donor | " + " | ".join(_fmt(q[k], '.4f') for k in ("q05", "q25", "q50", "q75", "q95")) + " |"
+            )
     if has("residualization"):
         resid = next(acc["residualization"] for acc in features.values() if "residualization" in acc)
         covs = resid["covariates"]
@@ -5865,7 +6422,8 @@ def render_preprocessing_sensitivity(
             "",
             "## Residualization",
             "",
-            f"After log2-CPM and before the selection step, each abundance-passing feature was replaced by its mean plus "
+            f"After log2-CPM{', the trend normalization' if has('normalization') else ''} and before the selection step, "
+            "each abundance-passing feature was replaced by its mean plus "
             f"the residual of its OLS fit on an intercept and {len(covs)} covariates: {', '.join(f'`{c}`' for c in covs)} "
             f"(`RESIDUALIZATION_COVARIATES`: the export's own log10 library sizes after step 2 and the technical table's "
             f"gene-set pseudobulk fractions; excluded as cell state under the technical-axis report's rule: {exclusions}). "
@@ -5897,7 +6455,13 @@ def render_preprocessing_sensitivity(
             f"In this cohort the rule {'holds' if holds else 'does not hold'}"
             + ("" if holds else ": flagged " + ", ".join(f"{r['component']} × `{r['variable']}` ({_fmt(r['spearman'], '.2f')})" for _, r in flagged.iterrows()))
             + ". The rule needs both cohorts; whether the candidate becomes a revised primary is a later change with the "
-            "current primary kept as the reference, and the candidate's statistics above are sensitivity, not the result.",
+            "current primary kept as the reference, and the candidate's statistics above are sensitivity, not the result."
+            + (
+                f" Between {' and '.join(f'`{c}`' for c in ADOPTION_PRECEDENCE_CANDIDATES)}, `ADOPTION_PRECEDENCE` decides "
+                f"from both cohorts' `holds` values: {ADOPTION_PRECEDENCE}; its outcome is recorded as `adoption_precedence` "
+                "in the comparison manifests."
+                if variant in ADOPTION_PRECEDENCE_CANDIDATES else ""
+            ),
             "",
             "| component | variable | source | n | Spearman | flagged |",
             "|---|---|---|---:|---:|:---:|",
@@ -5953,9 +6517,12 @@ def run_preprocessing_sensitivity(
         the primary analysis, read and checked, never written.
     out_dir:
         Sensitivity root; each variant goes to ``<out_dir>/<variant>/`` with
-        ``motco_input/<cohort>/`` (the variant export), ``motco_analysis/<cohort>/``
-        (the variant analysis) and ``comparison/<cohort>/`` (``sensitivity.csv``,
-        ``sensitivity.md``, ``sensitivity_manifest.json``).
+        ``motco_input/<cohort>/`` (the variant export, plus ``residualization.csv``
+        and ``normalization_trend.csv`` when those steps apply),
+        ``motco_analysis/<cohort>/`` (the variant analysis) and
+        ``comparison/<cohort>/`` (``sensitivity.csv``, ``sensitivity.md``,
+        ``sensitivity_manifest.json`` and, for an adoption candidate,
+        ``adoption_check.csv``).
     data_root:
         Data root holding (or receiving) the gene annotation.
     n_jobs:
@@ -6007,8 +6574,12 @@ def run_preprocessing_sensitivity(
     primary). The comparison holds the primary row first and the variant row
     second; a rejection status that differs is preprocessing dependence of the
     sensitivity analysis and the primary analysis stays primary. For the
-    registry entry with ``adoption_check`` the comparison also holds
-    ``adoption_check.csv`` (``ADOPTION_RULE`` over ``ADOPTION_CHECK_VARIABLES``).
+    registry entries with ``adoption_check`` the comparison also holds
+    ``adoption_check.csv`` (``ADOPTION_RULE`` over ``ADOPTION_CHECK_VARIABLES``);
+    after each cohort of an ``ADOPTION_PRECEDENCE_CANDIDATES`` entry,
+    ``ADOPTION_PRECEDENCE`` is evaluated from the candidates' adoption tables
+    under ``out_dir`` and written as ``adoption_precedence`` into every
+    existing candidate comparison manifest (``_update_adoption_precedence``).
     """
     import shutil
     from importlib.metadata import PackageNotFoundError, version
@@ -6178,6 +6749,10 @@ def run_preprocessing_sensitivity(
                               f"{acc['selection']['primary']['kept_mean_quantiles']['q50']:.3f})")
                 if "residualization" in acc and acc["residualization"].get("r_squared_quantiles"):
                     extra += f"; median R² {acc['residualization']['r_squared_quantiles']['q50']:.3f}"
+                if "normalization" in acc:
+                    tq = acc["normalization"]["tilt_quantiles"]["slope"]
+                    extra += (f"; {acc['normalization']['variant']} span {acc['normalization']['span']:.4f}, median slope of M "
+                              f"on A {tq['before']['q50']:.4g} → {tq['after']['q50']:.4g}")
                 print(
                     f"[{log}] {c} {o}: kept {acc['kept']['shared']} shared, {acc['kept']['primary_only']} primary-only, "
                     f"{acc['kept']['variant_only']} {v}-only{extra}"
@@ -6252,6 +6827,12 @@ def run_preprocessing_sensitivity(
                     "path": str(exp["dir"] / RESIDUALIZATION_FILE), "sha256": _sha256_file(exp["dir"] / RESIDUALIZATION_FILE),
                     "note": "the residualization design; not an analysis input (load_analysis_inputs reads the five files above)",
                 }
+            if (exp["dir"] / NORMALIZATION_TREND_FILE).exists():
+                variant_files[NORMALIZATION_TREND_FILE] = {
+                    "path": str(exp["dir"] / NORMALIZATION_TREND_FILE),
+                    "sha256": _sha256_file(exp["dir"] / NORMALIZATION_TREND_FILE),
+                    "note": "the per-donor tilt accounting of the trend normalization; not an analysis input",
+                }
             variant_analysis_files = {
                 name: {"path": str(ana["dir"] / name), "sha256": _sha256_file(ana["dir"] / name)}
                 for name in _REFERENCE_FILES
@@ -6319,6 +6900,11 @@ def run_preprocessing_sensitivity(
                             key: exp["manifest"]["residualization"].get(key)
                             for key in ("covariates", "cell_state_exclusions", "design_file", "design_sha256", "degrees_of_freedom", "r_squared_quantiles")
                         },
+                        "normalization": exp["manifest"].get("normalization"),
+                        **({"normalization_fit": {
+                            o: {key: fit.get(key) for key in ("rule", "reference", "n_features", "span", "iterations", "robustness_iterations")}
+                            for o, fit in exp["manifest"]["normalization_fit"].items() if o in ANALYSIS_BLOCKS
+                        }} if exp["manifest"].get("normalization_fit") else {}),
                         "feature_counts": exp["manifest"]["feature_counts"],
                         "findings": exp["findings"],
                     },
@@ -6369,6 +6955,14 @@ def run_preprocessing_sensitivity(
                 "export": exp, "analysis": ana, "comparison": final, "rows": rows, "table": table,
                 "manifest": manifest, "findings": findings, "adoption": adoption,
             }
+            if v in ADOPTION_PRECEDENCE_CANDIDATES:
+                precedence = _update_adoption_precedence(out_dir)
+                manifest["adoption_precedence"] = precedence
+                print(
+                    f"[{log}] ADOPTION_PRECEDENCE: candidate {precedence['candidate']} ({precedence['reason']}"
+                    + (f"; missing {', '.join(precedence['missing'])}" if precedence.get("missing") else "")
+                    + f"), written to the comparison manifests of {', '.join(ADOPTION_PRECEDENCE_CANDIDATES)} under {out_dir}"
+                )
     return results
 
 
