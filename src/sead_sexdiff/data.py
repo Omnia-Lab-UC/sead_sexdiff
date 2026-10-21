@@ -4425,18 +4425,31 @@ _ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "ma
 _ANALYSIS_DESIGN_COLUMNS = ("donor_id", "sex", "stage", "stage_label")
 
 
-def check_motco_version() -> str:
+def check_motco_version(
+    *,
+    required: str = ANALYSIS_MOTCO_MIN_VERSION,
+    purpose: str = "the analysis needs",
+    feature: str = "covariate-adjusted analyze_trajectories",
+) -> str:
     """Return the installed MOTCO version; raise if it is older than the minimum.
+
+    Parameters
+    ----------
+    required:
+        The minimum version; ``ANALYSIS_MOTCO_MIN_VERSION`` by default, and
+        ``LATENT_MOTCO_MIN_VERSION`` for ``latent-sensitivity``.
+    purpose, feature:
+        Named in the error message (what needs the version, and why).
 
     Raises
     ------
     RuntimeError
-        The installed MOTCO is older than ``ANALYSIS_MOTCO_MIN_VERSION``.
+        The installed MOTCO is older than ``required``; the message names both
+        versions.
     """
     import motco
 
     installed = str(motco.__version__)
-    required = ANALYSIS_MOTCO_MIN_VERSION
     try:
         from packaging.version import Version
 
@@ -4448,34 +4461,44 @@ def check_motco_version() -> str:
         too_old = key(installed) < key(required)
     if too_old:
         raise RuntimeError(
-            f"MOTCO {installed} is installed but the analysis needs MOTCO >= {required} "
-            "(covariate-adjusted analyze_trajectories); run `uv sync --locked`"
+            f"MOTCO {installed} is installed but {purpose} MOTCO >= {required} "
+            f"({feature}); run `uv sync --locked`"
         )
     return installed
 
 
-def load_analysis_inputs(cohort_dir: str | Path) -> dict:
+def load_analysis_inputs(cohort_dir: str | Path, *, extra_covariates: pd.DataFrame | None = None) -> dict:
     """Read one cohort's export, cross-check it and build the model's metadata table.
 
     Parameters
     ----------
     cohort_dir:
         ``<export root>/<cohort>/`` as written by ``run_export``.
+    extra_covariates:
+        Covariates from outside the export (``latent-sensitivity``: the
+        technical table's fractions): a table with a ``donor_id`` column and
+        one column per covariate, merged by ``donor_id`` after the log10
+        derivation and appended after ``ANALYSIS_COVARIATES`` in its column
+        order. Every export donor needs a row (extra rows are ignored).
+        ``None`` (the default) gives the metadata table of the ``analyze`` step.
 
     Returns
     -------
     dict
         ``blocks`` (omic → donors × features DataFrame, read as ``motco analyze``
         reads ``--block`` files), ``metadata`` (design columns plus
-        ``ANALYSIS_COVARIATES``, one row per donor sorted by ``donor_id``),
-        ``export_manifest`` and ``inputs`` (file → path and sha256).
+        ``ANALYSIS_COVARIATES`` and the extra covariates, one row per donor
+        sorted by ``donor_id``), ``export_manifest`` and ``inputs`` (file →
+        path and sha256 of the five export files).
 
     Raises
     ------
     FileNotFoundError
         The cohort directory or one of its five files is missing.
     ValueError
-        The tables list different donors or disagree with the export manifest.
+        The tables list different donors or disagree with the export manifest;
+        or ``extra_covariates`` lacks ``donor_id``, repeats a donor, has no row
+        for an export donor, or names a column the metadata table already has.
 
     Notes
     -----
@@ -4549,6 +4572,21 @@ def load_analysis_inputs(cohort_dir: str | Path) -> dict:
             raise ValueError(f"{d / 'covariates.csv'}: {source} must be positive for log10; donor(s) {sorted(bad)}")
         merged[derived] = np.log10(counts)
     merged = merged[list(_ANALYSIS_DESIGN_COLUMNS) + list(ANALYSIS_COVARIATES)]
+    if extra_covariates is not None:
+        extra = extra_covariates.copy()
+        if "donor_id" not in extra.columns:
+            raise ValueError("extra_covariates lacks a donor_id column")
+        extra["donor_id"] = extra["donor_id"].astype(str)
+        clash = [c for c in extra.columns if c != "donor_id" and c in merged.columns]
+        if clash:
+            raise ValueError(f"extra_covariates column(s) {clash} are already in the metadata table of {d}")
+        repeated = sorted(extra.loc[extra["donor_id"].duplicated(), "donor_id"].unique())
+        if repeated:
+            raise ValueError(f"extra_covariates: repeated donor_id(s) {repeated}")
+        absent = sorted(set(donors) - set(extra["donor_id"]))
+        if absent:
+            raise ValueError(f"extra_covariates has no row for export donor(s) {absent} of {d}")
+        merged = merged.merge(extra, on="donor_id", how="left", validate="one_to_one")
     merged = merged.sort_values("donor_id").reset_index(drop=True)
     return {"blocks": blocks, "metadata": merged, "export_manifest": manifest, "inputs": inputs}
 
@@ -4577,7 +4615,11 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         For a forced-rank record (``latent.component_selection == "forced"``)
         the ``angle`` row names the forced rank and says the CV-selected
         analysis is primary, and the latent block says cross-validation was
-        skipped; the output for CV records is unchanged.
+        skipped; the output for CV records is unchanged. A record with a
+        ``latent_adjustment`` block (MOTCO ≥ 0.9.0) gets a "Latent adjustment"
+        section (conditioning, residual df, smallest CV training df, median
+        feature R² and the fraction above 0.5); records without one are
+        rendered as before.
     """
     design = record["design"]
     meas = record["measurement"]
@@ -4662,11 +4704,31 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
             "|---|---:|",
         ]
         lines += [f"| {c} | {_fmt(v)} |" for c, v in cov["reference_row"].items()]
+    adjustment = record.get("latent_adjustment")
+    if adjustment is not None:
+        r2 = adjustment.get("feature_r2", {})
+        lines += [
+            "",
+            "## Latent adjustment",
+            "",
+            f"- basis fitted on the {adjustment['feature_scale']} features residualized on the covariates "
+            + ", ".join(f"`{c}`" for c in adjustment["covariates"])
+            + f", conditional on `{adjustment['conditioning']}`; the trajectory model, LS-means and RRPP are those "
+            "of the covariate block above",
+            f"- residualization design columns beyond the intercept: {len(adjustment['design_columns'])} ("
+            + ", ".join(adjustment["design_columns"]) + f"); n = {adjustment['n_samples']}",
+            f"- residual df: {adjustment['residual_df']}; smallest CV training df: "
+            + ("n/a (rank forced)" if adjustment.get("cv_min_training_df") is None else str(adjustment["cv_min_training_df"])),
+            f"- per-feature partial R² of the covariates given the conditioning: median {_fmt(r2.get('q50'), '.4f')}, "
+            f"fraction above 0.5 {_fmt(r2.get('fraction_above_0.5'), '.4f')}",
+        ]
     return "\n".join(lines) + "\n"
 
 
-def _cli_equivalent(cohort_dir: Path, metadata_path: Path, params, n_jobs: int) -> dict:
-    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank)."""
+def _cli_equivalent(
+    cohort_dir: Path, metadata_path: Path, params, n_jobs: int, *, covariates: Iterable[str] = ANALYSIS_COVARIATES,
+) -> dict:
+    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank, optionally latent-adjusted)."""
     import shlex
 
     argv = ["motco", "analyze"]
@@ -4677,10 +4739,13 @@ def _cli_equivalent(cohort_dir: Path, metadata_path: Path, params, n_jobs: int) 
         "--sample-col", "donor_id", "--group-col", "sex", "--stage-col", "stage",
         "--stage-order", ",".join(STAGES),
     ]
-    for c in ANALYSIS_COVARIATES:
+    for c in covariates:
         argv += ["--covariate", c]
+    argv += ["--missing-covariates", ANALYSIS_MISSING_COVARIATES]
+    latent = getattr(params, "covariate_latent_adjustment", None)
+    if latent is not None:
+        argv += ["--latent-adjustment", latent]
     argv += [
-        "--missing-covariates", ANALYSIS_MISSING_COVARIATES,
         "--permutations", str(params.permutations), "--seed", str(params.seed), "--n-jobs", str(n_jobs),
         "--orientation-estimator", params.orientation_estimator,
     ]
@@ -4713,12 +4778,18 @@ def _analyze_cohort(
     findings: list[str] | None = None,
     published_dir: Path | None = None,
     log_prefix: str = "analyze",
+    covariates: Iterable[str] = ANALYSIS_COVARIATES,
+    covariate_sources: dict[str, str] | None = None,
+    extra_inputs: dict | None = None,
 ) -> dict:
     """Run MOTCO on one loaded cohort and write a complete analysis directory.
 
-    Shared by ``run_analysis`` (CV-selected rank) and ``run_rank_sensitivity``
-    (forced rank): the two differ only in ``params`` and in where the directory
-    goes, so a forced-rank directory is a CV directory with one setting changed.
+    Shared by ``run_analysis`` (CV-selected rank), ``run_rank_sensitivity``
+    (forced rank), ``run_preprocessing_sensitivity`` (a variant export) and
+    ``run_latent_sensitivity`` (another covariate set, optionally with the
+    latent adjustment): they differ only in ``params``, the covariate set and
+    where the directory goes, so every directory is a primary directory with
+    the named setting(s) changed.
 
     Parameters
     ----------
@@ -4727,10 +4798,15 @@ def _analyze_cohort(
     cohort_dir:
         The export directory the inputs were read from.
     loaded:
-        ``load_analysis_inputs(cohort_dir)``.
+        ``load_analysis_inputs(cohort_dir)`` (with ``extra_covariates`` when
+        ``covariates`` goes beyond ``ANALYSIS_COVARIATES``).
     params:
         ``motco.analysis.TrajectoryAnalysisParams``; ``forced_components`` set
-        for a forced-rank run, ``None`` for CV rank selection.
+        for a forced-rank run, ``None`` for CV rank selection;
+        ``covariate_latent_adjustment`` set for a latent-adjusted run (recorded
+        as ``measurement.latent_adjustment`` and ``--latent-adjustment`` in
+        ``cli_equivalent``; both absent when it is ``None``, as MOTCO leaves
+        the setting out of its record).
     out_dir:
         The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
         to ``<out_dir>/<final_name>`` when complete.
@@ -4747,6 +4823,17 @@ def _analyze_cohort(
         under ``<cohort>.tmp/`` first); used for ``cli_equivalent``.
     log_prefix:
         Prefix of the progress lines, ``[analyze]`` by default.
+    covariates:
+        The covariates entered, additively and in this order; columns of
+        ``loaded["metadata"]``. ``ANALYSIS_COVARIATES`` by default.
+    covariate_sources:
+        Covariate → where it comes from, for covariates outside the export;
+        recorded as ``covariates.sources`` (absent when ``None``).
+    extra_inputs:
+        Inputs beside the five export files (``latent-sensitivity``: the
+        technical table), merged into the manifest's ``inputs`` block next to
+        ``files``, which stays the five export files so ``axis-diagnostics``
+        can check the directory against the export.
 
     Returns
     -------
@@ -4760,20 +4847,25 @@ def _analyze_cohort(
     from motco.analysis import OmicsBlock, TrajectoryDataset, analyze_trajectories, write_analysis_outputs
 
     motco_version = check_motco_version()
+    covariates = tuple(covariates)
     blocks = loaded["blocks"]
     export_manifest = loaded["export_manifest"]
     final = out_dir / final_name
     published = Path(published_dir) if published_dir is not None else final
+    absent = [c for c in covariates if c not in loaded["metadata"].columns]
+    if absent:
+        raise ValueError(f"covariate(s) {absent} are not in the metadata table loaded from {cohort_dir}")
     # Parse the table back as `motco analyze --metadata` does, so the
     # CLI-equivalent run sees exactly what this one sees
     metadata_csv = loaded["metadata"].to_csv(index=False)
     metadata = pd.read_csv(io.StringIO(metadata_csv))
     metadata["donor_id"] = metadata["donor_id"].astype(str)
     forced = params.forced_components
+    latent = getattr(params, "covariate_latent_adjustment", None)
     print(
         f"[{log_prefix}] {cohort}: {len(metadata)} donors, "
         + " + ".join(f"{b.shape[1]} {o}" for o, b in blocks.items())
-        + f" features, covariates {', '.join(ANALYSIS_COVARIATES)}"
+        + f" features, covariates {', '.join(covariates)}"
     )
 
     dataset = TrajectoryDataset(
@@ -4783,10 +4875,12 @@ def _analyze_cohort(
         group_col="sex",
         stage_col="stage",
         stage_order=STAGES,
-        covariate_cols=ANALYSIS_COVARIATES,
+        covariate_cols=covariates,
         missing_covariates=ANALYSIS_MISSING_COVARIATES,
     )
     selection = "CV rank selection" if forced is None else f"forced rank {forced}"
+    if latent is not None:
+        selection += f" with the {latent}-conditioned covariate latent adjustment"
     print(f"[{log_prefix}] {cohort}: {selection} + {params.permutations} RRPP permutations (n_jobs {n_jobs})...")
     result = analyze_trajectories(dataset, params)
     record = result.record
@@ -4836,6 +4930,7 @@ def _analyze_cohort(
             "export_manifest_sha256": loaded["inputs"]["manifest.json"]["sha256"],
             "export_manifest_created_at": export_manifest.get("created_at"),
             "export_git": export_manifest.get("git"),
+            **(extra_inputs or {}),
         },
         "model": {
             "entry_point": "motco.analysis.analyze_trajectories",
@@ -4875,8 +4970,9 @@ def _analyze_cohort(
             "export_findings": export_manifest.get("findings", []),
         },
         "covariates": {
-            "entered": list(ANALYSIS_COVARIATES),
+            "entered": list(covariates),
             "derived": {name: f"log10({src})" for name, src in ANALYSIS_LOG10_COLUMNS.items()},
+            **({"sources": dict(covariate_sources)} if covariate_sources else {}),
             "excluded": dict(ANALYSIS_EXCLUDED_COVARIATES),
             "missing_policy": ANALYSIS_MISSING_COVARIATES,
             "imputed": False,
@@ -4894,6 +4990,7 @@ def _analyze_cohort(
                     "random_state": params.random_state,
                 }}
             ),
+            **({"latent_adjustment": latent} if latent is not None else {}),
             "permutations": params.permutations,
             "seed": params.seed,
             "alpha": ANALYSIS_ALPHA,
@@ -4902,7 +4999,9 @@ def _analyze_cohort(
             "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
             "attribution": False,
         },
-        "cli_equivalent": _cli_equivalent(cohort_dir, published / "analysis_metadata.csv", params, n_jobs),
+        "cli_equivalent": _cli_equivalent(
+            cohort_dir, published / "analysis_metadata.csv", params, n_jobs, covariates=covariates
+        ),
         "outputs": sorted([p.name for p in written.values()] + [
             "analysis_metadata.csv", "summary.md", "analysis_manifest.json",
         ]),
@@ -5799,7 +5898,7 @@ def _check_technical_reference(pseudobulk_dir: str | Path, *, donors: Iterable[s
         bad = [d for d, v in zip(donors, values) if not np.isfinite(v)]
         if bad:
             raise ValueError(
-                f"{table_path}: column {col!r} is missing for cohort donor(s) {bad}; a variant that reads the "
+                f"{table_path}: column {col!r} is missing for cohort donor(s) {bad}; a variant or arm that reads the "
                 "technical table needs every value for every cohort donor (nothing is imputed); nothing was written"
             )
     files = {
@@ -7946,6 +8045,750 @@ def run_axis_diagnostics(
     return results
 
 
+# ---------------------------------------------------------------------------
+# MOTCO latent-adjustment sensitivity (covariate set and latent basis beside the primary analysis)
+# ---------------------------------------------------------------------------
+
+# MOTCO's covariate_latent_adjustment (covariate-aware latent construction)
+LATENT_MOTCO_MIN_VERSION = "0.9.0"
+# Added after ANALYSIS_COVARIATES, in this order, on the raw fraction scale of
+# donor_technical.csv (the scale of the `residualized` variant): the two
+# fractions the technical-axis report classified as residualization candidates
+# (between-donor share dominant, within-donor supertype share small), i.e.
+# RESIDUALIZATION_COVARIATES without the export's log10 library sizes (the
+# nuclei counts already enter; MOTCO's Type I check used eight covariates).
+# A constant, never a flag, never chosen from results; flag and ask before changing.
+LATENT_SENSITIVITY_ADDED_COVARIATES = ("ribosomal_pseudobulk", "mitochondrial_pseudobulk")
+LATENT_SENSITIVITY_COVARIATES = ANALYSIS_COVARIATES + LATENT_SENSITIVITY_ADDED_COVARIATES
+if LATENT_SENSITIVITY_ADDED_COVARIATES != tuple(c for c in RESIDUALIZATION_COVARIATES if not c.startswith("log10_lib_")):
+    raise AssertionError(
+        f"LATENT_SENSITIVITY_ADDED_COVARIATES {LATENT_SENSITIVITY_ADDED_COVARIATES} must equal RESIDUALIZATION_COVARIATES "
+        f"without log10_lib_* ({RESIDUALIZATION_COVARIATES}); a change to one set is a change to both"
+    )
+# MOTCO's admissible conditioning (Type I adopt_stage); group_stage is not run
+LATENT_SENSITIVITY_CONDITIONING = "stage"
+# The arms, a registry and not a flag, each run once per cohort on the primary
+# export with every other analysis setting equal to the primary's. The primary
+# analysis (six covariates, covariate-blind basis) is the reference row and
+# stays primary; primary → extended_covariates is the effect of the covariate
+# set, extended_covariates → latent_adjusted the effect of the basis alone.
+LATENT_SENSITIVITY_ARMS: dict[str, dict] = {
+    "extended_covariates": {
+        "description": (
+            "the six analysis covariates plus the ribosomal and mitochondrial pseudobulk fractions of the technical "
+            "table, entered additively in the trajectory model; covariate-blind latent basis (no latent adjustment)"
+        ),
+        "covariates": LATENT_SENSITIVITY_COVARIATES,
+        "latent_adjustment": None,
+    },
+    "latent_adjusted": {
+        "description": (
+            "the same eight covariates, with the latent basis fitted on features residualized on them conditional on "
+            "stage (MOTCO's covariate_latent_adjustment = 'stage'); trajectory model, LS-means and RRPP as in "
+            "extended_covariates"
+        ),
+        "covariates": LATENT_SENSITIVITY_COVARIATES,
+        "latent_adjustment": LATENT_SENSITIVITY_CONDITIONING,
+    },
+}
+LATENT_SENSITIVITY_REFERENCE_LABEL = "primary"
+# Layout under <out_dir>: <arm>/motco_analysis/<cohort>/ mirrors results/motco_analysis
+# so axis-diagnostics and rank-sensitivity can read an arm; comparison/<cohort>/
+LATENT_SENSITIVITY_ANALYSIS_DIR = "motco_analysis"
+LATENT_SENSITIVITY_COMPARISON_DIR = "comparison"
+LATENT_SENSITIVITY_TABLE = "latent_sensitivity.csv"
+LATENT_SENSITIVITY_MARKDOWN = "latent_sensitivity.md"
+LATENT_SENSITIVITY_MANIFEST = "latent_sensitivity_manifest.json"
+LATENT_SENSITIVITY_MEDIATOR_TABLE = "mediator_check.csv"
+# MOTCO's latent_adjustment.feature_r2 key → latent_sensitivity.csv column suffix
+LATENT_SENSITIVITY_FEATURE_R2: dict[str, str] = {
+    "q05": "q05", "q25": "q25", "q50": "q50", "q75": "q75", "q95": "q95", "mean": "mean",
+    "fraction_above_0.5": "frac_gt_0_5",
+}
+_MEDIATOR_SUBSETS: dict[str, str | None] = {"all": None, "F": "Female", "M": "Male"}
+
+
+def mediator_check(
+    technical: pd.DataFrame,
+    metadata: pd.DataFrame,
+    columns: Iterable[str] = LATENT_SENSITIVITY_ADDED_COVARIATES,
+    *,
+    cohort: str,
+    threshold: float = DIAGNOSTIC_CORRELATION_THRESHOLD,
+) -> pd.DataFrame:
+    """Spearman correlation of each added covariate with stage, over all donors and within each sex.
+
+    Parameters
+    ----------
+    technical:
+        A table with ``donor_id`` and the ``columns`` (``donor_technical.csv``).
+    metadata:
+        The cohort's design table (``donor_id``, ``sex`` as ``Female`` /
+        ``Male``, ``stage`` as ``0`` / ``1`` / ``2``); its donors are the rows used.
+    columns:
+        The covariates checked, in output order.
+    cohort:
+        Written in the ``cohort`` column.
+    threshold:
+        A cell with ``|ρ| >= threshold`` is flagged as a mediator candidate
+        (``DIAGNOSTIC_CORRELATION_THRESHOLD``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per covariate × subset (``all``, ``F``, ``M``): ``cohort``,
+        ``covariate``, ``subset``, ``n`` (pairwise-complete donors),
+        ``spearman`` (NaN with fewer than three donors or a constant) and
+        ``flagged``.
+
+    Notes
+    -----
+    Predeclared and written before any arm runs. No p-value is computed, and
+    the correlation is not partial on the analysis covariates: the question is
+    whether the fraction moves with stage at all. A flag removes no covariate,
+    changes no arm and stops no run; it binds the report to say that the
+    ``latent_adjusted`` basis may have removed stage signal carried by that
+    fraction (no simulation can tell a confounder from a mediator).
+    """
+    meta = metadata[["donor_id", "sex", "stage"]].copy()
+    meta["donor_id"] = meta["donor_id"].astype(str)
+    unknown = sorted(set(meta["sex"].astype(str)) - {s for s in _MEDIATOR_SUBSETS.values() if s})
+    if unknown:
+        raise ValueError(f"mediator_check: sex label(s) {unknown} are neither Female nor Male")
+    tech = technical.copy()
+    tech["donor_id"] = tech["donor_id"].astype(str)
+    tech = tech.set_index("donor_id")
+    absent = sorted(set(meta["donor_id"]) - set(tech.index))
+    if absent:
+        raise ValueError(f"mediator_check: the technical table has no row for donor(s) {absent}")
+    stage = meta["stage"].astype(int).to_numpy(dtype=float)
+    sex = meta["sex"].astype(str).to_numpy()
+    rows = []
+    for col in columns:
+        values = pd.to_numeric(tech.loc[meta["donor_id"], col], errors="coerce").to_numpy(dtype=float)
+        for subset, label in _MEDIATOR_SUBSETS.items():
+            keep = np.ones(len(meta), dtype=bool) if label is None else sex == label
+            rho, n = spearman(values[keep], stage[keep])
+            rows.append({
+                "cohort": cohort,
+                "covariate": col,
+                "subset": subset,
+                "n": n,
+                "spearman": rho,
+                "flagged": bool(np.isfinite(rho) and abs(rho) >= threshold),
+            })
+    return pd.DataFrame(rows, columns=["cohort", "covariate", "subset", "n", "spearman", "flagged"])
+
+
+def _latent_row(record: dict, *, arm: str, cohort: str, directory: str) -> dict:
+    """``_sensitivity_row`` with the arm, covariate set, conditioning and latent-adjustment block.
+
+    The latent-adjustment columns are ``None`` (empty in the CSV) for a record
+    without MOTCO's ``latent_adjustment`` block; ``conditioning`` is ``none``.
+    """
+    base = _sensitivity_row(
+        record, cohort=cohort, component_selection=record["latent"]["component_selection"], directory=directory
+    )
+    adjustment = record.get("latent_adjustment")
+    row = {
+        "arm": arm,
+        "cohort": base.pop("cohort"),
+        "component_selection": base.pop("component_selection"),
+        "rank": base.pop("rank"),
+        "covariates": ";".join((record.get("covariates") or {}).get("columns", [])),
+        "conditioning": "none" if adjustment is None else adjustment["conditioning"],
+    }
+    directory = base.pop("dir")
+    row.update(base)
+    row["residual_df"] = None if adjustment is None else adjustment["residual_df"]
+    row["cv_min_training_df"] = None if adjustment is None else adjustment["cv_min_training_df"]
+    r2 = {} if adjustment is None else adjustment.get("feature_r2", {})
+    for key, suffix in LATENT_SENSITIVITY_FEATURE_R2.items():
+        row[f"feature_r2_{suffix}"] = r2.get(key)
+    row["dir"] = directory
+    return row
+
+
+def render_latent_sensitivity(
+    rows: list[dict],
+    mediator: pd.DataFrame,
+    *,
+    cohort: str,
+    seed: int = ANALYSIS_SEED,
+    permutations: int = ANALYSIS_PERMUTATIONS,
+    alpha: float = ANALYSIS_ALPHA,
+    threshold: float = DIAGNOSTIC_CORRELATION_THRESHOLD,
+    findings: list[str] | None = None,
+) -> str:
+    """Render ``latent_sensitivity.md`` from the rows of ``latent_sensitivity.csv`` and the mediator check.
+
+    Parameters
+    ----------
+    rows:
+        ``_latent_row`` dicts: the primary (reference) row first, then the arms
+        in ``LATENT_SENSITIVITY_ARMS`` order.
+    mediator:
+        ``mediator_check`` output for the cohort.
+    cohort:
+        Cohort name for the title.
+    seed, permutations, alpha, threshold:
+        Named in the text; a statistic is rejected when ``p <= alpha``.
+    findings:
+        The comparison's findings, listed at the end.
+
+    Returns
+    -------
+    str
+        Markdown: a header with the arms and the reading rules, one table per
+        statistic (observed, p, rejected, null mean / sd / q95 per row), a run
+        table (selection, rank, CV AUROC, covariates, conditioning, runtime,
+        directory), the latent-adjustment block of the adjusted arm(s), the
+        mediator check with flagged rows first, and the findings. Every number
+        comes from the rows and the mediator table; the runtimes are the one
+        thing here that is not in ``latent_sensitivity.csv``.
+    """
+    ref = rows[0]
+    added = ", ".join(f"`{c}`" for c in LATENT_SENSITIVITY_ADDED_COVARIATES)
+    lines = [
+        f"# MOTCO latent-adjustment sensitivity: {cohort}",
+        "",
+        f"Covariate-set and latent-basis sensitivity of the covariate-adjusted trajectory analysis. The "
+        f"`{ref['arm']}` row is the primary analysis (CV-selected rank {ref['rank']}, the six analysis covariates, "
+        "covariate-blind basis), read from its `result.json` and never rerun; it stays the primary result, and "
+        "MOTCO's power comparison (`candidate_fails`) excludes the latent adjustment as its replacement. "
+        f"`extended_covariates` adds {added} (raw fractions from `donor_technical.csv`) with the covariate-blind "
+        f"basis; `latent_adjusted` enters the same eight covariates and fits the basis on features residualized on "
+        f"them conditional on `{LATENT_SENSITIVITY_CONDITIONING}`, with the trajectory model, LS-means and RRPP of "
+        "`extended_covariates`, so those two rows differ through the basis and the CV-selected rank only. Both arms "
+        "are read as sensitivity, never as the result: a rejection status that differs between `primary` and "
+        "`extended_covariates` is covariate-set dependence, one that differs between `extended_covariates` and "
+        "`latent_adjusted` is basis dependence; a CV-selected rank that differs is reported beside `angle`, not read "
+        "as better or worse; `angle` and `shape` non-rejections are uninformative and a `delta` rejection is a "
+        f"difference, not specifically of size, in every row. {permutations} RRPP permutations with seed {seed} in "
+        f"every row (the same permutation indices); α = {alpha} (rejected when p ≤ α). MOTCO measured the latent "
+        "adjustment's operating characteristics at its Phase 6 design only (Type I `adopt_stage`; power "
+        "`candidate_fails`, with `shape` power lost under a nuisance axis and small-magnitude power lost without "
+        "one), on neither these blocks nor this eight-covariate set, so neither arm carries a Type I or power claim "
+        "of its own.",
+    ]
+    for s in ANALYSIS_STATISTICS:
+        lines += [
+            "",
+            f"## {s}" + (" (degrees)" if s == "angle" else ""),
+            "",
+            "| arm | covariates | conditioning | rank | observed | p (RRPP) | rejected | null mean | null sd | null q95 |",
+            "|---|---:|---|---:|---:|---:|:---:|---:|---:|---:|",
+        ]
+        for r in rows:
+            rejected = r[f"{s}_rejected"]
+            n_cov = len(r["covariates"].split(";")) if r["covariates"] else 0
+            lines.append(
+                f"| {r['arm']} | {n_cov} | {r['conditioning']} | {r['rank']} | {_fmt(r[s])} | "
+                f"{_fmt(r[f'{s}_p'], '.4g')} | {'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
+                f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
+            )
+    lines += [
+        "",
+        "## Runs",
+        "",
+        "| arm | selection | rank | cv_mean_auroc | covariates (in order) | conditioning | runtime (s) | directory |",
+        "|---|---|---:|---:|---|---|---:|---|",
+    ]
+    for r in rows:
+        covs = ", ".join(f"`{c}`" for c in r["covariates"].split(";")) if r["covariates"] else "none"
+        lines.append(
+            f"| {r['arm']} | {r['component_selection']} | {r['rank']} | {_fmt(r['cv_mean_auroc'], '.4f')} | {covs} | "
+            f"{r['conditioning']} | {_fmt(r['runtime_seconds'], '.1f')} | `{r['dir']}` |"
+        )
+    adjusted = [r for r in rows if r["conditioning"] != "none"]
+    if adjusted:
+        suffixes = list(LATENT_SENSITIVITY_FEATURE_R2.values())
+        labels = {"frac_gt_0_5": "fraction > 0.5"}
+        lines += [
+            "",
+            "## Latent adjustment",
+            "",
+            "MOTCO's `latent_adjustment` block: the residualization's degrees of freedom on the full sample "
+            "(`n − 1 − k − q`) and the smallest over the CV training sets, and the quantiles over features of the "
+            "partial R² of the covariates given the intercept and the conditioning indicators (pooled-standardized "
+            "features).",
+            "",
+            "| arm | conditioning | residual df | smallest CV training df | "
+            + " | ".join(f"R² {labels.get(x, x)}" for x in suffixes) + " |",
+            "|---|---|---:|---:|" + "---:|" * len(suffixes),
+        ]
+        for r in adjusted:
+            lines.append(
+                f"| {r['arm']} | {r['conditioning']} | {_fmt(r['residual_df'], 'd')} | "
+                f"{'n/a' if r['cv_min_training_df'] is None else _fmt(r['cv_min_training_df'], 'd')} | "
+                + " | ".join(_fmt(r[f"feature_r2_{x}"], ".4f") for x in suffixes) + " |"
+            )
+    flagged = mediator[mediator["flagged"]]
+    ordered = pd.concat([flagged, mediator[~mediator["flagged"]]])
+    lines += [
+        "",
+        "## Mediator check",
+        "",
+        "Spearman correlation of each added covariate with stage (ordinal 0, 1, 2) over all cohort donors and within "
+        f"each sex, written before the arms ran; |ρ| ≥ {threshold} (`DIAGNOSTIC_CORRELATION_THRESHOLD`) flags a "
+        "mediator candidate (flagged rows first). No p-value is computed, and a flag removes no covariate and changes "
+        "no arm: no simulation can tell a confounder from a mediator, so a flagged fraction may carry stage signal "
+        "that the `latent_adjusted` basis removed (and that the covariate adjustment of both arms absorbed).",
+        "",
+        "| covariate | subset | n | Spearman | flagged |",
+        "|---|---|---:|---:|:---:|",
+    ]
+    for _, r in ordered.iterrows():
+        lines.append(
+            f"| `{r['covariate']}` | {r['subset']} | {r['n']} | {_fmt_nan(r['spearman'], '.3f')} | "
+            f"{'yes' if r['flagged'] else 'no'} |"
+        )
+    lines += ["", "## Findings", ""]
+    lines += [f"- {msg}" for msg in (findings or [])] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    """Whether ``a`` is ``b`` or lies inside it (resolved paths)."""
+    a, b = a.resolve(), b.resolve()
+    return a == b or b in a.parents
+
+
+def run_latent_sensitivity(
+    cohort: str = "all",
+    *,
+    input_dir: str | Path = "results/motco_input",
+    analysis_dir: str | Path = "results/motco_analysis",
+    pseudobulk_dir: str | Path = "results/pseudobulk",
+    out_dir: str | Path = "results/motco_latent_sensitivity",
+    n_jobs: int = 1,
+    force: bool = False,
+) -> dict:
+    """Rerun the primary analysis with the extended covariate set, without and with the latent adjustment.
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    input_dir:
+        Export root of the ``export`` step; ``<input_dir>/<cohort>/`` is the
+        primary export, read, never written. Both arms run on it.
+    analysis_dir:
+        Analysis root of the ``analyze`` step; ``<analysis_dir>/<cohort>/`` is
+        the primary analysis (the reference row), read and checked, never
+        rerun or written.
+    pseudobulk_dir:
+        Directory holding ``manifest.json``, ``donor_technical.csv`` and
+        ``technical_manifest.json`` (read, never written).
+    out_dir:
+        Output root: ``<out_dir>/<arm>/motco_analysis/<cohort>/`` per arm of
+        ``LATENT_SENSITIVITY_ARMS`` (the files ``analyze`` writes) and
+        ``<out_dir>/comparison/<cohort>/`` (``latent_sensitivity.csv``,
+        ``latent_sensitivity.md``, ``mediator_check.csv``,
+        ``latent_sensitivity_manifest.json``). It may not lie inside an input
+        directory.
+    n_jobs:
+        Parallel jobs for MOTCO's CV and RRPP (``-1`` = all CPUs); as in
+        ``run_analysis``, values other than 1 change the permutation draws and
+        are recorded as a finding. The reported results use 1.
+    force:
+        Replace a cohort's existing arm and comparison directories.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir", "arms" (arm → _analyze_cohort result), "reference",
+        "technical", "rows", "table", "mediator", "manifest", "findings"}``.
+
+    Raises
+    ------
+    RuntimeError
+        The installed MOTCO is older than ``LATENT_MOTCO_MIN_VERSION`` (raised
+        before any input is read).
+    FileExistsError
+        A cohort's arm or comparison directory exists and ``force`` is false.
+    FileNotFoundError
+        The primary export, the primary analysis, the pseudobulk manifest or
+        the technical table (or its manifest) is missing; the message names
+        the file and the command that produces it.
+    ValueError
+        The primary analysis does not match the export, the installed MOTCO,
+        the seed, the permutations or the CV selection (``_check_reference``);
+        the technical table does not match the pseudobulk manifest or
+        ``TECHNICAL_GENE_SETS``, or lacks an added covariate for a cohort donor
+        (``_check_technical_reference``); or ``out_dir`` lies inside an input
+        directory.
+
+    Notes
+    -----
+    Every check runs for every requested cohort before anything is written.
+    Per cohort, ``mediator_check.csv`` is written to
+    ``comparison/<cohort>.tmp/`` before the first arm runs; each arm is one
+    ``_analyze_cohort`` call on the primary export with
+    ``covariates = LATENT_SENSITIVITY_COVARIATES``, the fractions merged from
+    the technical table (``load_analysis_inputs(extra_covariates=...)``) and
+    ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
+    seed=ANALYSIS_SEED, n_jobs=n_jobs, covariate_latent_adjustment=...)``, so
+    everything else equals ``analyze`` (blocks, stage order, orientation, CV
+    rank selection, seed, permutations). The arm manifests record the five
+    export files as ``inputs.files`` (so ``axis-diagnostics`` can read an arm
+    against the primary export) and the technical table under
+    ``inputs.technical``. The arms are written as ``<cohort>.tmp/`` and the
+    three directories renamed once the comparison is complete; on any error
+    the cohort's temporaries are removed.
+    """
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    log = "latent-sensitivity"
+    motco_version = check_motco_version(
+        required=LATENT_MOTCO_MIN_VERSION, purpose="latent-sensitivity needs", feature="covariate_latent_adjustment"
+    )
+    from motco.analysis import TrajectoryAnalysisParams
+
+    input_dir, analysis_dir = Path(input_dir), Path(analysis_dir)
+    pb, out_dir = Path(pseudobulk_dir), Path(out_dir)
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    for name, d in (("--input-dir", input_dir), ("--analysis-dir", analysis_dir), ("--pseudobulk-dir", pb)):
+        if _same_dir(out_dir, d):
+            raise ValueError(
+                f"the output directory {out_dir} lies inside the input directory {d} ({name}); the step never "
+                "writes under its inputs; nothing was written"
+            )
+    arms = list(LATENT_SENSITIVITY_ARMS)
+    for c in cohorts:
+        targets = [out_dir / LATENT_SENSITIVITY_COMPARISON_DIR / c] + [
+            out_dir / arm / LATENT_SENSITIVITY_ANALYSIS_DIR / c for arm in arms
+        ]
+        for t in targets:
+            if t.exists() and not force:
+                raise FileExistsError(
+                    f"{t} exists; rerun with --force to replace the arms and the comparison of {c}; nothing was written"
+                )
+    for c in cohorts:
+        if not (input_dir / c).is_dir():
+            raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce the primary export")
+        if not (analysis_dir / c).is_dir():
+            raise FileNotFoundError(
+                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze` to produce the primary analysis"
+            )
+    if not (pb / "manifest.json").exists():
+        raise FileNotFoundError(
+            f"{pb / 'manifest.json'} is missing; run `sead-sexdiff pseudobulk` on the cluster and sync results/pseudobulk/ "
+            "(scripts/sync_pseudobulk.sh) to produce it"
+        )
+    print(f"[{log}] MOTCO {motco_version} (latent adjustment needs >= {LATENT_MOTCO_MIN_VERSION})")
+    print(f"[{log}] Primary export directory: {input_dir}")
+    print(f"[{log}] Primary analysis directory: {analysis_dir}")
+    print(f"[{log}] Pseudobulk directory: {pb}")
+    print(f"[{log}] Output directory: {out_dir}")
+    print(
+        f"[{log}] Arms: {', '.join(arms)} (registry LATENT_SENSITIVITY_ARMS; covariates "
+        f"{', '.join(LATENT_SENSITIVITY_COVARIATES)}; the primary analysis stays primary)"
+    )
+
+    params = {
+        arm: TrajectoryAnalysisParams(
+            permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
+            covariate_latent_adjustment=spec["latent_adjustment"],
+        )
+        for arm, spec in LATENT_SENSITIVITY_ARMS.items()
+    }
+    # Check every cohort's primary export, primary analysis and technical table before writing anything
+    prepared = {}
+    for c in cohorts:
+        cohort_dir = input_dir / c
+        loaded = load_analysis_inputs(cohort_dir)
+        reference = _check_reference(cohort_dir, analysis_dir / c, loaded["inputs"], motco_version)
+        meas = reference["manifest"].get("measurement", {})
+        for arm, p in params.items():
+            used = {
+                "orientation_estimator": p.orientation_estimator,
+                "cv": {
+                    "cv1_splits": p.cv1_splits, "cv2_splits": p.cv2_splits, "n_repeats": p.n_repeats,
+                    "max_components": p.max_components, "random_state": p.random_state,
+                },
+            }
+            for key, want in used.items():
+                if meas.get(key) != want:
+                    raise ValueError(
+                        f"{reference['dir'] / 'analysis_manifest.json'} records {key} = {meas.get(key)!r} but the "
+                        f"{arm} arm would use {want!r}; the arms must use the primary analysis's settings; rerun "
+                        "`sead-sexdiff analyze`; nothing was written"
+                    )
+        donors = loaded["metadata"]["donor_id"].tolist()
+        technical = _check_technical_reference(pb, donors=donors, columns=LATENT_SENSITIVITY_ADDED_COVARIATES)
+        extra = technical["table"][["donor_id", *LATENT_SENSITIVITY_ADDED_COVARIATES]].copy()
+        extra["donor_id"] = extra["donor_id"].astype(str)
+        extra = extra[extra["donor_id"].isin(donors)]
+        for col in LATENT_SENSITIVITY_ADDED_COVARIATES:
+            extra[col] = pd.to_numeric(extra[col], errors="raise").astype(float)
+        loaded_arms = load_analysis_inputs(cohort_dir, extra_covariates=extra)
+        if loaded_arms["inputs"] != loaded["inputs"]:
+            raise ValueError(f"the export files under {cohort_dir} changed while they were read; nothing was written")
+        ref_rank = reference["record"]["latent"]["selected_lv"]
+        print(
+            f"[{log}] {c}: primary analysis {reference['dir']} (CV-selected rank {ref_rank}; hashes and settings "
+            f"match); technical table {pb / TECHNICAL_OUTPUTS['table']} matches the pseudobulk manifest and "
+            f"TECHNICAL_GENE_SETS and is complete for {len(donors)} donors × "
+            f"{len(LATENT_SENSITIVITY_ADDED_COVARIATES)} added covariates"
+        )
+        prepared[c] = {"loaded": loaded_arms, "reference": reference, "technical": technical}
+
+    software = _software_versions()
+    software["motco"] = motco_version
+    try:
+        software["scikit-learn"] = version("scikit-learn")
+    except PackageNotFoundError:
+        software["scikit-learn"] = None
+    sources = {
+        col: f"{pb / TECHNICAL_OUTPUTS['table']} (raw fraction scale; checked by _check_technical_reference)"
+        for col in LATENT_SENSITIVITY_ADDED_COVARIATES
+    }
+
+    results = {}
+    for c in cohorts:
+        prep = prepared[c]
+        loaded, reference, technical = prep["loaded"], prep["reference"], prep["technical"]
+        cohort_dir = input_dir / c
+        comp_root = out_dir / LATENT_SENSITIVITY_COMPARISON_DIR
+        comp_tmp = comp_root / f"{c}.tmp"
+        arm_roots = {arm: out_dir / arm / LATENT_SENSITIVITY_ANALYSIS_DIR for arm in arms}
+        temporaries = [comp_tmp] + [root / f"{c}.tmp" for root in arm_roots.values()]
+        technical_inputs = {
+            "technical": {
+                **technical["files"],
+                "pseudobulk_manifest": {
+                    "path": str(pb / "manifest.json"), "sha256": technical["pseudobulk_manifest_sha256"],
+                },
+                "columns": list(LATENT_SENSITIVITY_ADDED_COVARIATES),
+                "note": (
+                    "the added covariates' source, checked against manifest.json and TECHNICAL_GENE_SETS and complete "
+                    "for the cohort donors; not an export file (inputs.files holds the five export files)"
+                ),
+            },
+        }
+        try:
+            for t in temporaries:
+                if t.exists():
+                    shutil.rmtree(t)
+            comp_tmp.mkdir(parents=True)
+            mediator = mediator_check(technical["table"], loaded["metadata"], LATENT_SENSITIVITY_ADDED_COVARIATES, cohort=c)
+            mediator.to_csv(comp_tmp / LATENT_SENSITIVITY_MEDIATOR_TABLE, index=False, float_format=_csv_float)
+            flagged = mediator[mediator["flagged"]]
+            print(
+                f"[{log}] {c}: mediator check written before the arms ({len(flagged)} of {len(mediator)} cells at "
+                f"|rho| >= {DIAGNOSTIC_CORRELATION_THRESHOLD}"
+                + ("" if flagged.empty else ": " + ", ".join(
+                    f"{r['covariate']} {r['subset']} {_fmt(r['spearman'], '.3f')}" for _, r in flagged.iterrows()
+                )) + ")"
+            )
+
+            runs = {}
+            for arm, spec in LATENT_SENSITIVITY_ARMS.items():
+                runs[arm] = _analyze_cohort(
+                    c, cohort_dir, loaded, params[arm],
+                    out_dir=arm_roots[arm], final_name=f"{c}.tmp", published_dir=arm_roots[arm] / c, n_jobs=n_jobs,
+                    findings=[f"latent-sensitivity arm {arm}: the primary analysis in {reference['dir']} is primary"],
+                    log_prefix=log, covariates=spec["covariates"], covariate_sources=sources,
+                    extra_inputs=technical_inputs,
+                )
+            for arm, spec in LATENT_SENSITIVITY_ARMS.items():
+                rec = runs[arm]["record"]
+                entered = (rec.get("covariates") or {}).get("columns")
+                if entered != list(spec["covariates"]):
+                    raise ValueError(f"the {arm} record lists covariates {entered}, not {list(spec['covariates'])}")
+                block = rec.get("latent_adjustment")
+                conditioning = None if block is None else block.get("conditioning")
+                if conditioning != spec["latent_adjustment"]:
+                    raise ValueError(
+                        f"the {arm} record has latent-adjustment conditioning {conditioning!r}, not "
+                        f"{spec['latent_adjustment']!r}"
+                    )
+            covariate_blocks = {
+                arm: {k: runs[arm]["record"]["covariates"][k] for k in ("columns", "kinds", "design_columns", "reference_row")}
+                for arm in arms
+            }
+            if any(b != covariate_blocks[arms[0]] for b in covariate_blocks.values()):
+                raise ValueError(
+                    f"the arms' covariate blocks differ ({covariate_blocks}); the latent adjustment must change only "
+                    "the basis"
+                )
+
+            rows = [_latent_row(
+                reference["record"], arm=LATENT_SENSITIVITY_REFERENCE_LABEL, cohort=c, directory=str(reference["dir"])
+            )]
+            rows += [
+                _latent_row(runs[arm]["record"], arm=arm, cohort=c, directory=f"{arm}/{LATENT_SENSITIVITY_ANALYSIS_DIR}/{c}")
+                for arm in arms
+            ]
+            for r in rows:
+                print(
+                    f"[{log}] {c}: {r['arm']} (rank {r['rank']}, conditioning {r['conditioning']}): "
+                    + ", ".join(f"{s} {_fmt(r[s])} (p {_fmt(r[f'{s}_p'], '.4g')})" for s in ANALYSIS_STATISTICS)
+                )
+
+            findings: list[str] = []
+            by_arm = {r["arm"]: r for r in rows}
+            ref_label = LATENT_SENSITIVITY_REFERENCE_LABEL
+            pairs = (
+                (ref_label, "extended_covariates", "covariate-set dependence"),
+                ("extended_covariates", "latent_adjusted", "basis dependence"),
+            )
+            for a, b, kind in pairs:
+                if by_arm[a]["rank"] != by_arm[b]["rank"]:
+                    findings.append(
+                        f"CV-selected rank differs: {by_arm[a]['rank']} in {a}, {by_arm[b]['rank']} in {b}; reported "
+                        "beside angle, not read as better or worse"
+                    )
+                for s in ANALYSIS_STATISTICS:
+                    ra, rb = by_arm[a][f"{s}_rejected"], by_arm[b][f"{s}_rejected"]
+                    if ra is not None and rb is not None and ra != rb:
+                        findings.append(
+                            f"{s}: rejection status differs between {a} (p = {_fmt(by_arm[a][f'{s}_p'], '.4g')}) and "
+                            f"{b} (p = {_fmt(by_arm[b][f'{s}_p'], '.4g')}); {kind} of the sensitivity analysis, not a "
+                            "result of the arm; the primary result stays primary"
+                        )
+            for _, r in flagged.iterrows():
+                findings.append(
+                    f"mediator candidate: {r['covariate']} has Spearman {_fmt(r['spearman'], '.3f')} with stage "
+                    f"({r['subset']}, n = {r['n']}); the latent_adjusted basis may have removed stage signal carried "
+                    "by it (no simulation can tell a confounder from a mediator; the flag changes no arm)"
+                )
+            if n_jobs != 1:
+                findings.append(
+                    f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
+                    "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
+                    "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+                )
+
+            table = pd.DataFrame(rows).drop(columns=list(_RANK_SENSITIVITY_CSV_EXCLUDED))
+            for col in ("residual_df", "cv_min_training_df"):
+                table[col] = table[col].astype("Int64")
+            table.to_csv(comp_tmp / LATENT_SENSITIVITY_TABLE, index=False, float_format=_csv_float)
+            (comp_tmp / LATENT_SENSITIVITY_MARKDOWN).write_text(
+                render_latent_sensitivity(
+                    rows, mediator, cohort=c, seed=ANALYSIS_SEED, permutations=ANALYSIS_PERMUTATIONS,
+                    alpha=ANALYSIS_ALPHA, findings=findings,
+                )
+            )
+            reference_now = {name: _sha256_file(Path(info["path"])) for name, info in reference["files"].items()}
+            if reference_now != {name: info["sha256"] for name, info in reference["files"].items()}:
+                raise ValueError(f"the primary analysis files under {reference['dir']} changed during the run")
+            ref_record = reference["record"]
+            manifest = {
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "cohort": c,
+                "n_donors": int(len(loaded["metadata"])),
+                "covariates": {
+                    "entered": list(LATENT_SENSITIVITY_COVARIATES),
+                    "primary": list(ANALYSIS_COVARIATES),
+                    "added": list(LATENT_SENSITIVITY_ADDED_COVARIATES),
+                    "sources": sources,
+                    "scale": "raw fraction (as the residualized variant)",
+                    "missing_policy": ANALYSIS_MISSING_COVARIATES,
+                    "imputed": False,
+                },
+                "conditioning": LATENT_SENSITIVITY_CONDITIONING,
+                "arms": {
+                    arm: {
+                        "description": spec["description"],
+                        "covariates": list(spec["covariates"]),
+                        "latent_adjustment": spec["latent_adjustment"],
+                        "dir": str(arm_roots[arm] / c),
+                        "files": {
+                            name: {"path": str(arm_roots[arm] / c / name), "sha256": _sha256_file(runs[arm]["dir"] / name)}
+                            for name in _REFERENCE_FILES
+                        },
+                        "component_selection": runs[arm]["record"]["latent"]["component_selection"],
+                        "selected_lv": runs[arm]["record"]["latent"]["selected_lv"],
+                        "cv_mean_auroc": runs[arm]["record"]["latent"].get("cv_mean_auroc"),
+                        "runtime_seconds": runs[arm]["record"]["measurement"]["runtime_seconds"],
+                        "latent_adjustment_block": runs[arm]["record"].get("latent_adjustment"),
+                        "findings": runs[arm]["findings"],
+                    }
+                    for arm, spec in LATENT_SENSITIVITY_ARMS.items()
+                },
+                "seed": ANALYSIS_SEED,
+                "permutations": ANALYSIS_PERMUTATIONS,
+                "same_seed_note": (
+                    "the same seed and permutation count as the primary analysis in every arm, so every row draws the "
+                    "same permutation indices"
+                ),
+                "alpha": ANALYSIS_ALPHA,
+                "rejection_rule": ANALYSIS_REJECTION_RULE,
+                "n_jobs": n_jobs,
+                "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+                "inputs": {
+                    "export": {"dir": str(cohort_dir), "files": loaded["inputs"]},
+                    **technical_inputs,
+                },
+                "reference": {
+                    "label": LATENT_SENSITIVITY_REFERENCE_LABEL,
+                    "dir": str(reference["dir"]),
+                    "files": reference["files"],
+                    "covariates": (ref_record.get("covariates") or {}).get("columns"),
+                    "component_selection": ref_record["latent"]["component_selection"],
+                    "selected_lv": ref_record["latent"]["selected_lv"],
+                    "cv_mean_auroc": ref_record["latent"].get("cv_mean_auroc"),
+                    "runtime_seconds": ref_record["measurement"]["runtime_seconds"],
+                    "motco": reference["manifest"]["software"]["motco"],
+                    "seed": reference["manifest"]["measurement"]["seed"],
+                    "permutations": reference["manifest"]["measurement"]["permutations"],
+                    "note": (
+                        "read and checked (export hashes, MOTCO version, seed, permutations, CV selection, orientation "
+                        "and CV settings), never rerun or modified; its files hash identically after the run"
+                    ),
+                },
+                "mediator_check": {
+                    "file": LATENT_SENSITIVITY_MEDIATOR_TABLE,
+                    "sha256": _sha256_file(comp_tmp / LATENT_SENSITIVITY_MEDIATOR_TABLE),
+                    "threshold": DIAGNOSTIC_CORRELATION_THRESHOLD,
+                    "statistic": "Spearman with stage (ordinal 0, 1, 2), all donors and per sex; no p-value",
+                    "written_before_arms": True,
+                    "note": "a flag removes no covariate, changes no arm and stops no run",
+                },
+                "mediator_flags": [
+                    {"covariate": r["covariate"], "subset": r["subset"], "n": int(r["n"]), "spearman": float(r["spearman"])}
+                    for _, r in flagged.iterrows()
+                ],
+                "outputs": sorted([
+                    LATENT_SENSITIVITY_TABLE, LATENT_SENSITIVITY_MARKDOWN, LATENT_SENSITIVITY_MEDIATOR_TABLE,
+                    LATENT_SENSITIVITY_MANIFEST,
+                ]),
+                "software": software,
+                "git": _git_revision(),
+                "findings": findings,
+            }
+            (comp_tmp / LATENT_SENSITIVITY_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+            # Arms first, the comparison last: a complete comparison directory marks a complete cohort
+            finals = [(arm_roots[arm] / f"{c}.tmp", arm_roots[arm] / c) for arm in arms]
+            finals.append((comp_tmp, comp_root / c))
+            for tmp, final in finals:
+                if final.exists():
+                    shutil.rmtree(final)
+                os.replace(tmp, final)
+        except BaseException:
+            for t in temporaries:
+                if t.exists():
+                    shutil.rmtree(t, ignore_errors=True)
+            raise
+        for arm in arms:
+            runs[arm]["dir"] = arm_roots[arm] / c
+        final = comp_root / c
+        print(f"[{log}] Wrote {final} and " + ", ".join(str(arm_roots[arm] / c) for arm in arms))
+        for msg in findings:
+            print(f"[{log}] FINDING: {c}: {msg}")
+        results[c] = {
+            "dir": final, "arms": runs, "reference": reference, "technical": technical, "rows": rows,
+            "table": table, "mediator": mediator, "manifest": manifest, "findings": findings,
+        }
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -7989,4 +8832,9 @@ __all__ = [
     "DIAGNOSTIC_VARIABLES",
     "render_axis_diagnostics",
     "run_axis_diagnostics",
+    "LATENT_SENSITIVITY_ARMS",
+    "LATENT_SENSITIVITY_COVARIATES",
+    "mediator_check",
+    "render_latent_sensitivity",
+    "run_latent_sensitivity",
 ]

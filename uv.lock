@@ -644,8 +644,8 @@ wheels = [
 
 [[package]]
 name = "motco"
-version = "0.8.0"
-source = { git = "https://github.com/tomszar/MOTCO?rev=v0.8.0#979657c3d0e6c9ad4d4bff0dc595a18df854ca61" }
+version = "0.9.0"
+source = { git = "https://github.com/tomszar/MOTCO?rev=v0.9.0#0150adc27b48528f1999a31a146a3df17ae3047f" }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
@@ -1305,7 +1305,7 @@ requires-dist = [
     { name = "botocore-stubs", specifier = "==1.42.12" },
     { name = "decoupler", specifier = ">=2.1.2" },
     { name = "hatchling", specifier = "==1.28.0" },
-    { name = "motco", git = "https://github.com/tomszar/MOTCO?rev=v0.8.0" },
+    { name = "motco", git = "https://github.com/tomszar/MOTCO?rev=v0.9.0" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pandas-stubs", specifier = "==2.3.3.251201" },
