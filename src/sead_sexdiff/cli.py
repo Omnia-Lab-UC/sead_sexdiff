@@ -21,12 +21,17 @@ from .data import (
     ANALYSIS_FORCED_RANKS,
     PREPROCESSING_VARIANTS,
     DIAGNOSTIC_CORRELATION_THRESHOLD,
+    LATENT_SENSITIVITY_ARMS,
+    LATENT_SENSITIVITY_ADDED_COVARIATES,
+    LATENT_SENSITIVITY_CONDITIONING,
+    LATENT_MOTCO_MIN_VERSION,
     run_analysis,
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
     run_covariates,
     run_technical_covariates,
     run_axis_diagnostics,
+    run_latent_sensitivity,
     run_export,
     run_pseudobulk,
     write_subset_from_folder,
@@ -666,6 +671,77 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing cohort directories under --out-dir",
     )
+
+    # latent-sensitivity command: covariate set and latent basis beside the primary analysis
+    arms = ", ".join(LATENT_SENSITIVITY_ARMS)
+    added = ", ".join(LATENT_SENSITIVITY_ADDED_COVARIATES)
+    sub_ls = sub.add_parser(
+        "latent-sensitivity",
+        help="Rerun the analysis with the extended covariate set, without and with MOTCO's latent adjustment",
+        description=(
+            f"Per cohort, from the export, the analyze step's analysis and the technical table: run the arms of the "
+            f"registry LATENT_SENSITIVITY_ARMS (a constant, not a flag; now: {arms}) on the unchanged primary export. "
+            f"Both enter the six analysis covariates plus {added} (raw fractions from donor_technical.csv; the set is "
+            "a constant); extended_covariates keeps the covariate-blind latent basis, latent_adjusted fits the basis "
+            f"on features residualized on the eight covariates conditional on {LATENT_SENSITIVITY_CONDITIONING} "
+            f"(MOTCO >= {LATENT_MOTCO_MIN_VERSION}). Everything else equals the analyze step (blocks, stage order, "
+            "orientation, CV-selected rank, 999 RRPP permutations, same seed). The primary analysis is read and "
+            "checked (export hashes, MOTCO version, seed, permutations, CV selection), never rerun or modified, and "
+            "stays the primary result; the technical table is checked against the pseudobulk manifest, "
+            "TECHNICAL_GENE_SETS and completeness. Before the arms run, mediator_check.csv gives each added "
+            "covariate's Spearman correlation with stage (all donors and per sex; flagged at |rho| >= "
+            f"{DIAGNOSTIC_CORRELATION_THRESHOLD}, no p-value, never a gate). Writes <out-dir>/<arm>/motco_analysis/<cohort>/ "
+            "(the files analyze writes) and <out-dir>/comparison/<cohort>/ (latent_sensitivity.csv, "
+            "latent_sensitivity.md, mediator_check.csv, latent_sensitivity_manifest.json)."
+        ),
+    )
+    sub_ls.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to run (default: %(default)s)",
+    )
+    sub_ls.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+    )
+    sub_ls.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+    )
+    sub_ls.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help=(
+            "Directory holding manifest.json, donor_technical.csv and technical_manifest.json; read, never written "
+            "(default: %(default)s)"
+        ),
+    )
+    sub_ls.add_argument(
+        "--out-dir",
+        default=Path("results/motco_latent_sensitivity"),
+        type=Path,
+        help="Output root; one subdirectory per arm plus comparison/ (default: %(default)s)",
+    )
+    sub_ls.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel jobs for MOTCO's CV and RRPP, -1 = all CPUs. Values other than 1 change the RRPP "
+            "draws (p-values); results are reported at 1 (default: %(default)s)"
+        ),
+    )
+    sub_ls.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a cohort's existing arm and comparison directories under --out-dir",
+    )
     return parser
 
 
@@ -926,6 +1002,34 @@ def main(argv: list[str] | None = None) -> int:
             if len(flagged):
                 print(flagged[["variable", "n", "spearman", "partial_spearman"]].to_string(index=False))
         print("[axis-diagnostics] Done.")
+        return 0
+
+    if args.command == "latent-sensitivity":
+        import pandas as pd
+
+        print("[latent-sensitivity] Running the covariate-set and latent-basis sensitivity analysis...")
+        results = run_latent_sensitivity(
+            args.cohort,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            pseudobulk_dir=args.pseudobulk_dir,
+            out_dir=args.out_dir,
+            n_jobs=args.n_jobs,
+            force=args.force,
+        )
+        columns = ["arm", "cohort", "conditioning", "rank"]
+        for s in ANALYSIS_STATISTICS:
+            columns += [s, f"{s}_p", f"{s}_rejected"]
+        table = pd.concat([res["table"][columns] for res in results.values()], ignore_index=True)
+        print("[latent-sensitivity] Comparison table (primary = the analyze step's result, primary; the arms are "
+              "sensitivity):")
+        print(table.to_string(index=False))
+        for cohort, res in results.items():
+            flags = res["manifest"]["mediator_flags"]
+            print(f"[latent-sensitivity] {cohort}: mediator check ({res['dir'] / 'mediator_check.csv'}): "
+                  + ("no flag" if not flags else ", ".join(
+                      f"{f['covariate']} {f['subset']} rho {f['spearman']:.3f}" for f in flags)))
+        print("[latent-sensitivity] Done.")
         return 0
 
     parser.error("Unknown command")

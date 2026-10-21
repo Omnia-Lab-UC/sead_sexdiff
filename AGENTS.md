@@ -118,6 +118,29 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `block_pcs.csv`, `geometry_shares.csv`, `feature_selection.csv`,
    `diagnostics.md` with flagged rows first, `diagnostics_manifest.json`).
    Its outputs feed no export or analysis command.
+10. `latent-sensitivity` – from `results/motco_input/`, `results/motco_analysis/`
+   and `results/pseudobulk/` (`manifest.json`, `donor_technical.csv`,
+   `technical_manifest.json`) only, per cohort: the two arms of the registry
+   `LATENT_SENSITIVITY_ARMS` on the unchanged primary export, both with
+   `LATENT_SENSITIVITY_COVARIATES` (the six analysis covariates plus the raw
+   `ribosomal_pseudobulk` and `mitochondrial_pseudobulk` fractions):
+   `extended_covariates` with the covariate-blind basis, `latent_adjusted`
+   with MOTCO's `covariate_latent_adjustment = "stage"` (MOTCO ≥ 0.9.0,
+   `LATENT_MOTCO_MIN_VERSION`); everything else equals `analyze`
+   (`_analyze_cohort` with `covariates=`, the fractions merged by
+   `load_analysis_inputs(extra_covariates=...)`). The primary analysis is the
+   reference row, read and checked (`_check_reference`, plus orientation and
+   CV settings), never rerun or modified; the technical table is checked by
+   `_check_technical_reference`. The predeclared mediator check
+   (`mediator_check`: Spearman of each added fraction with stage, all donors
+   and per sex, flagged at `DIAGNOSTIC_CORRELATION_THRESHOLD`, no p-value,
+   never a gate) is written before the arms. Writes
+   `results/motco_latent_sensitivity/` (`<arm>/motco_analysis/<cohort>/`,
+   mirroring the primary layout with the five export files as
+   `inputs.files` so `axis-diagnostics --analysis-dir` can read an arm, and
+   `comparison/<cohort>/` with `latent_sensitivity.csv`,
+   `latent_sensitivity.md`, `mediator_check.csv`,
+   `latent_sensitivity_manifest.json`).
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -128,8 +151,8 @@ when behavior or defaults change.
   that calls into `data.py` and prints `[command]`-prefixed progress messages.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
   pseudobulk, differential expression, covariates, technical covariates,
-  MOTCO export, analysis, the rank / preprocessing sensitivity analyses and
-  the axis diagnostics.
+  MOTCO export, analysis, the rank / preprocessing / latent-adjustment
+  sensitivity analyses and the axis diagnostics.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
@@ -151,13 +174,16 @@ when behavior or defaults change.
   packages used by `DEG.R`, `check_tmm_edger.R` and `check_cyclic_loess_limma.R`; its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
-  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`; `uv.lock` holds
-  the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
+  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
+  `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
   never as a path dependency on `../MOTCO`. It pins scikit-learn exactly; do
   not loosen that pin to resolve a conflict. `run_analysis` refuses a MOTCO
-  older than `ANALYSIS_MOTCO_MIN_VERSION`.
+  older than `ANALYSIS_MOTCO_MIN_VERSION` and `run_latent_sensitivity` one
+  older than `LATENT_MOTCO_MIN_VERSION`. A pin move reruns `analyze` (the
+  reference checks compare MOTCO versions) after checking the rerun against
+  the kept outputs.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
 - Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)
@@ -365,6 +391,41 @@ when behavior or defaults change.
   stays primary with its non-rejection rules; a gene-set fraction is a
   residualization candidate only when its between-donor share dominates and
   its within-donor supertype share is small (cell state otherwise).
+- Latent-adjustment-sensitivity constants (flag and ask before changing any
+  of them): `LATENT_SENSITIVITY_ADDED_COVARIATES` (`ribosomal_pseudobulk`,
+  `mitochondrial_pseudobulk` on the raw fraction scale of the technical
+  table, the `residualized` variant's scale; tied at import to
+  `RESIDUALIZATION_COVARIATES` minus `log10_lib_*`, so a change to one set
+  is a change to both; the export's `log10_lib_<omic>` stay out),
+  `LATENT_SENSITIVITY_COVARIATES` (`ANALYSIS_COVARIATES` + the two, in this
+  order), `LATENT_SENSITIVITY_CONDITIONING` (`stage`, MOTCO's admissible
+  conditioning; `group_stage` is never run), `LATENT_SENSITIVITY_ARMS`
+  (`extended_covariates`, `latent_adjusted`; a registry, never a flag, never
+  chosen from results), `LATENT_MOTCO_MIN_VERSION` (0.9.0), the mediator
+  check (`mediator_check`, the `DIAGNOSTIC_CORRELATION_THRESHOLD` reused,
+  not partial on the covariates, written before the arms, never a gate),
+  the output names (`LATENT_SENSITIVITY_*`), `n_jobs = 1` for reported
+  results, and the rule that the primary analysis stays primary. An arm
+  manifest records `measurement.latent_adjustment` and a `cli_equivalent`
+  with `--latent-adjustment` only when the adjustment is set (absent for the
+  primary, as MOTCO omits the setting from its record), the technical table
+  under `inputs.technical` and the fractions' source under
+  `covariates.sources`. Reading rules for the report: MOTCO's power
+  comparison (`candidate_fails`) excludes the latent adjustment as a
+  replacement, so the arms are sensitivity only; a rejection status that
+  differs is covariate-set dependence (primary vs `extended_covariates`) or
+  basis dependence (`extended_covariates` vs `latent_adjusted`), not a
+  result of the arm; a CV-selected rank that differs is reported beside
+  `angle`; the non-rejection rules hold in every arm; an arm's first-axis
+  technical correlations (`axis-diagnostics` on the arm, whose tables label
+  it `primary`) are a measurement-space finding only. Carried limitations:
+  the mediator limitation with the mediator check's flags (no simulation can
+  tell a confounder from a mediator), MOTCO's Phase 6-only operating
+  characteristics (Type I `adopt_stage`; power `candidate_fails`, `shape`
+  power lost under a nuisance axis, small-magnitude power lost without one),
+  no operating characteristic measured on these blocks or at eight
+  covariates, and the nuclei counts and the fractions both proxying library
+  quality.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
