@@ -31,6 +31,7 @@
               rPackages.MAST
               rPackages.anndataR
               rPackages.edgeR
+              rPackages.DESeq2
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
