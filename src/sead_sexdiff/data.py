@@ -8789,6 +8789,1578 @@ def run_latent_sensitivity(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Pseudobulk stage DE (per-feature DESeq2 of stage and sex × stage beside the primary analysis)
+# ---------------------------------------------------------------------------
+
+# pydeseq2's Benjamini–Hochberg padj with its defaults (independent filtering,
+# Cook's outlier handling); a feature is significant when padj <= α. A
+# constant, never a flag, never chosen from results; flag and ask before changing.
+STAGE_DE_ALPHA = 0.05
+# Treatment coding: the reference level is the first category of each factor
+STAGE_DE_REFERENCE_LEVELS: dict[str, str] = {"sex": "Female", "stage": "0"}
+_STAGE_DE_LEVELS: dict[str, tuple[str, ...]] = {"sex": ("Female", "Male"), "stage": tuple(STAGES)}
+if any(_STAGE_DE_LEVELS[v][0] != ref for v, ref in STAGE_DE_REFERENCE_LEVELS.items()):
+    raise AssertionError("STAGE_DE_REFERENCE_LEVELS must name the first level of each factor")
+# features_<omic>.csv statuses of the tested features: everything that passed
+# the export's chromosome and abundance filters, in the export's order;
+# STAGE_DE_EXPORTED_STATUS marks MOTCO's block (the `exported` column)
+STAGE_DE_FEATURE_STATUSES = ("variance", "kept")
+STAGE_DE_EXPORTED_STATUS = "kept"
+# The statuses a primary export writes; any other stops the step
+_STAGE_DE_EXPORT_STATUSES = ("sex_chromosome", "abundance", "variance", "kept")
+# The summary's reporting sets: `exported` (MOTCO's features, the primary
+# reading) and `abundance` (every tested feature). padj is DESeq2's over all
+# tested features in both, never recomputed on the exported subset.
+STAGE_DE_FEATURE_SETS = ("exported", "abundance")
+# Continuous covariates per omic on their recorded scale (covariates.csv; the
+# omic's own nuclei count on the log10 scale, derived as the analysis derives
+# it): ANALYSIS_COVARIATES without the other omic's nuclei count. Nothing is
+# imputed. Flag and ask before changing.
+STAGE_DE_COVARIATES: dict[str, tuple[str, ...]] = {
+    "rna": ("age_at_death", "pmi", "rin", "years_education", "log10_n_rna"),
+    "atac": ("age_at_death", "pmi", "rin", "years_education", "log10_n_atac"),
+}
+if any(
+    cols != tuple(c for c in ANALYSIS_COVARIATES if c not in ANALYSIS_LOG10_COLUMNS or c == f"log10_n_{o}")
+    for o, cols in STAGE_DE_COVARIATES.items()
+):
+    raise AssertionError(
+        f"STAGE_DE_COVARIATES {STAGE_DE_COVARIATES} must be ANALYSIS_COVARIATES {ANALYSIS_COVARIATES} without the "
+        "other omic's log10 nuclei count"
+    )
+# The predeclared models. `formula` holds the design terms (the omic's
+# covariates are appended by stage_de_formula); `tested` lists (label, design
+# column) per Wald-tested coefficient, the column resolved by name in the
+# fitted design matrix. A factor model's two tests are also reported as their
+# union, which carries no joint error-rate claim (pydeseq2 0.5.3 has no
+# likelihood-ratio test). factor_interaction is the primary interaction model
+# (MOTCO's ordered-categorical stages); trend_interaction is a second
+# predeclared model, not a fallback. A registry, never a flag, never chosen
+# from results; flag and ask before changing.
+STAGE_DE_MODELS: dict[str, dict] = {
+    "factor_additive": {
+        "formula": "~ sex + stage",
+        "stage_coding": "factor",
+        "interaction": False,
+        "tested": (("stage_1_vs_0", "stage[T.1]"), ("stage_2_vs_0", "stage[T.2]")),
+    },
+    "factor_interaction": {
+        "formula": "~ sex + stage + sex:stage",
+        "stage_coding": "factor",
+        "interaction": True,
+        "tested": (("male_x_stage_1", "sex[T.Male]:stage[T.1]"), ("male_x_stage_2", "sex[T.Male]:stage[T.2]")),
+    },
+    "trend_additive": {
+        "formula": "~ sex + stage_num",
+        "stage_coding": "numeric",
+        "interaction": False,
+        "tested": (("stage_num", "stage_num"),),
+    },
+    "trend_interaction": {
+        "formula": "~ sex + stage_num + sex:stage_num",
+        "stage_coding": "numeric",
+        "interaction": True,
+        "tested": (("male_x_stage_num", "sex[T.Male]:stage_num"),),
+    },
+}
+STAGE_DE_UNION = "union"
+# Written before either count existed (proposal); evaluated per cohort × omic
+# from the generated files. The cell reads a count and the primary analysis's
+# delta rejection status (ANALYSIS_REJECTION_RULE, as every comparison table
+# derives it), never a p-value magnitude; it changes no MOTCO output. A
+# constant; flag and ask before changing.
+STAGE_DE_CONCORDANCE_RULE: dict[str, str] = {
+    "model": "factor_interaction",
+    "coefficient": STAGE_DE_UNION,
+    "feature_set": "exported",
+    "interaction_detected": (
+        "at least one exported feature (status kept) with padj <= STAGE_DE_ALPHA on either interaction coefficient "
+        "of factor_interaction"
+    ),
+    "delta_rejected": "the primary analysis rejects delta (p <= ANALYSIS_ALPHA, ANALYSIS_REJECTION_RULE; result.json)",
+    "cell": "concordant when both are true or both are false; discordant otherwise, written as a finding",
+}
+if not (
+    STAGE_DE_MODELS[STAGE_DE_CONCORDANCE_RULE["model"]]["interaction"]
+    and STAGE_DE_MODELS[STAGE_DE_CONCORDANCE_RULE["model"]]["stage_coding"] == "factor"
+):
+    raise AssertionError("STAGE_DE_CONCORDANCE_RULE must name the factor interaction model")
+# Reproduction of the export from the counts now on disk (design D8; the export
+# records no count-file hash): statuses and library sizes exact, TMM factors
+# and the exported values to rounding (the export writes %.10g)
+STAGE_DE_TMM_RTOL = 1e-10
+STAGE_DE_VALUES_RTOL = 1e-9
+# Layout under <out_dir>/<cohort>/: <omic>/<model>__<coefficient>.csv per
+# tested coefficient and <omic>/<model>__fit.json per fit (the resume record),
+# then the summary, the Markdown and the manifest
+STAGE_DE_TABLE_TEMPLATE = "{model}__{coefficient}.csv"
+STAGE_DE_FIT_TEMPLATE = "{model}__fit.json"
+STAGE_DE_SUMMARY = "stage_de_summary.csv"
+STAGE_DE_MARKDOWN = "stage_de.md"
+STAGE_DE_MANIFEST = "stage_de_manifest.json"
+STAGE_DE_TABLE_COLUMNS = ("feature", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "exported")
+STAGE_DE_SUMMARY_COLUMNS = (
+    "cohort", "omic", "model", "coefficient", "kind", "design_column", "feature_set", "n_tested", "n_padj_missing",
+    "n_significant", "min_padj", "interaction_detected", "delta_rejected", "concordance",
+)
+_STAGE_DE_OMICS = ("rna", "atac")
+_STAGE_DE_PSEUDOBULK_INPUTS = ("rna_counts.h5ad", "atac_counts.h5ad", "donor_table.csv", "manifest.json")
+_STAGE_DE_EXPORT_INPUTS = (
+    "metadata.csv", "covariates.csv", "features_rna.csv", "features_atac.csv", "manifest.json", "rna.csv", "atac.csv",
+)
+_STAGE_DE_IGNORED_WARNINGS = (r"Setting an item of incompatible dtype",)
+# The parts of a fit record the summary and the manifest read; a record
+# lacking one (an earlier version's, or a damaged one) is stale
+_STAGE_DE_RECORD_KEYS = (
+    ("tables",), ("export_reproduction", "variance_max_rel_diff"), ("fit", "warnings"), ("fit", "n_cpus"),
+    ("fit", "convergence"), ("fit", "dispersion_trend", "type"), ("fit", "settings", "fit_type_used"),
+    ("fit", "coefficients"), ("fit", "cooks"), ("fit", "tested"),
+)
+def _stage_de_warnings_scope(n_cpus: int) -> str:
+    """What a fit record's ``warnings`` cover: with ``n_cpus > 1`` pydeseq2's worker processes raise their own."""
+    if n_cpus == 1:
+        return "all warnings of the fit (n_cpus = 1)"
+    return (
+        f"main process only (n_cpus = {n_cpus}): warnings raised in pydeseq2's worker processes, such as the IRLS "
+        "fallback's RuntimeWarnings, are not captured; the tables do not depend on n_cpus"
+    )
+
+
+_STAGE_DE_PADJ_NOTE = (
+    "pydeseq2's Benjamini-Hochberg over the tested features that pass its independent filter (a baseMean cutoff "
+    "chosen per coefficient at alpha); filtered features have no padj and count as not significant; never "
+    "recomputed on the exported subset"
+)
+
+
+def stage_de_formula(model: str, omic: str) -> str:
+    """The full design formula of one registered model for one omic: the design terms, then the omic's covariates."""
+    if model not in STAGE_DE_MODELS:
+        raise ValueError(f"unknown stage-DE model {model!r}; expected one of {tuple(STAGE_DE_MODELS)}")
+    if omic not in STAGE_DE_COVARIATES:
+        raise ValueError(f"unknown omic {omic!r}; expected one of {tuple(STAGE_DE_COVARIATES)}")
+    return " + ".join([STAGE_DE_MODELS[model]["formula"], *STAGE_DE_COVARIATES[omic]])
+
+
+def stage_de_design(metadata: pd.DataFrame, omic: str, *, source: str | Path = "covariates.csv") -> pd.DataFrame:
+    """The donors × design-variable table of the stage-DE models for one omic.
+
+    Parameters
+    ----------
+    metadata:
+        ``load_analysis_inputs(...)["metadata"]``: ``donor_id``, ``sex``
+        (``Female`` / ``Male``), ``stage`` (``0`` / ``1`` / ``2``) and the
+        analysis covariates (the log10 nuclei counts derived).
+    omic:
+        ``rna`` or ``atac``; selects ``STAGE_DE_COVARIATES[omic]``.
+    source:
+        Named in the error for a missing covariate value.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by ``donor_id`` in the input order: ``sex`` and ``stage`` as
+        categoricals whose first category is the reference level of
+        ``STAGE_DE_REFERENCE_LEVELS``, ``stage_num`` (0, 1, 2 as float) and the
+        omic's covariates as floats on their recorded scale.
+
+    Raises
+    ------
+    ValueError
+        A sex or stage label outside the expected levels, a level without
+        donors, a covariate column absent, or a missing covariate value (donors
+        and column named; nothing is imputed).
+    """
+    if omic not in STAGE_DE_COVARIATES:
+        raise ValueError(f"unknown omic {omic!r}; expected one of {tuple(STAGE_DE_COVARIATES)}")
+    donors = metadata["donor_id"].astype(str).to_numpy()
+    design = pd.DataFrame(index=pd.Index(donors, name="donor_id"))
+    for var, levels in _STAGE_DE_LEVELS.items():
+        values = metadata[var].astype(str).to_numpy()
+        unknown = sorted(set(values) - set(levels))
+        if unknown:
+            raise ValueError(f"stage-de: {var} label(s) {unknown} are not among the levels {list(levels)}")
+        empty = [lv for lv in levels if lv not in set(values)]
+        if empty:
+            raise ValueError(f"stage-de: no donor has {var} = {empty}; every model needs every level")
+        design[var] = pd.Categorical(values, categories=list(levels))
+    design["stage_num"] = metadata["stage"].astype(str).astype(int).to_numpy(dtype=float)
+    for col in STAGE_DE_COVARIATES[omic]:
+        if col not in metadata.columns:
+            raise ValueError(f"stage-de: the metadata table lacks covariate {col!r} ({source})")
+        values = pd.to_numeric(metadata[col], errors="coerce").to_numpy(dtype=float)
+        bad = donors[~np.isfinite(values)].tolist()
+        if bad:
+            raise ValueError(
+                f"stage-de: covariate {col!r} is missing for donor(s) {bad} ({source}); nothing is imputed; nothing "
+                "was written"
+            )
+        design[col] = values
+    return design
+
+
+def _resolve_design_column(columns: list[str], expected: str, *, model: str, formula: str) -> str:
+    """The design-matrix column of a tested coefficient, found by name, never by position."""
+    if expected in columns:
+        return expected
+    raise ValueError(
+        f"stage-de: the {model} design matrix ({formula}) has no column {expected!r} (columns: {columns}); the tested "
+        "coefficient cannot be resolved by name"
+    )
+
+
+def stage_de_design_check(design: pd.DataFrame, model: str, omic: str) -> dict:
+    """Build one model's design matrix as pydeseq2 does, check its rank and resolve the tested columns.
+
+    Run before anything is written, so a design that is not full rank or a
+    coefficient whose column cannot be found by name stops the step before
+    any fit (``stage_de_fit`` repeats both checks on the fitted matrix).
+
+    Returns
+    -------
+    dict
+        ``formula``, ``design_columns``, ``rank`` and ``resolved``
+        (coefficient label → design column).
+
+    Raises
+    ------
+    ValueError
+        The design matrix is not full rank, or a tested column is absent (the
+        name and the available columns are given).
+    """
+    from formulaic_contrasts import FormulaicContrasts
+
+    formula = stage_de_formula(model, omic)
+    matrix = FormulaicContrasts(design, formula).design_matrix
+    columns = [str(c) for c in matrix.columns]
+    rank = int(np.linalg.matrix_rank(np.asarray(matrix, dtype=float)))
+    if rank < len(columns):
+        raise ValueError(
+            f"stage-de: the {model} design ({formula}) has rank {rank} < {len(columns)} columns for these "
+            f"{len(design)} donors; the model cannot be fitted; nothing was written"
+        )
+    resolved = {
+        label: _resolve_design_column(columns, expected, model=model, formula=formula)
+        for label, expected in STAGE_DE_MODELS[model]["tested"]
+    }
+    return {"formula": formula, "design_columns": columns, "rank": rank, "resolved": resolved}
+
+
+def stage_de_fit(
+    counts: pd.DataFrame,
+    design: pd.DataFrame,
+    model: str,
+    *,
+    omic: str,
+    exported: Iterable[bool] | None = None,
+    n_cpus: int = 1,
+) -> dict:
+    """Fit one registered stage-DE model with pydeseq2 and Wald-test its coefficients.
+
+    Parameters
+    ----------
+    counts:
+        Donors × features raw counts (integer-valued), rows in ``design``
+        order, columns the tested feature set in the export's order. Size
+        factors and dispersions are fitted on exactly these features.
+    design:
+        ``stage_de_design`` output for the same donors.
+    model:
+        A key of ``STAGE_DE_MODELS``.
+    omic:
+        Selects the covariates of the formula (``stage_de_formula``).
+    exported:
+        Per feature (``counts`` column order), whether it is one of MOTCO's
+        exported features; written as the ``exported`` column. ``None``
+        leaves the column out.
+    n_cpus:
+        pydeseq2's worker count (runtime only; recorded).
+
+    Returns
+    -------
+    dict
+        ``tables`` (coefficient label → DataFrame with ``feature``,
+        ``baseMean``, ``log2FoldChange``, ``lfcSE``, ``stat``, ``pvalue``,
+        ``padj`` and ``exported``, one row per feature in ``counts`` order),
+        ``fit`` (formula, design-matrix columns, each tested coefficient's
+        resolved column, size factors, dispersion trend requested and used,
+        Cook's counts, non-converged dispersion and LFC fits, per-coefficient
+        missing-padj and significant counts, the warnings pydeseq2 raised,
+        settings, runtime) and ``dispersions`` (per feature: gene-wise, trend,
+        MAP and final dispersion and the three convergence flags).
+
+    Raises
+    ------
+    ValueError
+        ``counts`` and ``design`` list different donors, a count is negative
+        or not an integer, the design matrix is not full rank, or a tested
+        coefficient's design column cannot be found by name (the expected name
+        and the available columns are given).
+
+    Notes
+    -----
+    Each tested coefficient is a unit contrast vector on the design-matrix
+    column found by name, with ``DeseqStats(alpha=STAGE_DE_ALPHA)`` and
+    pydeseq2's defaults (Cook's refit, Cook's filtering, independent
+    filtering); ``log2FoldChange`` is the coefficient on the log2 scale.
+    With continuous covariates no donor shares its design row with another,
+    so pydeseq2 (as R's DESeq2) replaces no outlier and filters no Cook's
+    outlier; the counts are recorded.
+    """
+    import warnings
+
+    if model not in STAGE_DE_MODELS:
+        raise ValueError(f"unknown stage-DE model {model!r}; expected one of {tuple(STAGE_DE_MODELS)}")
+    spec = STAGE_DE_MODELS[model]
+    formula = stage_de_formula(model, omic)
+    if counts.index.astype(str).tolist() != design.index.astype(str).tolist():
+        raise ValueError("stage-de: the count rows and the design rows list different donors (or orders)")
+    values = counts.to_numpy()
+    if not np.issubdtype(values.dtype, np.integer):
+        values = np.asarray(values, dtype=float)
+        if not np.all(np.isfinite(values)) or not np.array_equal(values, np.round(values)):
+            raise ValueError("stage-de: the counts are not integer-valued")
+    if (values < 0).any():
+        raise ValueError("stage-de: the counts contain negative values")
+    feature_names = counts.columns.astype(str)
+    counts_df = pd.DataFrame(values.astype(np.int64), index=design.index.astype(str), columns=feature_names)
+    meta = design.copy()
+    meta.index = meta.index.astype(str)
+    mask = None if exported is None else np.asarray(list(exported), dtype=bool)
+    if mask is not None and mask.size != counts_df.shape[1]:
+        raise ValueError(f"stage-de: exported has {mask.size} entries for {counts_df.shape[1]} features")
+
+    t0 = time.perf_counter()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for pattern in _STAGE_DE_IGNORED_WARNINGS:
+            warnings.filterwarnings("ignore", message=pattern)
+        dds = DeseqDataSet(
+            counts=counts_df, metadata=meta, design=formula, refit_cooks=True, n_cpus=n_cpus, quiet=True,
+        )
+        if any("not full rank" in str(w.message) for w in caught):
+            raise ValueError(
+                f"stage-de: the {model} design ({formula}) is not full rank for these {len(meta)} donors; the model "
+                "cannot be fitted"
+            )
+        dds.deseq2()
+        columns = [str(c) for c in dds.obsm["design_matrix"].columns]
+        resolved = {
+            label: _resolve_design_column(columns, expected, model=model, formula=formula)
+            for label, expected in spec["tested"]
+        }
+        tables = {}
+        for label, column in resolved.items():
+            contrast = np.zeros(len(columns))
+            contrast[columns.index(column)] = 1.0
+            ds = DeseqStats(
+                dds, contrast=contrast, alpha=STAGE_DE_ALPHA, cooks_filter=True, independent_filter=True,
+                quiet=True, n_cpus=n_cpus,
+            )
+            ds.summary()
+            res = ds.results_df.reindex(feature_names)
+            table = pd.DataFrame({"feature": np.asarray(feature_names, dtype=object)})
+            for col in STAGE_DE_TABLE_COLUMNS[1:-1]:
+                table[col] = res[col].to_numpy(dtype=float)
+            if mask is not None:
+                table["exported"] = mask
+            tables[label] = table
+    runtime = time.perf_counter() - t0
+    messages = sorted({f"{w.category.__name__}: {w.message}" for w in caught})
+
+    uns = dds.uns
+    trend_type = uns.get("disp_function_type")
+    trend = {"type": trend_type}
+    if trend_type == "parametric":
+        trend["coefficients"] = {str(k): float(v) for k, v in uns["trend_coeffs"].items()}
+    elif trend_type == "mean":
+        trend["mean_dispersion"] = float(uns["mean_disp"])
+
+    def _count(frame, key) -> int:
+        return int(np.asarray(frame[key], dtype=bool).sum()) if key in frame else 0
+
+    def _not_converged(key) -> int:
+        if key not in dds.var:
+            return 0
+        flags = pd.to_numeric(dds.var[key], errors="coerce").to_numpy(dtype=float)
+        return int((np.isfinite(flags) & (flags == 0)).sum())
+
+    var = dds.var.reindex(feature_names)
+    dispersions = pd.DataFrame({"feature": np.asarray(feature_names, dtype=object)})
+    for out_col, key in (
+        ("genewise", "genewise_dispersions"), ("trend", "fitted_dispersions"), ("map", "MAP_dispersions"),
+        ("dispersion", "dispersions"),
+    ):
+        dispersions[out_col] = pd.to_numeric(var[key], errors="coerce").to_numpy(dtype=float) if key in var else np.nan
+    for out_col, key in (
+        ("genewise_converged", "_genewise_converged"), ("map_converged", "_MAP_converged"),
+        ("lfc_converged", "_LFC_converged"),
+    ):
+        dispersions[out_col] = pd.to_numeric(var[key], errors="coerce").to_numpy(dtype=float) if key in var else np.nan
+
+    fit = {
+        "model": model,
+        "omic": omic,
+        "formula": formula,
+        "stage_coding": spec["stage_coding"],
+        "interaction": spec["interaction"],
+        "design_columns": columns,
+        "tested": [
+            {"coefficient": label, "expected_column": expected, "design_column": resolved[label]}
+            for label, expected in spec["tested"]
+        ],
+        "n_donors": int(counts_df.shape[0]),
+        "n_features": int(counts_df.shape[1]),
+        "n_exported": None if mask is None else int(mask.sum()),
+        "size_factors": {str(d): float(v) for d, v in dds.obs["size_factors"].items()},
+        "dispersion_trend": trend,
+        "cooks": {
+            "replaceable_donors": _count(dds.obs, "replaceable"),
+            "replaced_features": _count(dds.var, "replaced"),
+            "refitted_features": _count(dds.var, "refitted"),
+            "outlier_features": int(np.asarray(dds.cooks_outlier(), dtype=bool).sum()),
+            "note": (
+                "Cook's refit and filtering need donors that share a design row (>= 7 for the refit, >= 3 for the "
+                "filter); with continuous covariates none does, so both are inactive by construction (as in R's "
+                "DESeq2) and the per-feature results carry no outlier protection"
+            ),
+        },
+        "convergence": {
+            "genewise_not_converged": _not_converged("_genewise_converged"),
+            "map_not_converged": _not_converged("_MAP_converged"),
+            "lfc_not_converged": _not_converged("_LFC_converged"),
+            "note": (
+                "pydeseq2's L-BFGS-B dispersion fits fall back to a grid search and its IRLS to an optimizer when "
+                "they do not converge; these features are the ones least reproducible across implementations"
+            ),
+        },
+        "coefficients": {
+            label: {
+                "n_pvalue_missing": int(t["pvalue"].isna().sum()),
+                "n_padj_missing": int(t["padj"].isna().sum()),
+                "n_significant": int((t["padj"] <= STAGE_DE_ALPHA).sum()),
+            }
+            for label, t in tables.items()
+        },
+        "settings": {
+            "alpha": STAGE_DE_ALPHA,
+            "padj": _STAGE_DE_PADJ_NOTE,
+            "independent_filter": True,
+            "cooks_filter": True,
+            "refit_cooks": True,
+            "min_replicates": int(dds.min_replicates),
+            "fit_type_requested": str(dds.fit_type),
+            "fit_type_used": trend_type,
+            "size_factors_fit_type": str(dds.size_factors_fit_type),
+            "lfc_shrinkage": False,
+        },
+        "n_cpus": n_cpus,
+        "warnings": messages,
+        "warnings_scope": _stage_de_warnings_scope(n_cpus),
+        "runtime_seconds": runtime,
+    }
+    del dds
+    gc.collect()
+    return {"tables": tables, "fit": fit, "dispersions": dispersions}
+
+
+def _stage_de_export_settings(manifest: dict, path: Path) -> None:
+    """Stop unless the export was made with the primary settings (the reproduction reruns those)."""
+    problems = []
+    if manifest.get("variant"):
+        problems.append(f"variant {manifest['variant'].get('name', manifest['variant'])!r}")
+    if manifest.get("excluded_gene_sets"):
+        problems.append(f"excluded_gene_sets {manifest['excluded_gene_sets']}")
+    for o in _STAGE_DE_OMICS:
+        rule = (manifest.get("selection_rule") or {}).get(o, "variance")
+        if rule != "variance":
+            problems.append(f"selection_rule {o} = {rule!r}")
+        norm = (manifest.get("normalization") or {}).get(o, "none")
+        if norm != "none":
+            problems.append(f"normalization {o} = {norm!r}")
+    if manifest.get("residualization"):
+        problems.append("residualization")
+    if problems:
+        raise ValueError(
+            f"{path} records {', '.join(problems)}; stage-de binds to an export made with the primary settings "
+            "(chromosome and abundance filters, variance selection, no normalization or residualization); "
+            "nothing was written"
+        )
+
+
+def _stage_de_inputs(cohort: str, pseudobulk_dir: Path, input_dir: Path, analysis_dir: Path) -> dict:
+    """Check the input files exist (naming the producing command); return group → name → path."""
+    groups = {
+        "pseudobulk": (
+            pseudobulk_dir, _STAGE_DE_PSEUDOBULK_INPUTS,
+            "run `sead-sexdiff pseudobulk` on the cluster and sync results/pseudobulk/ (scripts/sync_pseudobulk.sh) "
+            "to produce it",
+        ),
+        "export": (input_dir / cohort, _STAGE_DE_EXPORT_INPUTS, "run `sead-sexdiff export` to produce it"),
+        "analysis": (analysis_dir / cohort, _REFERENCE_FILES, "run `sead-sexdiff analyze` to produce it"),
+    }
+    paths: dict[str, dict[str, Path]] = {}
+    for group, (d, names, hint) in groups.items():
+        paths[group] = {}
+        for name in names:
+            p = d / name
+            if not p.exists():
+                raise FileNotFoundError(f"{p} is missing; {hint}; nothing was written")
+            paths[group][name] = p
+    return paths
+
+
+def _stage_de_reproduce(
+    counts: np.ndarray,
+    features: pd.DataFrame,
+    exported_values: pd.DataFrame,
+    export_manifest: dict,
+    *,
+    omic: str,
+    donors: list[str],
+    counts_path: Path,
+    export_dir: Path,
+) -> dict:
+    """Rerun the export's preprocessing on the cohort counts and compare with what the export recorded.
+
+    Raises a ``ValueError`` naming ``counts_path`` and the ``export`` command
+    when a status, a library size, a TMM factor, a tested feature's log2-CPM
+    variance or an exported value differs.
+    """
+    rerun = (
+        "the counts on disk do not reproduce the primary export; they changed since the export; rerun "
+        "`sead-sexdiff export` (then `sead-sexdiff analyze`); nothing was written"
+    )
+    thr = export_manifest["thresholds"]
+    # preprocess_block takes k, min_cpm, prior_count, N and the chromosomes from
+    # the record; the TMM trims and the float format are the module constants
+    for key, recorded, constant in (
+        ("thresholds.tmm.logratio_trim", (thr.get("tmm") or {}).get("logratio_trim"), TMM_LOGRATIO_TRIM),
+        ("thresholds.tmm.sum_trim", (thr.get("tmm") or {}).get("sum_trim"), TMM_SUM_TRIM),
+        ("thresholds.float_format", thr.get("float_format"), EXPORT_FLOAT_FORMAT),
+    ):
+        if recorded != constant:
+            raise ValueError(
+                f"{export_dir / 'manifest.json'} records {key} = {recorded!r} but the export constant is "
+                f"{constant!r}; the reproduction reruns the export with the constants; rerun `sead-sexdiff export` "
+                "(then `sead-sexdiff analyze`); nothing was written"
+            )
+    names = features["feature"].to_numpy(dtype=str)
+    res = preprocess_block(
+        counts, names, features["chromosome"].to_numpy(dtype=object), k=int(thr["k"]), min_cpm=float(thr["min_cpm"]),
+        prior_count=float(thr["prior_count"]), top_n=int(thr["N"]), excluded_chromosomes=tuple(thr["excluded_chromosomes"]),
+    )
+    status_now = np.asarray(res["status"], dtype=str)
+    status_then = features["status"].to_numpy(dtype=str)
+    diff = np.flatnonzero(status_now != status_then)
+    if diff.size:
+        examples = ", ".join(f"{names[i]} ({status_then[i]} recorded, {status_now[i]} now)" for i in diff[:3])
+        raise ValueError(
+            f"{counts_path}: {diff.size} feature status(es) differ from {export_dir / f'features_{omic}.csv'} for the "
+            f"cohort donors (e.g. {examples}); {rerun}"
+        )
+    tmm = export_manifest.get("tmm", {}).get(omic, {})
+    absent = [d for d in donors if d not in tmm]
+    if absent:
+        raise ValueError(f"{export_dir / 'manifest.json'} records no TMM entry for {omic} donor(s) {absent}; {rerun}")
+    for key, now in (("lib_size_filter", res["lib_size_filter"]), ("lib_size", res["lib_size"])):
+        then = np.array([tmm[d][key] for d in donors], dtype=float)
+        if not np.array_equal(np.asarray(now, dtype=float), then):
+            bad = [d for d, a, b in zip(donors, now, then) if a != b]
+            raise ValueError(
+                f"{counts_path}: the {key} of donor(s) {bad[:5]} differs from {export_dir / 'manifest.json'}; {rerun}"
+            )
+    factors_then = np.array([tmm[d]["factor"] for d in donors], dtype=float)
+    factor_rel = float(np.max(np.abs(res["tmm_factors"] - factors_then) / np.abs(factors_then)))
+    if not factor_rel <= STAGE_DE_TMM_RTOL:
+        raise ValueError(
+            f"{counts_path}: the TMM factors differ from {export_dir / 'manifest.json'} by up to {factor_rel:.3g} "
+            f"(relative; tolerance {STAGE_DE_TMM_RTOL}); {rerun}"
+        )
+    # Every tested feature's log2-CPM variance (features_<omic>.csv), so a count
+    # change confined to tested-but-not-exported features is caught as well
+    tested = np.isin(status_then, STAGE_DE_FEATURE_STATUSES)
+    variance_then = pd.to_numeric(features["variance"], errors="coerce").to_numpy(dtype=float)[tested]
+    variance_now = np.asarray(res["variance"], dtype=float)[tested]
+    if not np.all(np.isfinite(variance_then)):
+        raise ValueError(f"{export_dir / f'features_{omic}.csv'} lacks the variance of a tested feature; {rerun}")
+    variance_diff = np.abs(variance_now - variance_then)
+    variance_bad = ~(variance_diff <= STAGE_DE_VALUES_RTOL * np.abs(variance_then) + 1e-12)
+    if variance_bad.any():
+        examples = ", ".join(names[tested][variance_bad][:3])
+        raise ValueError(
+            f"{counts_path}: the log2-CPM variance of {int(variance_bad.sum())} tested feature(s) differs from "
+            f"{export_dir / f'features_{omic}.csv'} (e.g. {examples}; up to {float(np.max(variance_diff)):.3g}); {rerun}"
+        )
+    variance_rel = float(np.max(variance_diff / np.maximum(np.abs(variance_then), 1e-300))) if variance_diff.size else 0.0
+    kept = list(res["kept"])
+    if kept != exported_values.columns.astype(str).tolist():
+        raise ValueError(f"{counts_path}: the reproduced kept features differ from {export_dir / f'{omic}.csv'}; {rerun}")
+    then_values = exported_values.loc[donors].to_numpy(dtype=float)
+    abs_diff = np.abs(res["values"] - then_values)
+    value_rel = float(np.max(abs_diff / np.maximum(np.abs(then_values), 1e-300)))
+    value_abs = float(np.max(abs_diff))
+    if not np.all(abs_diff <= STAGE_DE_VALUES_RTOL * np.abs(then_values) + 1e-12):
+        raise ValueError(
+            f"{counts_path}: the reproduced log2-CPM values differ from {export_dir / f'{omic}.csv'} by up to "
+            f"{value_abs:.3g} (absolute; tolerance {STAGE_DE_VALUES_RTOL} relative); {rerun}"
+        )
+    return {
+        "statuses_equal": True,
+        "lib_sizes_equal": True,
+        "tmm_factor_max_rel_diff": factor_rel,
+        "tmm_rtol": STAGE_DE_TMM_RTOL,
+        "variance_max_rel_diff": variance_rel,
+        "values_max_abs_diff": value_abs,
+        "values_max_rel_diff": value_rel,
+        "values_rtol": STAGE_DE_VALUES_RTOL,
+        "thresholds": {
+            "excluded_chromosomes": list(thr["excluded_chromosomes"]), "min_cpm": thr["min_cpm"], "k": thr["k"],
+            "prior_count": thr["prior_count"], "N": thr["N"],
+        },
+        "steps": res["steps"],
+        "note": (
+            "preprocess_block rerun on the cohort donors' counts with the chromosomes of features_<omic>.csv and the "
+            "recorded thresholds; statuses and library sizes equal exactly, the TMM factors, every tested feature's "
+            "log2-CPM variance and the exported values to rounding. Not a hash: a count change that leaves all of "
+            "these unchanged would pass"
+        ),
+    }
+
+
+def _stage_de_prepare(
+    cohort: str,
+    *,
+    pseudobulk_dir: Path,
+    input_dir: Path,
+    analysis_dir: Path,
+    omics: list[str],
+    motco_version: str,
+    log: str,
+) -> dict:
+    """Every check of one cohort before anything is written; the loaded counts, designs and references.
+
+    Returns
+    -------
+    dict
+        ``paths``, ``hashes`` (group → name → sha256 of every input file),
+        ``loaded`` (``load_analysis_inputs``), ``reference`` (``_check_reference``),
+        ``delta_rejected``, ``donors``, ``cells``, ``k``, ``features`` (omic →
+        ``features_<omic>.csv``), ``feature_sets`` (omic → abundance / exported
+        counts), ``designs`` and, for the requested omics, ``counts`` (donors ×
+        tested features), ``exported`` (mask) and ``reproduction``.
+    """
+    c = cohort
+    pb, ex_dir, an_dir = pseudobulk_dir, input_dir / c, analysis_dir / c
+    paths = _stage_de_inputs(c, pb, input_dir, analysis_dir)
+    rerun_export = "rerun `sead-sexdiff export` (then `sead-sexdiff analyze`); nothing was written"
+    # Hash every file before it is read (load_analysis_inputs hashes the five
+    # analysis inputs of the export itself before reading them)
+    hashes = {
+        group: {
+            name: _sha256_file(p) for name, p in files.items() if not (group == "export" and name in _ANALYSIS_INPUTS)
+        }
+        for group, files in paths.items()
+    }
+    pb_manifest = json.loads((pb / "manifest.json").read_text())
+    if pb_manifest.get("partial", True):
+        raise ValueError(f"{pb / 'manifest.json'}: the pseudobulk run is partial; stage-de needs a full run")
+    info = pb_manifest.get("cohorts", {}).get(c)
+    if info is None or not info.get("analysable", False):
+        raise ValueError(f"{pb / 'manifest.json'}: cohort {c} is missing or not analysable")
+
+    loaded = load_analysis_inputs(ex_dir)
+    hashes["export"].update({name: info["sha256"] for name, info in loaded["inputs"].items()})
+    meta = loaded["metadata"]
+    # The designs first, so a missing covariate is reported by donor and column
+    designs = {o: stage_de_design(meta, o, source=ex_dir / "covariates.csv") for o in _STAGE_DE_OMICS}
+    design_checks = {o: {m: stage_de_design_check(designs[o], m, o) for m in STAGE_DE_MODELS} for o in _STAGE_DE_OMICS}
+    reference = _check_reference(ex_dir, an_dir, loaded["inputs"], motco_version)
+    for name, info in reference["files"].items():
+        if info["sha256"] != hashes["analysis"][name]:
+            raise ValueError(f"{an_dir / name} changed while it was read; nothing was written")
+    export_manifest = loaded["export_manifest"]
+    recorded = export_manifest.get("input", {}).get("pseudobulk_manifest_sha256")
+    now = hashes["pseudobulk"]["manifest.json"]
+    if recorded != now:
+        raise ValueError(
+            f"{pb / 'manifest.json'} has sha256 {now} but {ex_dir / 'manifest.json'} recorded {recorded} "
+            f"(input.pseudobulk_manifest_sha256): the export was made from a different pseudobulk; {rerun_export}"
+        )
+    _stage_de_export_settings(export_manifest, ex_dir / "manifest.json")
+
+    donors = meta["donor_id"].astype(str).tolist()
+    table = pd.read_csv(pb / "donor_table.csv", dtype={"donor_id": str, "stage": str, "sex": str})
+    if c not in table.columns:
+        raise ValueError(f"{pb / 'donor_table.csv'} has no {c} column")
+    sub = table[table[c].astype(bool)].set_index("donor_id")
+    if set(sub.index) != set(donors):
+        raise ValueError(
+            f"{pb / 'donor_table.csv'} and {ex_dir / 'metadata.csv'} list different {c} donors (only in the donor "
+            f"table: {sorted(set(sub.index) - set(donors))}; only in the export: {sorted(set(donors) - set(sub.index))}); "
+            f"{rerun_export}"
+        )
+    for col in ("sex", "stage"):
+        bad = [d for d, v in zip(donors, meta[col].astype(str)) if str(sub.loc[d, col]) != v]
+        if bad:
+            raise ValueError(
+                f"{pb / 'donor_table.csv'} and {ex_dir / 'metadata.csv'} disagree on {col} for donor(s) {bad}; "
+                f"{rerun_export}"
+            )
+    k, _, cells = smallest_cell(sub.reset_index())
+    thr = export_manifest.get("thresholds", {})
+    if thr.get("k") != k or export_manifest.get("metadata", {}).get("cells") != cells:
+        raise ValueError(
+            f"{ex_dir / 'manifest.json'} records k = {thr.get('k')} and cells "
+            f"{export_manifest.get('metadata', {}).get('cells')} but {pb / 'donor_table.csv'} gives k = {k} and cells "
+            f"{cells}; {rerun_export}"
+        )
+
+    features, feature_sets = {}, {}
+    for o in _STAGE_DE_OMICS:
+        path = ex_dir / f"features_{o}.csv"
+        f = pd.read_csv(path, dtype={"feature": str, "chromosome": str, "status": str}, keep_default_na=False)
+        unknown = sorted(set(f["status"]) - set(_STAGE_DE_EXPORT_STATUSES))
+        if unknown:
+            raise ValueError(f"{path} has status(es) {unknown}; stage-de reads a primary export ({_STAGE_DE_EXPORT_STATUSES})")
+        if not f["feature"].is_unique:
+            raise ValueError(f"{path}: feature names repeat")
+        tested = f["status"].isin(STAGE_DE_FEATURE_STATUSES).to_numpy()
+        kept = (f["status"] == STAGE_DE_EXPORTED_STATUS).to_numpy()
+        steps = export_manifest.get("feature_counts", {}).get(o, {})
+        expected = {
+            "input": len(f), "after_sex_chromosome": int((f["status"] != "sex_chromosome").sum()),
+            "after_abundance": int(tested.sum()), "after_variance": int(kept.sum()),
+        }
+        for key, val in expected.items():
+            if steps.get(key) != val:
+                raise ValueError(
+                    f"{path} gives {key} = {val} but {ex_dir / 'manifest.json'} records {steps.get(key)}; {rerun_export}"
+                )
+        if f.loc[kept, "feature"].tolist() != loaded["blocks"][o].columns.astype(str).tolist():
+            raise ValueError(f"{path}: the kept features differ from the columns of {ex_dir / f'{o}.csv'}; {rerun_export}")
+        features[o] = f
+        feature_sets[o] = {"abundance": int(tested.sum()), "exported": int(kept.sum())}
+
+    counts, exported, reproduction = {}, {}, {}
+    for o in omics:
+        path = pb / f"{o}_counts.h5ad"
+        f = features[o]
+        a = ad.read_h5ad(path)
+        names = a.var_names.astype(str).to_numpy()
+        if not np.array_equal(names, f["feature"].to_numpy(dtype=str)):
+            raise ValueError(
+                f"{path} lists features other than, or in another order than, {ex_dir / f'features_{o}.csv'}; "
+                f"{rerun_export}"
+            )
+        obs = a.obs.copy()
+        obs.index = obs.index.astype(str)
+        absent = sorted(set(donors) - set(obs.index))
+        if absent:
+            raise ValueError(f"{path} has no row for {c} donor(s) {absent}; {rerun_export}")
+        for col in ("sex", "stage"):
+            if col not in obs.columns:
+                raise ValueError(f"{path}: obs lacks {col!r}")
+            bad = [d for d, v in zip(donors, meta[col].astype(str)) if str(obs.loc[d, col]) != v]
+            if bad:
+                raise ValueError(f"{path} and {ex_dir / 'metadata.csv'} disagree on {col} for donor(s) {bad}; {rerun_export}")
+        rows = obs.index.get_indexer(donors)
+        X = a.X[rows]
+        X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+        del a
+        if not np.array_equal(X, np.round(X)) or (X < 0).any():
+            raise ValueError(f"{path}: the counts are not non-negative integers")
+        reproduction[o] = _stage_de_reproduce(
+            X, f, loaded["blocks"][o], export_manifest, omic=o, donors=donors, counts_path=path, export_dir=ex_dir,
+        )
+        tested = f["status"].isin(STAGE_DE_FEATURE_STATUSES).to_numpy()
+        counts[o] = pd.DataFrame(
+            np.asarray(X[:, tested], dtype=np.int64), index=pd.Index(donors, name="donor_id"),
+            columns=f.loc[tested, "feature"].to_numpy(dtype=str),
+        )
+        exported[o] = (f.loc[tested, "status"] == STAGE_DE_EXPORTED_STATUS).to_numpy()
+        del X
+        gc.collect()
+        print(
+            f"[{log}] {c} {o}: {path.name} reproduces the export (statuses, library sizes; TMM factors to "
+            f"{reproduction[o]['tmm_factor_max_rel_diff']:.2g}, tested-feature variances to "
+            f"{reproduction[o]['variance_max_rel_diff']:.2g}, values to {reproduction[o]['values_max_abs_diff']:.2g}); "
+            f"{feature_sets[o]['abundance']} features tested, {feature_sets[o]['exported']} exported"
+        )
+
+    delta_rejected = _sensitivity_row(
+        reference["record"], cohort=c, component_selection="cv", directory=str(an_dir)
+    )["delta_rejected"]
+    if delta_rejected is None:
+        raise ValueError(f"{an_dir / 'result.json'} has no delta p-value; rerun `sead-sexdiff analyze`")
+    return {
+        "paths": paths, "hashes": hashes, "loaded": loaded, "reference": reference, "delta_rejected": delta_rejected,
+        "donors": donors, "cells": cells, "k": k, "features": features, "feature_sets": feature_sets,
+        "designs": designs, "design_checks": design_checks, "counts": counts, "exported": exported,
+        "reproduction": reproduction,
+    }
+
+
+def _stage_de_fingerprint(prep: dict, cohort: str, omic: str, model: str) -> dict:
+    """What a fit depends on: inputs (sha256), formula, tested coefficients, covariates, levels, α, pydeseq2."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        pydeseq2_version = version("pydeseq2")
+    except PackageNotFoundError:
+        pydeseq2_version = None
+    h = prep["hashes"]
+    return {
+        "cohort": cohort,
+        "omic": omic,
+        "model": model,
+        "formula": stage_de_formula(model, omic),
+        "tested": [list(t) for t in STAGE_DE_MODELS[model]["tested"]],
+        "covariates": list(STAGE_DE_COVARIATES[omic]),
+        "reference_levels": dict(STAGE_DE_REFERENCE_LEVELS),
+        "alpha": STAGE_DE_ALPHA,
+        "feature_statuses": list(STAGE_DE_FEATURE_STATUSES),
+        "donors": list(prep["donors"]),
+        "inputs": {
+            f"pseudobulk/{omic}_counts.h5ad": h["pseudobulk"][f"{omic}_counts.h5ad"],
+            "pseudobulk/manifest.json": h["pseudobulk"]["manifest.json"],
+            "pseudobulk/donor_table.csv": h["pseudobulk"]["donor_table.csv"],
+            **{f"export/{n}": h["export"][n] for n in ("metadata.csv", "covariates.csv", f"features_{omic}.csv",
+                                                      "manifest.json", f"{omic}.csv")},
+            **{f"analysis/{n}": h["analysis"][n] for n in _REFERENCE_FILES},
+        },
+        "pydeseq2": pydeseq2_version,
+    }
+
+
+def _stage_de_model_state(omic_dir: Path, model: str, fingerprint: dict) -> str:
+    """``complete`` (fit record and tables match), ``missing`` (to fit) or ``stale``.
+
+    ``stale`` covers a record made from other inputs or settings, an
+    unreadable record, and a record lacking a part the summary and manifest
+    read (``_STAGE_DE_RECORD_KEYS``), such as one written by an earlier
+    version of the step.
+    """
+    record_path = omic_dir / STAGE_DE_FIT_TEMPLATE.format(model=model)
+    if not record_path.exists():
+        return "missing"
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "stale"
+    if not isinstance(record, dict) or record.get("fingerprint") != fingerprint:
+        return "stale"
+    for path in _STAGE_DE_RECORD_KEYS:
+        node = record
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return "stale"
+            node = node[key]
+    tables = record["tables"]
+    if not isinstance(tables, dict) or not all(
+        isinstance(info, dict) and isinstance(info.get("file"), str) and isinstance(info.get("sha256"), str)
+        for info in tables.values()
+    ):
+        return "stale"
+    for label, info in tables.items():
+        p = omic_dir / info["file"]
+        if not p.is_file() or _sha256_file(p) != info["sha256"]:
+            return "missing"
+    if set(tables) != {label for label, _ in STAGE_DE_MODELS[model]["tested"]}:
+        return "missing"
+    return "complete"
+
+
+def _stage_de_summary_rows(cohort: str, omic: str, tables: dict[str, dict[str, pd.DataFrame]], delta_rejected: bool) -> list[dict]:
+    """Summary rows of one omic: per model × coefficient (and the union of a two-coefficient model) × feature set."""
+    rule = STAGE_DE_CONCORDANCE_RULE
+    rows = []
+    for model, spec in STAGE_DE_MODELS.items():
+        model_tables = tables[model]
+        labels = [label for label, _ in spec["tested"]]
+        features = model_tables[labels[0]]["feature"].tolist()
+        for label in labels[1:]:
+            if model_tables[label]["feature"].tolist() != features:
+                raise ValueError(f"stage-de: the {model} tables of {cohort} {omic} list different features")
+        exported = model_tables[labels[0]]["exported"].to_numpy(dtype=bool)
+        entries = [(label, "wald", col, model_tables[label]["padj"].to_numpy(dtype=float)[:, None])
+                   for label, col in spec["tested"]]
+        if len(labels) > 1:
+            entries.append((
+                STAGE_DE_UNION, "union", ";".join(col for _, col in spec["tested"]),
+                np.column_stack([model_tables[label]["padj"].to_numpy(dtype=float) for label in labels]),
+            ))
+        for label, kind, column, padj in entries:
+            for feature_set in STAGE_DE_FEATURE_SETS:
+                keep = exported if feature_set == "exported" else np.ones(len(features), dtype=bool)
+                p = padj[keep]
+                finite = np.isfinite(p)
+                significant = (np.where(finite, p, np.inf) <= STAGE_DE_ALPHA).any(axis=1)
+                row = {
+                    "cohort": cohort, "omic": omic, "model": model, "coefficient": label, "kind": kind,
+                    "design_column": column, "feature_set": feature_set, "n_tested": int(keep.sum()),
+                    "n_padj_missing": int((~finite).all(axis=1).sum()), "n_significant": int(significant.sum()),
+                    "min_padj": float(np.min(p[finite])) if finite.any() else float("nan"),
+                    "interaction_detected": None, "delta_rejected": None, "concordance": None,
+                }
+                if (model, label, feature_set) == (rule["model"], rule["coefficient"], rule["feature_set"]):
+                    detected = row["n_significant"] > 0
+                    row["interaction_detected"] = detected
+                    row["delta_rejected"] = bool(delta_rejected)
+                    row["concordance"] = "concordant" if detected == bool(delta_rejected) else "discordant"
+                rows.append(row)
+    return rows
+
+
+def render_stage_de(summary: pd.DataFrame, manifest: dict) -> str:
+    """Render ``stage_de.md`` from ``stage_de_summary.csv`` and ``stage_de_manifest.json``.
+
+    Parameters
+    ----------
+    summary:
+        The cohort's summary table (``STAGE_DE_SUMMARY_COLUMNS``).
+    manifest:
+        The cohort's manifest.
+
+    Returns
+    -------
+    str
+        Markdown: the reading rules, the concordance table, one count table
+        per omic (per model × coefficient and union: significant / tested on
+        the exported and the abundance-passing set, missing padj, smallest
+        padj), the models with their formulas and resolved design columns, the
+        covariates, the feature sets, the fits (runtime, CPUs, Cook's counts,
+        dispersion trend, warnings), the inputs with their sha256 and the
+        reproduction of the export, and the findings. Every number comes from
+        the two arguments.
+    """
+    c = manifest["cohort"]
+    alpha = manifest["alpha"]
+    ref = manifest["reference"]
+    lines = [
+        f"# Pseudobulk stage DE: {c}",
+        "",
+        f"Per-feature DESeq2 (pydeseq2 {manifest['software'].get('pydeseq2')}) on the raw pseudobulk counts of the "
+        f"{manifest['n_donors']} {c} donors, covariate-adjusted models of ADNC stage and of sex × stage, on the "
+        "features that passed the primary export's chromosome and abundance filters (size factors and dispersions "
+        "fitted on that set; DESeq2's own normalization, not the export's TMM). A feature is significant when "
+        f"padj ≤ {alpha}: Benjamini–Hochberg over the tested features that pass pydeseq2's independent filter (a "
+        "baseMean cutoff chosen per coefficient; a filtered feature has no padj and counts as not significant); no "
+        "permutation null. The FDR is approximate: DESeq2's Wald test plugs in estimated dispersions, and in "
+        "simulations under DESeq2's own model the realized FDR at padj ≤ 0.05 was about 0.06–0.09, higher when few "
+        "features are non-null. With continuous covariates no two donors share a design row, so Cook's refit and Cook's "
+        "filtering are inactive by construction (as in R's DESeq2): the per-feature results carry no outlier "
+        "protection. The `exported` counts (the features MOTCO measured) are the primary reading; padj is never "
+        "recomputed on that subset. A factor model's `union` counts features significant on either Wald-tested "
+        "coefficient and carries no joint error-rate claim (pydeseq2 has no likelihood-ratio test). "
+        "Reading rules: the stage counts describe the stage signal in the pseudobulks; the interaction counts and the "
+        "concordance cells cross-check the primary analysis and are not a second test of its hypothesis; a "
+        "discordance in either direction is reported as such, since per-feature FDR over thousands of features and "
+        "one latent-space permutation test ask related, not identical, questions; a zero interaction count means none "
+        "detected at this n, not no interaction; the primary analysis stays primary with its non-rejection rules "
+        f"(`angle` and `shape` non-rejections are uninformative). The step read sex and stage, so it is a check beside "
+        "the analysis, never a filter: no export, analysis or sensitivity run reads its outputs.",
+        "",
+        "## Concordance",
+        "",
+        f"Rule (`STAGE_DE_CONCORDANCE_RULE`, predeclared): `interaction_detected` = "
+        f"{manifest['concordance_rule']['interaction_detected']}; `delta_rejected` = "
+        f"{manifest['concordance_rule']['delta_rejected']}; {manifest['concordance_rule']['cell']}. The primary "
+        f"analysis (`{ref['dir']}`, CV-selected rank {ref['selected_lv']}, MOTCO {ref['motco']}) is read, never "
+        "rerun or modified; a DE result changes no MOTCO reading.",
+        "",
+        "| omic | interaction detected | exported features with interaction padj ≤ α | delta rejected | cell |",
+        "|---|:---:|---:|:---:|---|",
+    ]
+    for o, cell in manifest["concordance"].items():
+        lines.append(
+            f"| {o} | {'yes' if cell['interaction_detected'] else 'no'} | {cell['n_interaction_exported']} | "
+            f"{'yes' if cell['delta_rejected'] else 'no'} | {cell['cell']} |"
+        )
+    for o in manifest["omics"]:
+        sub = summary[summary["omic"] == o]
+        lines += [
+            "",
+            f"## Counts: {o}",
+            "",
+            f"{manifest['feature_sets'][o]['exported']} exported and {manifest['feature_sets'][o]['abundance']} "
+            "abundance-passing features tested; significant / tested at padj ≤ α, missing padj (removed by the "
+            "independent filter; for `union`, missing on both coefficients) and the smallest padj per set.",
+            "",
+            "| model | coefficient | design column | exported: significant / tested | abundance: significant / tested | "
+            "padj missing (exported / abundance) | min padj (exported) | min padj (abundance) |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+        keys = sub[["model", "coefficient"]].drop_duplicates().itertuples(index=False)
+        for model, coefficient in keys:
+            pair = sub[(sub["model"] == model) & (sub["coefficient"] == coefficient)].set_index("feature_set")
+            e, a = pair.loc["exported"], pair.loc["abundance"]
+            label = f"{coefficient} (no joint error rate)" if coefficient == STAGE_DE_UNION else coefficient
+            lines.append(
+                f"| {model} | {label} | `{e['design_column']}` | {int(e['n_significant'])} / {int(e['n_tested'])} | "
+                f"{int(a['n_significant'])} / {int(a['n_tested'])} | {int(e['n_padj_missing'])} / "
+                f"{int(a['n_padj_missing'])} | {_fmt_nan(float(e['min_padj']), '.3g')} | "
+                f"{_fmt_nan(float(a['min_padj']), '.3g')} |"
+            )
+    lines += [
+        "",
+        "## Models",
+        "",
+        f"Reference levels: {', '.join(f'{k} = `{v}`' for k, v in manifest['reference_levels'].items())} "
+        f"(treatment coding). Primary interaction model: `{manifest['primary_interaction_model']}`.",
+        "",
+        "| model | stage coding | formula (RNA) | formula (ATAC) | tested coefficient → design column |",
+        "|---|---|---|---|---|",
+    ]
+    for model, info in manifest["models"].items():
+        tested = "; ".join(f"`{t['coefficient']}` → `{t['design_column']}`" for t in info["tested"])
+        lines.append(
+            f"| {model} | {info['stage_coding']} | `{info['formulas'].get('rna', 'n/a')}` | "
+            f"`{info['formulas'].get('atac', 'n/a')}` | {tested} |"
+        )
+    cov = manifest["covariates"]
+    lines += [
+        "",
+        "## Covariates",
+        "",
+        f"Continuous, {cov['scale']}; source `{cov['source']}`; missing values: {cov['missing_policy']} (imputed: "
+        f"{'yes' if cov['imputed'] else 'no'}).",
+        "",
+    ]
+    for o in _STAGE_DE_OMICS:
+        lines.append(f"- {o}: {', '.join(f'`{x}`' for x in cov['per_omic'][o])}")
+    lines += [
+        "",
+        "## Feature sets",
+        "",
+        "| omic | abundance-passing (tested) | exported (`kept`) | statuses tested |",
+        "|---|---:|---:|---|",
+    ]
+    for o, fs in manifest["feature_sets"].items():
+        lines.append(f"| {o} | {fs['abundance']} | {fs['exported']} | {', '.join(fs['statuses'])} |")
+    lines += [
+        "",
+        "## Fits",
+        "",
+        "Dispersion trend used (pydeseq2 switches from the parametric fit to a mean trend when the parametric fit "
+        "does not converge), Cook's counts (replaceable donors, refitted and outlier features; zero by construction "
+        "here) and the features whose gene-wise or MAP dispersion or LFC fit did not converge. The warnings column "
+        "counts the warnings captured in the main process; a fit made with more than one CPU does not capture those "
+        "of pydeseq2's worker processes.",
+        "",
+        "| omic | model | features × donors | CPUs | runtime (s) | dispersion trend | Cook's replaceable / refitted / "
+        "outliers | not converged (gene-wise / MAP / LFC) | warnings |",
+        "|---|---|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for o, fits in manifest["fits"].items():
+        for model, fit in fits.items():
+            conv = fit.get("convergence", {})
+            lines.append(
+                f"| {o} | {model} | {fit['n_features']} × {fit['n_donors']} | {fit['n_cpus']} | "
+                f"{_fmt(fit['runtime_seconds'], '.1f')} | {fit['dispersion_trend']['type']} | "
+                f"{fit['cooks']['replaceable_donors']} / {fit['cooks']['refitted_features']} / "
+                f"{fit['cooks']['outlier_features']} | {conv.get('genewise_not_converged', 'n/a')} / "
+                f"{conv.get('map_not_converged', 'n/a')} / {conv.get('lfc_not_converged', 'n/a')} | "
+                f"{len(fit['warnings'])} |"
+            )
+    lines += ["", "## Inputs", ""]
+    for group, files in manifest["inputs"]["files"].items():
+        for name, info in files.items():
+            lines.append(f"- {group}: `{info['path']}` sha256 `{info['sha256']}`")
+    lines += ["", "Reproduction of the export from the counts:", ""]
+    for o, rep in manifest["export_reproduction"].items():
+        lines.append(
+            f"- {o}: statuses and library sizes equal; TMM factors to {rep['tmm_factor_max_rel_diff']:.3g} (relative), "
+            f"tested-feature log2-CPM variances to {rep.get('variance_max_rel_diff', float('nan')):.3g} (relative), "
+            f"exported values to {rep['values_max_abs_diff']:.3g} (absolute)"
+        )
+    lines += ["", "## Findings", ""]
+    lines += [f"- {msg}" for msg in manifest["findings"]] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def _write_stage_de_debug(debug_dir: Path, cohort: str, omic: str, counts: pd.DataFrame, design: pd.DataFrame) -> None:
+    """Write the tested counts and the design table for ``scripts/check_stage_de_deseq2.R``."""
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    counts.to_csv(debug_dir / f"{cohort}_{omic}_counts.csv")
+    out = design.copy()
+    for col in ("sex", "stage"):
+        out[col] = out[col].astype(str)
+    out.to_csv(debug_dir / f"{cohort}_{omic}_design.csv", float_format=_csv_float)
+
+
+def run_stage_de(
+    cohort: str = "all",
+    *,
+    omic: str = "both",
+    pseudobulk_dir: str | Path = "results/pseudobulk",
+    input_dir: str | Path = "results/motco_input",
+    analysis_dir: str | Path = "results/motco_analysis",
+    out_dir: str | Path = "results/stage_de",
+    n_cpus: int = 1,
+    force: bool = False,
+    debug_dir: str | Path | None = None,
+) -> dict:
+    """Per-feature DESeq2 of ADNC stage and sex × stage on the cohort pseudobulks, beside the primary analysis.
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    omic:
+        ``"rna"``, ``"atac"`` or ``"both"``: the omics fitted in this run.
+        The summary covers every omic whose fits are complete under the
+        cohort directory (an omic fitted earlier from the same inputs is kept).
+    pseudobulk_dir:
+        Directory holding ``rna_counts.h5ad``, ``atac_counts.h5ad``,
+        ``donor_table.csv`` and ``manifest.json`` (read, never written).
+    input_dir:
+        Export root; ``<input_dir>/<cohort>/`` is the primary export (read,
+        never written).
+    analysis_dir:
+        Analysis root; ``<analysis_dir>/<cohort>/`` is the primary analysis
+        (read and checked, never rerun or written).
+    out_dir:
+        Output root: ``<out_dir>/<cohort>/`` with ``<omic>/<model>__<coefficient>.csv``
+        (one DESeq2 table per tested coefficient), ``<omic>/<model>__fit.json``
+        (the fit record that makes the step resumable), ``stage_de_summary.csv``,
+        ``stage_de.md`` and ``stage_de_manifest.json``. It may not lie inside
+        an input directory.
+    n_cpus:
+        pydeseq2's worker count; runtime only (recorded).
+    force:
+        Refit the requested omics of a cohort even when their fits are
+        complete (their directories and the cohort's summary files are
+        replaced); without it a complete fit is skipped and a fit made from
+        other inputs or settings is an error.
+    debug_dir:
+        Python API only: write ``<cohort>_<omic>_counts.csv`` and
+        ``<cohort>_<omic>_design.csv`` (the tested counts and the design
+        table) and, per model, ``<cohort>_<omic>_<model>_trend.csv``,
+        ``_dispersions.csv`` and ``_size_factors.csv`` there for
+        ``scripts/check_stage_de_deseq2.R``. The per-model files come from the
+        fits of this call, so with ``debug_dir`` every requested model must
+        be fitted: a complete model without ``force`` is an error.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir", "summary", "manifest", "concordance", "findings", "fitted", "skipped"}``.
+
+    Raises
+    ------
+    FileNotFoundError
+        An input file is missing; the message names it and the command that
+        produces it.
+    ValueError
+        A reference check fails (pseudobulk manifest hash, reproduction of the
+        export from the counts, donors / sex / stage, k and cells, feature
+        statuses, the analysis's export hashes, MOTCO version, seed,
+        permutations or CV selection), a covariate value is missing, a fit
+        record was made from other inputs (without ``force``), a design is not
+        full rank or a coefficient cannot be resolved, or ``out_dir`` lies
+        inside an input directory.
+
+    Notes
+    -----
+    Every check runs for every requested cohort before anything is written.
+    Fits run one model at a time; each writes its tables and then its fit
+    record (``.tmp`` files renamed), so an interrupted run resumes at the first
+    model without a matching record. After a cohort's fits the input files
+    are hashed again and must be unchanged. The step reads sex and stage, so
+    its outputs are an input of no export, analysis or sensitivity step.
+    """
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    log = "stage-de"
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    omics = list(_STAGE_DE_OMICS) if omic == "both" else [omic]
+    for o in omics:
+        if o not in _STAGE_DE_OMICS:
+            raise ValueError(f"Unknown omic {o!r}; expected one of {_STAGE_DE_OMICS} or 'both'")
+    if not isinstance(n_cpus, int) or n_cpus < 1:
+        raise ValueError(f"n_cpus must be a positive integer, not {n_cpus!r}")
+    pb, input_dir, analysis_dir, out_dir = Path(pseudobulk_dir), Path(input_dir), Path(analysis_dir), Path(out_dir)
+    debug = None if debug_dir is None else Path(debug_dir)
+    for target_name, target in (("--out-dir", out_dir), ("debug_dir", debug)):
+        if target is None:
+            continue
+        for name, d in (("--pseudobulk-dir", pb), ("--input-dir", input_dir), ("--analysis-dir", analysis_dir)):
+            if _same_dir(target, d):
+                raise ValueError(
+                    f"{target_name} {target} lies inside the input directory {d} ({name}); the step never writes "
+                    "under its inputs; nothing was written"
+                )
+    motco_version = check_motco_version()
+    print(f"[{log}] Pseudobulk directory: {pb}")
+    print(f"[{log}] Primary export directory: {input_dir}")
+    print(f"[{log}] Primary analysis directory: {analysis_dir} (read and checked; it stays primary)")
+    print(f"[{log}] Output directory: {out_dir}")
+    print(
+        f"[{log}] Models: {', '.join(STAGE_DE_MODELS)} (registry STAGE_DE_MODELS); alpha {STAGE_DE_ALPHA}; "
+        f"omics fitted: {', '.join(omics)}; n_cpus {n_cpus}"
+    )
+
+    # Every check of every cohort before anything is written
+    prepared = {}
+    for c in cohorts:
+        prep = _stage_de_prepare(
+            c, pseudobulk_dir=pb, input_dir=input_dir, analysis_dir=analysis_dir, omics=omics,
+            motco_version=motco_version, log=log,
+        )
+        prep["fingerprints"] = {
+            o: {m: _stage_de_fingerprint(prep, c, o, m) for m in STAGE_DE_MODELS} for o in _STAGE_DE_OMICS
+        }
+        states = {}
+        for o in _STAGE_DE_OMICS:
+            for m in STAGE_DE_MODELS:
+                states[(o, m)] = _stage_de_model_state(out_dir / c / o, m, prep["fingerprints"][o][m])
+                if states[(o, m)] == "stale" and not (force and o in omics):
+                    hint = "rerun with --force" + ("" if o in omics else f" --omic {o} (or both)")
+                    raise ValueError(
+                        f"{out_dir / c / o / STAGE_DE_FIT_TEMPLATE.format(model=m)} is unreadable or was made from "
+                        f"other inputs or settings than the files now on disk; {hint}; nothing was written"
+                    )
+        prep["states"] = states
+        if debug is not None and not force:
+            done = [f"{o}/{m}" for o in omics for m in STAGE_DE_MODELS if states[(o, m)] == "complete"]
+            if done:
+                raise ValueError(
+                    f"debug_dir needs every requested model fitted in this call, but {', '.join(done)} of {c} are "
+                    f"complete under {out_dir / c}; pass force=True or another out_dir; nothing was written"
+                )
+        print(
+            f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
+            f"{motco_version}, seed, permutations, CV selection); delta rejected: "
+            f"{'yes' if prep['delta_rejected'] else 'no'}"
+        )
+        prepared[c] = prep
+
+    software = _software_versions()
+    for pkg in ("pydeseq2", "formulaic", "formulaic-contrasts", "statsmodels", "scikit-learn"):
+        try:
+            software[pkg] = version(pkg)
+        except PackageNotFoundError:
+            software[pkg] = None
+    software["motco"] = motco_version
+
+    results = {}
+    for c in cohorts:
+        prep = prepared[c]
+        cohort_dir = out_dir / c
+        if force:
+            for o in omics:
+                if (cohort_dir / o).exists():
+                    shutil.rmtree(cohort_dir / o)
+                for m in STAGE_DE_MODELS:
+                    prep["states"][(o, m)] = "missing"
+            for name in (STAGE_DE_SUMMARY, STAGE_DE_MARKDOWN, STAGE_DE_MANIFEST):
+                if (cohort_dir / name).exists():
+                    (cohort_dir / name).unlink()
+        fitted, skipped = [], []
+        for o in omics:
+            omic_dir = cohort_dir / o
+            omic_dir.mkdir(parents=True, exist_ok=True)
+            if debug is not None:
+                _write_stage_de_debug(debug, c, o, prep["counts"][o], prep["designs"][o])
+            for m, spec in STAGE_DE_MODELS.items():
+                if prep["states"][(o, m)] == "complete":
+                    print(f"[{log}] {c} {o} {m}: complete fit record found; skipped (rerun with --force to refit)")
+                    skipped.append((o, m))
+                    continue
+                out = stage_de_fit(
+                    prep["counts"][o], prep["designs"][o], m, omic=o, exported=prep["exported"][o], n_cpus=n_cpus,
+                )
+                checked = prep["design_checks"][o][m]
+                if out["fit"]["design_columns"] != checked["design_columns"]:
+                    raise ValueError(
+                        f"stage-de: the fitted {m} design columns {out['fit']['design_columns']} differ from the "
+                        f"pre-checked ones {checked['design_columns']}"
+                    )
+                if debug is not None:
+                    out["dispersions"].to_csv(debug / f"{c}_{o}_{m}_dispersions.csv", index=False, float_format=_csv_float)
+                    pd.Series(out["fit"]["size_factors"], name="size_factor").rename_axis("donor_id").to_csv(
+                        debug / f"{c}_{o}_{m}_size_factors.csv", float_format=_csv_float
+                    )
+                    trend = out["fit"]["dispersion_trend"]
+                    pd.DataFrame([{
+                        "type": trend["type"],
+                        "a0": (trend.get("coefficients") or {}).get("a0"),
+                        "a1": (trend.get("coefficients") or {}).get("a1"),
+                        "mean_dispersion": trend.get("mean_dispersion"),
+                    }]).to_csv(debug / f"{c}_{o}_{m}_trend.csv", index=False, float_format=_csv_float)
+                table_files = {}
+                for label, table in out["tables"].items():
+                    name = STAGE_DE_TABLE_TEMPLATE.format(model=m, coefficient=label)
+                    tmp = omic_dir / f"{name}.tmp"
+                    table.to_csv(tmp, index=False, float_format=_csv_float)
+                    os.replace(tmp, omic_dir / name)
+                    table_files[label] = {"file": name, "sha256": _sha256_file(omic_dir / name)}
+                record = {
+                    "fingerprint": prep["fingerprints"][o][m],
+                    "fit": out["fit"],
+                    "export_reproduction": prep["reproduction"][o],
+                    "tables": table_files,
+                    "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+                record_path = omic_dir / STAGE_DE_FIT_TEMPLATE.format(model=m)
+                tmp = record_path.with_name(record_path.name + ".tmp")
+                tmp.write_text(json.dumps(record, indent=2) + "\n")
+                os.replace(tmp, record_path)
+                prep["states"][(o, m)] = "complete"
+                fitted.append((o, m))
+                print(
+                    f"[{log}] {c} {o} {m}: {out['fit']['n_features']} features × {out['fit']['n_donors']} donors in "
+                    f"{out['fit']['runtime_seconds']:.1f} s; padj <= {STAGE_DE_ALPHA}: "
+                    + ", ".join(
+                        f"{label} {info['n_significant']}" for label, info in out["fit"]["coefficients"].items()
+                    )
+                )
+            prep["counts"].pop(o, None)
+            gc.collect()
+
+        # Omics not fitted in this run: their state again now (another run may have completed them)
+        for o in _STAGE_DE_OMICS:
+            if o in omics:
+                continue
+            for m in STAGE_DE_MODELS:
+                state = _stage_de_model_state(cohort_dir / o, m, prep["fingerprints"][o][m])
+                if state == "stale":
+                    raise ValueError(
+                        f"{cohort_dir / o / STAGE_DE_FIT_TEMPLATE.format(model=m)} became unreadable or was replaced "
+                        f"by a fit from other inputs during this run; rerun with --force --omic {o}"
+                    )
+                prep["states"][(o, m)] = state
+        included = [o for o in _STAGE_DE_OMICS if all(prep["states"][(o, m)] == "complete" for m in STAGE_DE_MODELS)]
+        records, tables = {}, {}
+        for o in included:
+            records[o], tables[o] = {}, {}
+            for m, spec in STAGE_DE_MODELS.items():
+                records[o][m] = json.loads((cohort_dir / o / STAGE_DE_FIT_TEMPLATE.format(model=m)).read_text())
+                tables[o][m] = {
+                    label: pd.read_csv(
+                        cohort_dir / o / STAGE_DE_TABLE_TEMPLATE.format(model=m, coefficient=label),
+                        dtype={"feature": str}, keep_default_na=False, na_values=[""], float_precision="round_trip",
+                    )
+                    for label, _ in spec["tested"]
+                }
+        rows = []
+        for o in included:
+            rows += _stage_de_summary_rows(c, o, tables[o], prep["delta_rejected"])
+        summary = pd.DataFrame(rows, columns=list(STAGE_DE_SUMMARY_COLUMNS))
+        rule = STAGE_DE_CONCORDANCE_RULE
+        concordance, findings = {}, []
+        for o in included:
+            cell = summary[
+                (summary["omic"] == o) & (summary["model"] == rule["model"])
+                & (summary["coefficient"] == rule["coefficient"]) & (summary["feature_set"] == rule["feature_set"])
+            ].iloc[0]
+            concordance[o] = {
+                "interaction_detected": bool(cell["interaction_detected"]),
+                "n_interaction_exported": int(cell["n_significant"]),
+                "delta_rejected": bool(cell["delta_rejected"]),
+                "cell": str(cell["concordance"]),
+            }
+            if concordance[o]["cell"] == "discordant":
+                if concordance[o]["interaction_detected"]:
+                    what = (
+                        f"{concordance[o]['n_interaction_exported']} exported {o} feature(s) have padj <= "
+                        f"{STAGE_DE_ALPHA} on an interaction coefficient of {rule['model']} and the primary analysis "
+                        "did not reject delta"
+                    )
+                else:
+                    what = (
+                        f"no exported {o} feature has padj <= {STAGE_DE_ALPHA} on an interaction coefficient of "
+                        f"{rule['model']} and the primary analysis rejected delta"
+                    )
+                findings.append(
+                    f"{c} {o}: discordant: {what}; reported beside both (per-feature FDR and one latent-space "
+                    "permutation test ask related, not identical, questions); the primary analysis stays primary and "
+                    "is unchanged"
+                )
+        missing = [o for o in _STAGE_DE_OMICS if o not in included]
+        for o in missing:
+            findings.append(f"{c} {o}: not fitted yet (run `sead-sexdiff stage-de --omic {o}`); the summary lacks it")
+        for o in included:
+            for m in STAGE_DE_MODELS:
+                for msg in records[o][m]["fit"]["warnings"]:
+                    findings.append(f"{c} {o} {m}: pydeseq2 warning: {msg}")
+        fit_cpus = {
+            f"{o}/{m}": records[o][m]["fit"]["n_cpus"] for o in included for m in STAGE_DE_MODELS
+            if records[o][m]["fit"]["n_cpus"] != 1
+        }
+        if fit_cpus:
+            findings.append(
+                f"fits made with n_cpus != 1: {', '.join(f'{k} ({v})' for k, v in fit_cpus.items())}; pydeseq2's "
+                "per-feature fits are expected not to depend on n_cpus (the report states whether this was checked), "
+                "but warnings raised in pydeseq2's worker processes were not captured for these fits, so their "
+                "warning records and findings are incomplete"
+            )
+
+        hashes_now = {
+            group: {name: _sha256_file(p) for name, p in files.items()} for group, files in prep["paths"].items()
+        }
+        if hashes_now != prep["hashes"]:
+            changed = [f"{g}/{n}" for g in hashes_now for n in hashes_now[g] if hashes_now[g][n] != prep["hashes"][g][n]]
+            raise ValueError(f"input file(s) {changed} changed during the stage-de run of {c}")
+
+        reference = prep["reference"]
+        ref_record = reference["record"]
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cohort": c,
+            "n_donors": len(prep["donors"]),
+            "cells": prep["cells"],
+            "k": prep["k"],
+            "omics": included,
+            "complete": not missing,
+            "inputs": {
+                "files": {
+                    group: {name: {"path": str(p), "sha256": prep["hashes"][group][name]} for name, p in files.items()}
+                    for group, files in prep["paths"].items()
+                },
+                "pseudobulk_manifest_sha256": prep["hashes"]["pseudobulk"]["manifest.json"],
+                "export_manifest_sha256": prep["hashes"]["export"]["manifest.json"],
+                "export_input": prep["loaded"]["export_manifest"].get("input"),
+                "note": (
+                    "every file hashed before it was read and again after the run; the export records the pseudobulk "
+                    "manifest's sha256, not the count files', so the counts are bound to the export by reproduction "
+                    "(export_reproduction: statuses, library sizes, TMM factors, tested-feature log2-CPM variances, "
+                    "exported values), not by a hash"
+                ),
+            },
+            "export_reproduction": {
+                o: prep["reproduction"].get(o, records[o][next(iter(STAGE_DE_MODELS))]["export_reproduction"])
+                for o in included
+            },
+            "reference": {
+                "dir": str(reference["dir"]),
+                "files": reference["files"],
+                "result_sha256": reference["files"]["result.json"]["sha256"],
+                "delta_rejected": prep["delta_rejected"],
+                "alpha": ANALYSIS_ALPHA,
+                "rejection_rule": ANALYSIS_REJECTION_RULE,
+                "component_selection": ref_record["latent"]["component_selection"],
+                "selected_lv": ref_record["latent"]["selected_lv"],
+                "motco": reference["manifest"]["software"]["motco"],
+                "seed": reference["manifest"]["measurement"]["seed"],
+                "permutations": reference["manifest"]["measurement"]["permutations"],
+                "note": (
+                    "read and checked (export hashes, MOTCO version, seed, permutations, CV selection), never rerun "
+                    "or modified; only its delta rejection status enters the concordance rule"
+                ),
+            },
+            "models": {
+                m: {
+                    "formula": spec["formula"],
+                    "formulas": {o: stage_de_formula(m, o) for o in _STAGE_DE_OMICS},
+                    "stage_coding": spec["stage_coding"],
+                    "interaction": spec["interaction"],
+                    "tested": [
+                        {
+                            "coefficient": label,
+                            "design_column": (
+                                records[included[0]][m]["fit"]["tested"][i]["design_column"] if included else column
+                            ),
+                        }
+                        for i, (label, column) in enumerate(spec["tested"])
+                    ],
+                }
+                for m, spec in STAGE_DE_MODELS.items()
+            },
+            "primary_interaction_model": "factor_interaction",
+            "union": (
+                "a factor model's two Wald tests are also counted as their union (significant on either coefficient; "
+                "its padj missing = missing on both); the union carries no joint error-rate claim (pydeseq2 "
+                f"{software.get('pydeseq2')} has no likelihood-ratio test)"
+            ),
+            "covariates": {
+                "per_omic": {o: list(cols) for o, cols in STAGE_DE_COVARIATES.items()},
+                "scale": (
+                    "on their recorded scale, not centered or scaled (the MLE of the tested coefficients is invariant "
+                    "to affine covariate transforms; features whose dispersion optimizer fell back to a grid search "
+                    "may differ slightly, counted under fits.*.convergence); nuclei counts on the log10 scale as the "
+                    "analysis derives them"
+                ),
+                "source": str(input_dir / c / "covariates.csv"),
+                "missing_policy": ANALYSIS_MISSING_COVARIATES,
+                "imputed": False,
+            },
+            "reference_levels": dict(STAGE_DE_REFERENCE_LEVELS),
+            "alpha": STAGE_DE_ALPHA,
+            "significance": f"padj <= alpha; padj is {_STAGE_DE_PADJ_NOTE}; no permutation null",
+            "cooks": (
+                "Cook's refit and filtering are on (pydeseq2's defaults) but inactive by construction: with continuous "
+                "covariates no two donors share a design row, so no donor is replaceable and no Cook's outlier is "
+                "filtered (as in R's DESeq2); the per-feature results carry no outlier protection"
+            ),
+            "design_checks": {
+                o: {m: {k: v for k, v in chk.items() if k != "formula"} for m, chk in prep["design_checks"][o].items()}
+                for o in _STAGE_DE_OMICS
+            },
+            "normalization": (
+                "DESeq2 median-of-ratios size factors and dispersions fitted on the abundance-passing set; the "
+                "export's TMM factors are not reused"
+            ),
+            "feature_sets": {
+                o: {
+                    **prep["feature_sets"][o],
+                    "statuses": list(STAGE_DE_FEATURE_STATUSES),
+                    "exported_status": STAGE_DE_EXPORTED_STATUS,
+                    "source": str(input_dir / c / f"features_{o}.csv"),
+                }
+                for o in _STAGE_DE_OMICS
+            },
+            "fits": {
+                o: {
+                    m: {
+                        **records[o][m]["fit"],
+                        "warnings_scope": records[o][m]["fit"].get(
+                            "warnings_scope", _stage_de_warnings_scope(records[o][m]["fit"]["n_cpus"])
+                        ),
+                    }
+                    for m in STAGE_DE_MODELS
+                }
+                for o in included
+            },
+            "tables": {o: {m: records[o][m]["tables"] for m in STAGE_DE_MODELS} for o in included},
+            "concordance_rule": dict(STAGE_DE_CONCORDANCE_RULE),
+            "concordance": concordance,
+            "run": {"omics_fitted": [f"{o}/{m}" for o, m in fitted], "skipped": [f"{o}/{m}" for o, m in skipped],
+                    "n_cpus": n_cpus},
+            "outputs": sorted([STAGE_DE_SUMMARY, STAGE_DE_MARKDOWN, STAGE_DE_MANIFEST]),
+            "software": software,
+            "git": _git_revision(),
+            "findings": findings,
+        }
+        cohort_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cohort_dir / f"{STAGE_DE_SUMMARY}.tmp"
+        summary.to_csv(tmp, index=False, float_format=_csv_float)
+        os.replace(tmp, cohort_dir / STAGE_DE_SUMMARY)
+        written = pd.read_csv(cohort_dir / STAGE_DE_SUMMARY, dtype={"design_column": str}, float_precision="round_trip")
+        tmp = cohort_dir / f"{STAGE_DE_MARKDOWN}.tmp"
+        tmp.write_text(render_stage_de(written, manifest))
+        os.replace(tmp, cohort_dir / STAGE_DE_MARKDOWN)
+        tmp = cohort_dir / f"{STAGE_DE_MANIFEST}.tmp"
+        tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+        os.replace(tmp, cohort_dir / STAGE_DE_MANIFEST)
+        print(f"[{log}] Wrote {cohort_dir}")
+        for msg in findings:
+            print(f"[{log}] FINDING: {msg}")
+        results[c] = {
+            "dir": cohort_dir, "summary": summary, "manifest": manifest, "concordance": concordance,
+            "findings": findings, "fitted": fitted, "skipped": skipped,
+        }
+        del prepared[c]
+        gc.collect()
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -8837,4 +10409,12 @@ __all__ = [
     "mediator_check",
     "render_latent_sensitivity",
     "run_latent_sensitivity",
+    "STAGE_DE_MODELS",
+    "STAGE_DE_COVARIATES",
+    "STAGE_DE_CONCORDANCE_RULE",
+    "stage_de_formula",
+    "stage_de_design",
+    "stage_de_fit",
+    "render_stage_de",
+    "run_stage_de",
 ]

@@ -9,7 +9,7 @@ Fits covariate-adjusted per-feature DESeq2 models of ADNC stage and of the sex �
 ### Requirement: Inputs are the pseudobulk, the primary export and the primary analysis
 For each requested cohort the step SHALL read only:
 - the pseudobulk outputs (`rna_counts.h5ad`, `atac_counts.h5ad`, `donor_table.csv`, `manifest.json` under the pseudobulk directory);
-- the primary export (`metadata.csv`, `covariates.csv`, `features_rna.csv`, `features_atac.csv`, `manifest.json` under `<export root>/<cohort>/`);
+- the primary export (`metadata.csv`, `covariates.csv`, `features_rna.csv`, `features_atac.csv`, `manifest.json` under `<export root>/<cohort>/`, and `rna.csv`, `atac.csv` for the analysis hash check and the reproduction check only);
 - the primary analysis (`result.json`, `analysis_manifest.json` under `<analysis root>/<cohort>/`).
 
 It SHALL NOT read donor objects, and it SHALL stop with an error naming the missing file and the command that produces it, writing nothing.
@@ -23,10 +23,17 @@ It SHALL NOT read donor objects, and it SHALL stop with an error naming the miss
 - **THEN** the step stops with an error naming the file and the `analyze` command, and writes nothing
 
 ### Requirement: References must match
-Before any model is fitted the step SHALL check that the export manifest records the sha256 of the pseudobulk files now on disk, and that the analysis manifest records the sha256 of the export files now on disk, the installed MOTCO version, the analysis seed and permutation count. On any difference it SHALL stop with an error naming the file or setting, and write nothing.
+Before any fit the step SHALL check that the export manifest records the sha256 of the pseudobulk manifest now on disk, that donors, sex and stage agree between the export, the donor table and the count files, and that the analysis manifest records the export files' sha256 now on disk, the installed MOTCO version, the seed and the permutation count. On any difference it SHALL stop naming the file or setting and write nothing. The manifest SHALL record the sha256 of every input file read.
+
+#### Scenario: Pseudobulk manifest changed since the export
+- **WHEN** the pseudobulk `manifest.json` has a sha256 different from the one the export manifest records
+- **THEN** the step stops with an error naming the file and the `export` command, and writes nothing
+
+### Requirement: Counts reproduce the export
+Because the export records no count-file hash, the step SHALL rerun the export's preprocessing on the cohort donors' counts (chromosomes from `features_<omic>.csv`, recorded thresholds) before any fit, and SHALL require the recorded statuses and per-donor library sizes exactly and the TMM factors, tested-feature log2-CPM variances and exported values to rounding; otherwise it SHALL stop naming the count file and the `export` command, writing nothing.
 
 #### Scenario: Pseudobulk changed since the export
-- **WHEN** `rna_counts.h5ad` has a sha256 different from the one the export manifest records
+- **WHEN** `rna_counts.h5ad` no longer reproduces the feature statuses, library sizes, TMM factors, tested-feature variances or exported values the export recorded for the cohort donors
 - **THEN** the step stops with an error naming the file and the `export` command, and writes nothing
 
 ### Requirement: Feature set bound to the primary export
@@ -72,11 +79,11 @@ Each omic's model SHALL enter, as continuous covariates, `age_at_death`, `pmi`, 
 The step SHALL write `stage_de_summary.csv` with, per cohort × omic × model × tested coefficient (and the union per factor model), the number of tested features and the number significant at α, each on the exported set and on the abundance-passing set, plus the smallest `padj`. The exported-set counts SHALL be the primary reading.
 
 #### Scenario: Summary rows
-- **WHEN** both omics of both cohorts have run
-- **THEN** the summary has a row for every cohort × omic × coefficient and union, with `n_tested` and `n_significant` for `feature_set` `exported` and `abundance`, and the exported `n_tested` is 5,000 in every row
+- **WHEN** both omics of a cohort have run
+- **THEN** that cohort's `stage_de_summary.csv` has a row for every omic × coefficient and union × `feature_set` (`exported`, `abundance`), with `n_tested` and `n_significant`, and the exported `n_tested` is 5,000 in every row
 
 ### Requirement: Predeclared concordance rule against the primary analysis
-For each cohort and omic the step SHALL evaluate, from the generated files: `interaction_detected` (at least one exported feature with `padj ≤ α` on either interaction coefficient of `factor_interaction`) against `delta_rejected` read from the primary analysis's `result.json` under the analysis rejection rule. The cell SHALL be `concordant` when both are true or both are false, `discordant` otherwise, and a discordance SHALL be written as a finding. The rule SHALL read no p-value of the primary analysis, SHALL change no MOTCO output, and SHALL be a constant.
+For each cohort and omic the step SHALL evaluate, from the generated files: `interaction_detected` (at least one exported feature with `padj ≤ α` on either interaction coefficient of `factor_interaction`) against `delta_rejected` read from the primary analysis's `result.json` under the analysis rejection rule. The cell SHALL be `concordant` when both are true or both are false, `discordant` otherwise, and a discordance SHALL be written as a finding. The rule SHALL read only the binary `delta` rejection status (derived from `result.json` under the analysis rejection rule, as the comparison tables derive it) and no p-value magnitude, SHALL change no MOTCO output, and SHALL be a constant.
 
 #### Scenario: Both negative
 - **WHEN** no exported RNA feature has an interaction `padj ≤ 0.05` in `cohort_30` and the primary analysis did not reject `delta`
@@ -87,7 +94,11 @@ For each cohort and omic the step SHALL evaluate, from the generated files: `int
 - **THEN** the cell is `discordant`, the manifest records a finding naming the cohort, omic and count, and the primary analysis's files are unchanged
 
 ### Requirement: Outputs, manifest and reproducibility
-The step SHALL write, per cohort, the result tables, `stage_de_summary.csv`, `stage_de.md` (rendered from the summary and the manifest) and `stage_de_manifest.json` recording: the input files with sha256, the pseudobulk and export manifest hashes, the primary analysis's `result.json` hash and `delta` status, the models, covariates, reference levels and α, the feature counts per set, the concordance cells, findings, pydeseq2 and dependency versions, git revision and timestamps. A rerun on the same inputs and versions SHALL give equal result tables (equal `pvalue` and `padj`, equal counts) and a byte-identical summary. The step SHALL write nothing under the pseudobulk, export or analysis directories, and no `export`, `analyze` or sensitivity step SHALL read its outputs.
+The step SHALL write, per cohort, the result tables, a fit record per omic × model (`<omic>/<model>__fit.json`: the fingerprint of the inputs and settings, the fit, the reproduction of the export, each table's sha256), `stage_de_summary.csv`, `stage_de.md` (rendered from the summary and the manifest) and `stage_de_manifest.json` recording: the input files with sha256, the pseudobulk and export manifest hashes, the primary analysis's `result.json` hash and `delta` status, the models, covariates, reference levels and α, the feature counts per set, the concordance cells, findings, pydeseq2 and dependency versions, git revision and timestamps. A rerun on the same inputs and versions SHALL give equal result tables (equal `pvalue` and `padj`, equal counts) and a byte-identical summary. The step SHALL write nothing under the pseudobulk, export or analysis directories, and no `export`, `analyze` or sensitivity step SHALL read its outputs.
+
+#### Scenario: Resume
+- **WHEN** a model's fit record matches the inputs and settings now on disk and its tables hash as recorded, and the step runs without `--force`
+- **THEN** the model is skipped, and a record made from other inputs or settings stops the step with an error naming it, writing nothing
 
 #### Scenario: Rerun
 - **WHEN** `stage-de --cohort cohort_30` is run twice with `--force`

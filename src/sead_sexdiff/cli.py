@@ -25,6 +25,8 @@ from .data import (
     LATENT_SENSITIVITY_ADDED_COVARIATES,
     LATENT_SENSITIVITY_CONDITIONING,
     LATENT_MOTCO_MIN_VERSION,
+    STAGE_DE_ALPHA,
+    STAGE_DE_MODELS,
     run_analysis,
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
@@ -32,6 +34,7 @@ from .data import (
     run_technical_covariates,
     run_axis_diagnostics,
     run_latent_sensitivity,
+    run_stage_de,
     run_export,
     run_pseudobulk,
     write_subset_from_folder,
@@ -742,6 +745,83 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace a cohort's existing arm and comparison directories under --out-dir",
     )
+
+    # stage-de command: per-feature DESeq2 of stage and sex x stage beside the primary analysis
+    models = ", ".join(STAGE_DE_MODELS)
+    sub_sd = sub.add_parser(
+        "stage-de",
+        help="Per-feature DESeq2 of ADNC stage and sex x stage on the cohort pseudobulks, beside the primary analysis",
+        description=(
+            "Per cohort and omic, from the pseudobulk counts, the primary export and the primary analysis: fit the "
+            f"covariate-adjusted DESeq2 models of the registry STAGE_DE_MODELS (a constant, not a flag; now: {models}) "
+            "with pydeseq2 on the raw counts of the cohort donors, on the features that passed the export's "
+            "chromosome and abundance filters (features_<omic>.csv status variance or kept; size factors and "
+            "dispersions fitted on that set), with sex (reference Female), stage (reference 0) and the omic's "
+            "covariates (age_at_death, pmi, rin, years_education, log10_n_<omic>). One Wald test per tested "
+            f"coefficient, Benjamini-Hochberg padj at alpha = {STAGE_DE_ALPHA} with pydeseq2's defaults; counts on the "
+            "exported set (MOTCO's features, the primary reading) and on the abundance-passing set. The predeclared "
+            "concordance rule compares the exported interaction count of factor_interaction with the primary "
+            "analysis's delta rejection status. Before anything is fitted the export is checked against the "
+            "pseudobulk (manifest hash, and the export's preprocessing reproduced from the counts) and the analysis "
+            "against the export (hashes, MOTCO version, seed, permutations, CV selection). The primary analysis "
+            "stays primary and is never rerun or written. Writes <out-dir>/<cohort>/ (<omic>/<model>__<coefficient>.csv, "
+            "<omic>/<model>__fit.json, stage_de_summary.csv, stage_de.md, stage_de_manifest.json); resumable per "
+            "model."
+        ),
+    )
+    sub_sd.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to run (default: %(default)s)",
+    )
+    sub_sd.add_argument(
+        "--omic",
+        choices=["rna", "atac", "both"],
+        default="both",
+        help=(
+            "Omic(s) to fit; the summary covers every omic whose fits are complete in the cohort directory "
+            "(default: %(default)s)"
+        ),
+    )
+    sub_sd.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help=(
+            "Directory holding rna_counts.h5ad, atac_counts.h5ad, donor_table.csv and manifest.json; read, never "
+            "written (default: %(default)s)"
+        ),
+    )
+    sub_sd.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+    )
+    sub_sd.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+    )
+    sub_sd.add_argument(
+        "--out-dir",
+        default=Path("results/stage_de"),
+        type=Path,
+        help="Output root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_sd.add_argument(
+        "--n-cpus",
+        type=int,
+        default=1,
+        help="pydeseq2 worker processes; runtime only, recorded in the manifest (default: %(default)s)",
+    )
+    sub_sd.add_argument(
+        "--force",
+        action="store_true",
+        help="Refit the requested omics even when their fits are complete, replacing them and the cohort's summary",
+    )
     return parser
 
 
@@ -1030,6 +1110,34 @@ def main(argv: list[str] | None = None) -> int:
                   + ("no flag" if not flags else ", ".join(
                       f"{f['covariate']} {f['subset']} rho {f['spearman']:.3f}" for f in flags)))
         print("[latent-sensitivity] Done.")
+        return 0
+
+    if args.command == "stage-de":
+        import pandas as pd
+
+        print("[stage-de] Running the per-feature stage and sex x stage DESeq2 models...")
+        results = run_stage_de(
+            args.cohort,
+            omic=args.omic,
+            pseudobulk_dir=args.pseudobulk_dir,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            out_dir=args.out_dir,
+            n_cpus=args.n_cpus,
+            force=args.force,
+        )
+        columns = ["cohort", "omic", "model", "coefficient", "feature_set", "n_tested", "n_significant", "min_padj"]
+        table = pd.concat([res["summary"][columns] for res in results.values()], ignore_index=True)
+        print(f"[stage-de] Counts at padj <= {STAGE_DE_ALPHA} (union = either coefficient, no joint error-rate claim):")
+        print(table.to_string(index=False))
+        for cohort, res in results.items():
+            for omic, cell in res["concordance"].items():
+                print(
+                    f"[stage-de] {cohort} {omic}: concordance {cell['cell']} (interaction detected: "
+                    f"{'yes' if cell['interaction_detected'] else 'no'}, {cell['n_interaction_exported']} exported "
+                    f"features; primary delta rejected: {'yes' if cell['delta_rejected'] else 'no'})"
+                )
+        print("[stage-de] Done.")
         return 0
 
     parser.error("Unknown command")

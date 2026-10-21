@@ -141,6 +141,27 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `comparison/<cohort>/` with `latent_sensitivity.csv`,
    `latent_sensitivity.md`, `mediator_check.csv`,
    `latent_sensitivity_manifest.json`).
+11. `stage-de` – from `results/pseudobulk/` (`rna_counts.h5ad`,
+   `atac_counts.h5ad`, `donor_table.csv`, `manifest.json`),
+   `results/motco_input/` and `results/motco_analysis/` only, per cohort and
+   omic: per-feature DESeq2 (pydeseq2) of the four models of the registry
+   `STAGE_DE_MODELS` (`factor_additive`, `factor_interaction`,
+   `trend_additive`, `trend_interaction`) with sex, stage and
+   `STAGE_DE_COVARIATES` on the raw counts of the cohort donors, on the
+   export's abundance-passing features (`features_<omic>.csv` status
+   `variance` or `kept`; `exported` marks `kept`), one Wald test per tested
+   coefficient (a unit contrast on the design column found by name). The
+   counts are bound to the export by the pseudobulk manifest hash and a
+   reproduction (`preprocess_block` rerun on the counts: statuses, library
+   sizes, TMM factors, tested-feature log2-CPM variances, exported values),
+   since the export records no count-file hash; the analysis by
+   `_check_reference`. The predeclared
+   `STAGE_DE_CONCORDANCE_RULE` compares the exported interaction count of
+   `factor_interaction` with the primary `delta` rejection status. Writes
+   `results/stage_de/<cohort>/` (`<omic>/<model>__<coefficient>.csv`,
+   `<omic>/<model>__fit.json` (the resume record), `stage_de_summary.csv`,
+   `stage_de.md`, `stage_de_manifest.json`). It reads sex and stage, so its
+   outputs feed no export, analysis or sensitivity command.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -152,15 +173,17 @@ when behavior or defaults change.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
   pseudobulk, differential expression, covariates, technical covariates,
   MOTCO export, analysis, the rank / preprocessing / latent-adjustment
-  sensitivity analyses and the axis diagnostics.
+  sensitivity analyses, the axis diagnostics and the pseudobulk stage DE.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
   `sync_pseudobulk.sh` (rsync of `results/pseudobulk/` to a workstation,
   per-donor caches excluded), `check_tmm_edger.R`
-  (one-off edgeR cross-check of the export's TMM / log2-CPM) and
+  (one-off edgeR cross-check of the export's TMM / log2-CPM),
   `check_cyclic_loess_limma.R` (limma cross-check of the variants' cyclic
-  loess on `_export_cohort` debug files).
+  loess on `_export_cohort` debug files) and `check_stage_de_deseq2.R` (R
+  DESeq2 cross-check of one `stage-de` fit on `run_stage_de(debug_dir=...)`
+  files).
 - `data/`, `results/` – gitignored; never commit their contents.
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
   Their numbers are pasted from generated outputs (`summary.md`, manifests),
@@ -171,10 +194,10 @@ when behavior or defaults change.
 
 - Python `>=3.12,<3.14`, managed with **uv** (`uv.lock` is committed).
 - Setup: the Nix flake (`flake.nix`) provides Python 3.12, uv, R, and the R
-  packages used by `DEG.R`, `check_tmm_edger.R` and `check_cyclic_loess_limma.R`; its shell hook runs `uv sync --locked`. Enter it
+  packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R` and `check_stage_de_deseq2.R` (DESeq2); its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
   `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -426,6 +449,48 @@ when behavior or defaults change.
   no operating characteristic measured on these blocks or at eight
   covariates, and the nuclei counts and the fractions both proxying library
   quality.
+- Stage-DE constants (flag and ask before changing any of them):
+  `STAGE_DE_MODELS` (a registry, never a flag, never chosen from results:
+  `factor_additive` `~ sex + stage` testing `stage[T.1]`, `stage[T.2]`;
+  `factor_interaction` `+ sex:stage` testing `sex[T.Male]:stage[T.1]`,
+  `sex[T.Male]:stage[T.2]`, the primary interaction model;
+  `trend_additive` `~ sex + stage_num` testing `stage_num`;
+  `trend_interaction` `+ sex:stage_num` testing `sex[T.Male]:stage_num`, a
+  second predeclared model, not a fallback; the two Wald tests of a factor
+  model also counted as their `union` (`STAGE_DE_UNION`), with no joint
+  error-rate claim, since pydeseq2 0.5.3 has no LRT),
+  `STAGE_DE_REFERENCE_LEVELS` (`Female`, stage `0`; treatment coding via the
+  categorical order), `STAGE_DE_COVARIATES` (per omic `age_at_death`, `pmi`,
+  `rin`, `years_education` and the omic's own `log10_n_<omic>`, continuous,
+  recorded scale, never imputed; tied at import to `ANALYSIS_COVARIATES`
+  minus the other omic's count), `STAGE_DE_FEATURE_STATUSES` (`variance`,
+  `kept`: the export-bound tested set; size factors and dispersions fitted
+  on it; the export's TMM not reused) with `STAGE_DE_EXPORTED_STATUS`
+  (`kept`) and `STAGE_DE_FEATURE_SETS` (`exported` the primary reading,
+  `abundance`; `padj` never recomputed on a subset), `STAGE_DE_ALPHA` (0.05,
+  `padj ≤ α`, pydeseq2's BH with independent filtering and Cook's defaults,
+  no LFC shrinkage, no permutation null), `STAGE_DE_CONCORDANCE_RULE`
+  (exported `factor_interaction` union count > 0 against the primary `delta`
+  rejection status; reads a count and a status, never a p-value magnitude;
+  a discordance is a finding), the reproduction tolerances
+  `STAGE_DE_TMM_RTOL` (1e-10) and `STAGE_DE_VALUES_RTOL` (1e-9), the output
+  names (`STAGE_DE_*`), and the rule that the primary analysis stays
+  primary. `--n-cpus` does not change the tables, but warnings raised in pydeseq2's worker processes are not
+  captured when it is above 1 (recorded as `warnings_scope` and in the `n_cpus` finding). Reading rules for the report: the
+  stage counts describe the stage signal in the pseudobulks; the
+  interaction counts and the concordance cells cross-check the primary
+  analysis and are not a second test of its hypothesis; a discordance in
+  either direction is reported as such (per-feature FDR and one latent-space
+  permutation test ask related, not identical, questions); a zero
+  interaction count is "none detected at this n"; the union counts carry no
+  joint error-rate claim; the MOTCO non-rejection rules are untouched; the
+  covariate set, the feature set and DESeq2's own normalization are stated
+  beside the counts; the FDR of `padj ≤ α` is approximate and Cook's
+  handling is inactive with continuous covariates. Changes to the fit must be
+  re-checked with `scripts/check_stage_de_deseq2.R` (full DESeq2 fit with
+  pydeseq2's trend type plus a plug-in Wald test on pydeseq2's dispersions;
+  exit 0 / 2 / 3 / 4, see README; the full fit is not expected to meet 1e-3
+  on every feature).
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
