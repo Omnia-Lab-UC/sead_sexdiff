@@ -10361,6 +10361,1465 @@ def run_stage_de(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Pseudobulk stage DE, limma-voom (a second predeclared method beside stage-de)
+# ---------------------------------------------------------------------------
+
+# The method, fixed before any limma run (design D3–D5): edgeR TMM on the
+# tested counts with the export's trims (library size = their column sums) →
+# voomWithQualityWeights (voom's precision weights times one quality weight per
+# donor from arrayWeights) → lmFit → eBayes, each with limma 3.68.4's defaults.
+# The R script passes every argument it can as written here and stops when an
+# installed default differs (arrayWeights' prior.n, which
+# voomWithQualityWeights does not pass on, is only checked). A constant, never
+# a flag, never changed from results; flag and ask before changing.
+STAGE_DE_LIMMA_METHOD: dict = {
+    "normalization": {
+        "function": "edgeR::calcNormFactors",
+        "method": "TMM",
+        "logratioTrim": TMM_LOGRATIO_TRIM,
+        "sumTrim": TMM_SUM_TRIM,
+        "doWeighting": True,
+        "Acutoff": -1e10,
+        "refColumn": "automatic (upper-quartile factor closest to the mean)",
+        "lib_size": "column sums of the tested counts",
+    },
+    "weights": {
+        "function": "limma::voomWithQualityWeights",
+        "normalize.method": "none",
+        "span": 0.5,
+        "adaptive.span": True,
+        "var.design": None,
+        "var.group": None,
+        "method": "genebygene",
+        "maxiter": 50,
+        "tol": 1e-5,
+        "prior.n": 10,
+    },
+    "fit": {"function": "limma::lmFit", "method": "ls"},
+    "moderation": {
+        "function": "limma::eBayes",
+        "proportion": 0.01,
+        "stdev.coef.lim": [0.1, 4.0],
+        "trend": False,
+        "robust": False,
+        "legacy": None,
+    },
+    "adjust_method": "BH",
+    "bh_family": "all tested features (limma has no independent filter; the export's abundance filter is the only one)",
+}
+if (
+    STAGE_DE_LIMMA_METHOD["normalization"]["logratioTrim"] != TMM_LOGRATIO_TRIM
+    or STAGE_DE_LIMMA_METHOD["normalization"]["sumTrim"] != TMM_SUM_TRIM
+):
+    raise AssertionError("STAGE_DE_LIMMA_METHOD's TMM trims must be TMM_LOGRATIO_TRIM / TMM_SUM_TRIM (the export's)")
+# One joint moderated F per factor model over its two tested coefficients
+# (label, (coefficient labels)); a trend model has one coefficient, whose t is
+# its test. Tied to STAGE_DE_MODELS; flag and ask before changing.
+STAGE_DE_LIMMA_JOINT_TESTS: dict[str, tuple[str, tuple[str, str]]] = {
+    "factor_additive": ("stage_joint", ("stage_1_vs_0", "stage_2_vs_0")),
+    "factor_interaction": ("interaction_joint", ("male_x_stage_1", "male_x_stage_2")),
+}
+if set(STAGE_DE_LIMMA_JOINT_TESTS) != {m for m, spec in STAGE_DE_MODELS.items() if len(spec["tested"]) > 1} or any(
+    labels != tuple(label for label, _ in STAGE_DE_MODELS[m]["tested"])
+    or joint in labels or joint == STAGE_DE_UNION
+    for m, (joint, labels) in STAGE_DE_LIMMA_JOINT_TESTS.items()
+) or len({joint for joint, _ in STAGE_DE_LIMMA_JOINT_TESTS.values()}) != len(STAGE_DE_LIMMA_JOINT_TESTS):
+    raise AssertionError(
+        "STAGE_DE_LIMMA_JOINT_TESTS must name, per factor model of STAGE_DE_MODELS, exactly its two tested labels "
+        "in order, under a label of its own"
+    )
+# Written before any limma run (proposal); evaluated per cohort × omic beside
+# the DESeq2 cell (STAGE_DE_CONCORDANCE_RULE), which stays the reported cell of
+# stage-de. Reads a count and the primary analysis's delta status, never a
+# p-value magnitude of MOTCO's; changes no MOTCO output. Flag and ask before changing.
+STAGE_DE_LIMMA_CONCORDANCE_RULE: dict[str, str] = {
+    "model": "factor_interaction",
+    "test": "interaction_joint",
+    "feature_set": "exported",
+    "interaction_detected": (
+        "at least one exported feature (status kept) with adj.P.Val <= STAGE_DE_ALPHA on the joint moderated F of "
+        "factor_interaction's two interaction coefficients (interaction_joint)"
+    ),
+    "delta_rejected": STAGE_DE_CONCORDANCE_RULE["delta_rejected"],
+    "cell": STAGE_DE_CONCORDANCE_RULE["cell"],
+    "beside": (
+        "reported beside the DESeq2 cell (STAGE_DE_CONCORDANCE_RULE, the union of two Wald tests), which stays the "
+        "reported cell of stage-de; methods_agree compares the two interaction_detected values and a disagreement "
+        "is a method-dependence finding; neither cell replaces the other or changes a MOTCO reading"
+    ),
+}
+if not (
+    STAGE_DE_LIMMA_CONCORDANCE_RULE["model"] == STAGE_DE_CONCORDANCE_RULE["model"]
+    and STAGE_DE_LIMMA_CONCORDANCE_RULE["test"] == STAGE_DE_LIMMA_JOINT_TESTS[STAGE_DE_CONCORDANCE_RULE["model"]][0]
+    and STAGE_DE_LIMMA_CONCORDANCE_RULE["feature_set"] == STAGE_DE_CONCORDANCE_RULE["feature_set"]
+):
+    raise AssertionError(
+        "STAGE_DE_LIMMA_CONCORDANCE_RULE must name the factor interaction model's joint test on the exported set"
+    )
+# The step's TMM factors (edgeR, in R) against the export manifest's, absolute;
+# the tolerance of scripts/check_tmm_edger.R. Beyond it the cohort stops.
+STAGE_DE_LIMMA_TMM_ATOL = 1e-8
+# Layout under <out_dir>/<cohort>/ (stage-de's): <omic>/<model>__<label>.csv per
+# tested coefficient and joint test, <omic>/<model>__fit.json per fit (the
+# resume record), then the summary, the method comparison, the Markdown and
+# the manifest. The R script ships beside this module.
+STAGE_DE_LIMMA_TABLE_TEMPLATE = "{model}__{label}.csv"
+STAGE_DE_LIMMA_FIT_TEMPLATE = "{model}__fit.json"
+STAGE_DE_LIMMA_SUMMARY = "stage_de_limma_summary.csv"
+STAGE_DE_LIMMA_COMPARISON = "method_comparison.csv"
+STAGE_DE_LIMMA_MARKDOWN = "stage_de_limma.md"
+STAGE_DE_LIMMA_MANIFEST = "stage_de_limma_manifest.json"
+STAGE_DE_LIMMA_SCRIPT = "stage_de_limma.R"
+STAGE_DE_LIMMA_TABLE_COLUMNS = ("feature", "AveExpr", "logFC", "SE", "t", "P.Value", "adj.P.Val", "B", "exported")
+# Summary rows: stage-de's columns; kind is moderated_t, union or joint_f
+STAGE_DE_LIMMA_SUMMARY_COLUMNS = STAGE_DE_SUMMARY_COLUMNS
+STAGE_DE_LIMMA_COMPARISON_COLUMNS = (
+    "cohort", "omic", "model", "test", "kind", "deseq2_test", "limma_test", "feature_set", "n_tested",
+    "n_significant_deseq2", "n_significant_limma", "n_both", "n_only_deseq2", "n_only_limma", "detected_deseq2",
+    "detected_limma", "detection_agrees", "spearman_log2fc", "spearman_stat", "n_compared", "delta_rejected",
+    "concordance_deseq2", "concordance_limma", "methods_agree",
+)
+_STAGE_DE_LIMMA_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+
+
+def stage_de_limma_script() -> Path:
+    """The packaged R script (``stage_de_limma.R``, shipped beside this module)."""
+    return Path(__file__).with_name(STAGE_DE_LIMMA_SCRIPT)
+
+
+def _run_stage_de_limma_r(args: list[str], *, what: str) -> subprocess.CompletedProcess:
+    """Run the packaged R script with one BLAS thread; raise with the end of R's stderr on failure."""
+    import shutil
+
+    exe = shutil.which("Rscript")
+    if exe is None:
+        raise RuntimeError(
+            "Rscript is not on PATH; stage-de-limma runs R (limma, edgeR) from the project's Nix shell: enter it with "
+            "direnv or `nix develop`, or run `nix develop -c uv run sead-sexdiff stage-de-limma ...`; nothing was written"
+        )
+    env = dict(os.environ)
+    for name in _STAGE_DE_LIMMA_THREAD_ENV:
+        env[name] = "1"
+    proc = subprocess.run(
+        [exe, "--vanilla", str(stage_de_limma_script()), *args], capture_output=True, text=True, env=env, check=False,
+    )
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
+        raise RuntimeError(
+            f"stage-de-limma: R failed ({what}; exit status {proc.returncode}); nothing of it was written. End of R's "
+            f"error output:\n{tail}"
+        )
+    return proc
+
+
+def stage_de_limma_versions() -> dict:
+    """R, limma, edgeR and jsonlite versions as the packaged script reports them, plus the script's sha256."""
+    proc = _run_stage_de_limma_r(["--versions"], what="--versions")
+    out = json.loads(proc.stdout)
+    out["script_sha256"] = _sha256_file(stage_de_limma_script())
+    return out
+
+
+def _stage_de_limma_settings(model: str, omic: str, check: dict) -> dict:
+    """``settings.json`` of one model: what the R script fits, tests and checks."""
+    resolved = check["resolved"]
+    joint = []
+    if model in STAGE_DE_LIMMA_JOINT_TESTS:
+        label, coefficients = STAGE_DE_LIMMA_JOINT_TESTS[model]
+        joint.append({"label": label, "coefficients": list(coefficients), "columns": [resolved[c] for c in coefficients]})
+    return {
+        "model": model,
+        "omic": omic,
+        "formula": stage_de_formula(model, omic),
+        "levels": {v: list(levels) for v, levels in _STAGE_DE_LEVELS.items()},
+        "tested": [{"label": label, "column": resolved[label]} for label, _ in STAGE_DE_MODELS[model]["tested"]],
+        "joint": joint,
+        "alpha": STAGE_DE_ALPHA,
+        "tmm_atol": STAGE_DE_LIMMA_TMM_ATOL,
+        "method": STAGE_DE_LIMMA_METHOD,
+    }
+
+
+def write_stage_de_limma_exchange(
+    directory: str | Path,
+    counts: pd.DataFrame,
+    design: pd.DataFrame,
+    *,
+    omic: str,
+    export_tmm: pd.Series,
+    models: Iterable[str] | None = None,
+) -> dict[str, Path]:
+    """Write one omic's exchange files for ``stage_de_limma.R``.
+
+    Parameters
+    ----------
+    directory:
+        The omic directory: ``counts.csv`` (features × donors, integers) and
+        ``export_tmm.csv`` (``donor_id``, ``factor``) are written once there,
+        and one subdirectory per model holds links to both plus
+        ``design_matrix.csv``, ``design_table.csv`` (``%.17g``) and
+        ``settings.json``, so each model directory can be rerun by hand.
+    counts:
+        Donors × tested features raw counts, rows in ``design`` order.
+    design:
+        ``stage_de_design`` output for the same donors.
+    omic:
+        Selects the covariates of the formulas.
+    export_tmm:
+        The export manifest's TMM factor per donor (indexed by donor id).
+    models:
+        Keys of ``STAGE_DE_MODELS`` (default: all).
+
+    Returns
+    -------
+    dict
+        Model → its directory.
+
+    Raises
+    ------
+    ValueError
+        Donors differ between the counts, the design and the TMM factors, a
+        count is not a non-negative integer, a name holds a character the CSV
+        exchange cannot carry, or a design fails ``stage_de_design_check``.
+    """
+    import shutil
+
+    from formulaic_contrasts import FormulaicContrasts
+
+    d = Path(directory)
+    models = list(STAGE_DE_MODELS) if models is None else list(models)
+    donors = design.index.astype(str).tolist()
+    if counts.index.astype(str).tolist() != donors:
+        raise ValueError("stage-de-limma: the count rows and the design rows list different donors (or orders)")
+    tmm = export_tmm.copy()
+    tmm.index = tmm.index.astype(str)
+    if sorted(tmm.index) != sorted(donors):
+        raise ValueError("stage-de-limma: the export TMM factors list other donors than the counts")
+    names = [*counts.columns.astype(str), *donors]
+    bad = [n for n in names if any(ch in n for ch in ',"\n\r')]
+    if bad:
+        raise ValueError(f"stage-de-limma: name(s) {bad[:3]} hold a comma, quote or line break; the exchange cannot carry them")
+    values = counts.to_numpy()
+    if not np.issubdtype(values.dtype, np.integer):
+        values = np.asarray(values, dtype=float)
+        if not np.all(np.isfinite(values)) or not np.array_equal(values, np.round(values)):
+            raise ValueError("stage-de-limma: the counts are not integer-valued")
+    if (values < 0).any():
+        raise ValueError("stage-de-limma: the counts contain negative values")
+    d.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(values.astype(np.int64).T, index=pd.Index(counts.columns.astype(str), name="feature"),
+                         columns=donors)
+    frame.to_csv(d / "counts.csv")
+    pd.DataFrame({"donor_id": donors, "factor": tmm.loc[donors].to_numpy(dtype=float)}).to_csv(
+        d / "export_tmm.csv", index=False, float_format="%.17g"
+    )
+    table = design.copy()
+    table.index = table.index.astype(str)
+    table.index.name = "donor_id"
+    for col in _STAGE_DE_LEVELS:
+        table[col] = table[col].astype(str)
+    dirs = {}
+    for model in models:
+        check = stage_de_design_check(design, model, omic)
+        matrix = FormulaicContrasts(design, stage_de_formula(model, omic)).design_matrix
+        md = d / model
+        md.mkdir(exist_ok=True)
+        for name in ("counts.csv", "export_tmm.csv"):
+            target = md / name
+            if target.exists():
+                target.unlink()
+            try:
+                os.link(d / name, target)
+            except OSError:
+                shutil.copyfile(d / name, target)
+        pd.DataFrame(np.asarray(matrix, dtype=float), index=pd.Index(donors, name="donor_id"),
+                     columns=[str(c) for c in matrix.columns]).to_csv(md / "design_matrix.csv", float_format="%.17g")
+        table.to_csv(md / "design_table.csv", float_format="%.17g")
+        (md / "settings.json").write_text(json.dumps(_stage_de_limma_settings(model, omic, check), indent=2) + "\n")
+        dirs[model] = md
+    return dirs
+
+
+def stage_de_limma_check(directory: str | Path, model_dirs: dict[str, Path]) -> dict:
+    """Run the R script's ``--check``: donor ids, TMM against the export, every model's design rebuilt in R.
+
+    Returns ``check.json`` (TMM result, design checks per model, versions);
+    raises with R's message when a check fails.
+    """
+    d = Path(directory)
+    _run_stage_de_limma_r(["--check", str(d), *[str(p) for p in model_dirs.values()]], what=f"checks in {d}")
+    return json.loads((d / "check.json").read_text())
+
+
+def _read_r_table(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"feature": str, "donor_id": str}, keep_default_na=False, na_values=["NA"],
+                       float_precision="round_trip")
+
+
+def stage_de_limma_fit(
+    counts: pd.DataFrame,
+    design: pd.DataFrame,
+    model: str,
+    *,
+    omic: str,
+    export_tmm: pd.Series,
+    exported: Iterable[bool] | None = None,
+    model_dir: str | Path | None = None,
+) -> dict:
+    """Fit one registered stage-DE model with limma-voom (quality weights) in R and test its coefficients.
+
+    Parameters
+    ----------
+    counts:
+        Donors × tested features raw counts (integers), rows in ``design``
+        order, columns in the export's order.
+    design:
+        ``stage_de_design`` output for the same donors.
+    model:
+        A key of ``STAGE_DE_MODELS``.
+    omic:
+        Selects the covariates of the formula.
+    export_tmm:
+        The export manifest's TMM factor per donor; the R side's edgeR TMM
+        must equal it to ``STAGE_DE_LIMMA_TMM_ATOL``.
+    exported:
+        Per feature, whether it is one of MOTCO's exported features (the
+        ``exported`` column); ``None`` leaves the column out.
+    model_dir:
+        A model directory already written by ``write_stage_de_limma_exchange``
+        (kept, with R's outputs, for a rerun by hand). ``None`` writes the
+        exchange files into a temporary directory removed afterwards.
+
+    Returns
+    -------
+    dict
+        ``tables`` (label → DataFrame: per tested coefficient ``feature``,
+        ``AveExpr``, ``logFC``, ``SE``, ``t``, ``P.Value``, ``adj.P.Val``,
+        ``B``; per joint test ``feature``, ``AveExpr``, the two
+        ``logFC_<coefficient>``, ``F``, ``P.Value``, ``adj.P.Val``; each with
+        ``exported``, one row per feature in ``counts`` order) and ``fit``
+        (formula, design columns and resolved tests, the TMM check and
+        factors, the R-side design check, voom's span, the sample weights per
+        donor with their minimum, median, maximum and per-cell means, the
+        empirical-Bayes hyperparameters, per-test counts, the exact-F
+        diagnostic, versions, the script's sha256, runtime).
+
+    Raises
+    ------
+    RuntimeError
+        ``Rscript`` is not on ``PATH`` (the message names the Nix shell) or
+        the R process fails (the message ends with R's stderr).
+    ValueError
+        The inputs are inconsistent (see ``write_stage_de_limma_exchange``)
+        or R's tables do not list the tested features in order or lack an
+        adjusted p-value.
+    """
+    import shutil
+    import tempfile
+
+    if model not in STAGE_DE_MODELS:
+        raise ValueError(f"unknown stage-DE model {model!r}; expected one of {tuple(STAGE_DE_MODELS)}")
+    spec = STAGE_DE_MODELS[model]
+    features = counts.columns.astype(str).tolist()
+    mask = None if exported is None else np.asarray(list(exported), dtype=bool)
+    if mask is not None and mask.size != len(features):
+        raise ValueError(f"stage-de-limma: exported has {mask.size} entries for {len(features)} features")
+    check = stage_de_design_check(design, model, omic)
+    t0 = time.perf_counter()
+    tmp = None
+    try:
+        if model_dir is None:
+            tmp = Path(tempfile.mkdtemp(prefix="stage_de_limma_"))
+            md = write_stage_de_limma_exchange(tmp, counts, design, omic=omic, export_tmm=export_tmm, models=[model])[model]
+        else:
+            md = Path(model_dir)
+        for p in md.glob("*__*.csv"):
+            p.unlink()
+        for name in ("fit.json", "sample_weights.csv", "tmm.csv"):
+            if (md / name).exists():
+                (md / name).unlink()
+        _run_stage_de_limma_r([str(md)], what=f"{omic} {model}")
+        r_fit = json.loads((md / "fit.json").read_text())
+        tables = {}
+        labels = [(label, f"coef__{label}.csv", False) for label, _ in spec["tested"]]
+        if model in STAGE_DE_LIMMA_JOINT_TESTS:
+            labels.append((STAGE_DE_LIMMA_JOINT_TESTS[model][0], f"joint__{STAGE_DE_LIMMA_JOINT_TESTS[model][0]}.csv", True))
+        for label, name, joint in labels:
+            table = _read_r_table(md / name)
+            if table["feature"].tolist() != features:
+                raise ValueError(f"stage-de-limma: R's {name} for {omic} {model} does not list the tested features in order")
+            if table["adj.P.Val"].isna().any():
+                raise ValueError(f"stage-de-limma: R's {name} for {omic} {model} lacks an adjusted p-value")
+            if mask is not None:
+                table["exported"] = mask
+            tables[label] = table
+        weights = _read_r_table(md / "sample_weights.csv").set_index("donor_id")["weight"]
+        tmm = _read_r_table(md / "tmm.csv").set_index("donor_id")
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    runtime = time.perf_counter() - t0
+
+    sex = design["sex"].astype(str)
+    stage = design["stage"].astype(str)
+    cells = {}
+    for s in _STAGE_DE_LEVELS["sex"]:
+        for t in _STAGE_DE_LEVELS["stage"]:
+            members = design.index[(sex == s).to_numpy() & (stage == t).to_numpy()].astype(str)
+            cells[f"{s}/stage {t}"] = {"n": int(len(members)), "mean_weight": float(weights.loc[members].mean())}
+    versions = dict(r_fit["versions"])
+    versions["script_sha256"] = _sha256_file(stage_de_limma_script())
+    joint_info = {}
+    if model in STAGE_DE_LIMMA_JOINT_TESTS:
+        label, coefficients = STAGE_DE_LIMMA_JOINT_TESTS[model]
+        joint_info[label] = {
+            "coefficients": list(coefficients),
+            "design_columns": [check["resolved"][c] for c in coefficients],
+            **r_fit["joint"][label],
+        }
+    fit = {
+        "model": model,
+        "omic": omic,
+        "formula": check["formula"],
+        "stage_coding": spec["stage_coding"],
+        "interaction": spec["interaction"],
+        "design_columns": check["design_columns"],
+        "tested": [
+            {"coefficient": label, "expected_column": expected, "design_column": check["resolved"][label]}
+            for label, expected in spec["tested"]
+        ],
+        "joint": joint_info,
+        "n_donors": int(r_fit["n_donors"]),
+        "n_features": int(r_fit["n_features"]),
+        "n_exported": None if mask is None else int(mask.sum()),
+        "tmm": {**r_fit["tmm"], "factors": {str(k): float(v) for k, v in tmm["factor"].items()}},
+        "design_check": r_fit["design_check"],
+        "installed_defaults_equal_method": r_fit["installed_defaults_equal_method"],
+        "voom": r_fit["voom"],
+        "sample_weights": {
+            "per_donor": {str(k): float(v) for k, v in weights.items()},
+            "min": float(weights.min()),
+            "median": float(weights.median()),
+            "max": float(weights.max()),
+            "per_cell_mean": cells,
+        },
+        "ebayes": r_fit["ebayes"],
+        "coefficients": {
+            label: {
+                "n_padj_missing": int(t["adj.P.Val"].isna().sum()),
+                "n_significant": int((t["adj.P.Val"] <= STAGE_DE_ALPHA).sum()),
+            }
+            for label, t in tables.items()
+        },
+        "settings": STAGE_DE_LIMMA_METHOD,
+        "versions": versions,
+        "runtime_seconds": runtime,
+        "r_runtime_seconds": r_fit["runtime_seconds"],
+    }
+    return {"tables": tables, "fit": fit}
+
+
+# The parts of a fit record the summary and the manifest read; a record lacking
+# one (an earlier version's, or a damaged one) is stale
+_STAGE_DE_LIMMA_RECORD_KEYS = (
+    ("tables",), ("fit", "tmm", "max_abs_diff"), ("fit", "sample_weights", "per_cell_mean"), ("fit", "ebayes"),
+    ("fit", "coefficients"), ("fit", "versions", "script_sha256"), ("fit", "tested"), ("fit", "joint"),
+    ("fit", "design_check"), ("fit", "voom"),
+)
+
+
+def _stage_de_limma_labels(model: str) -> list[tuple[str, str]]:
+    """(label, kind) of every table of one model: its moderated t's, then its joint F."""
+    labels = [(label, "moderated_t") for label, _ in STAGE_DE_MODELS[model]["tested"]]
+    if model in STAGE_DE_LIMMA_JOINT_TESTS:
+        labels.append((STAGE_DE_LIMMA_JOINT_TESTS[model][0], "joint_f"))
+    return labels
+
+
+def _stage_de_limma_fingerprint(prep: dict, cohort: str, omic: str, model: str, versions: dict) -> dict:
+    """What a limma fit depends on: stage-de's fingerprint without pydeseq2, plus the method, joint tests, script and R versions."""
+    fingerprint = _stage_de_fingerprint(prep, cohort, omic, model)
+    fingerprint.pop("pydeseq2")
+    fingerprint.update({
+        "joint": [STAGE_DE_LIMMA_JOINT_TESTS[model][0], list(STAGE_DE_LIMMA_JOINT_TESTS[model][1])]
+        if model in STAGE_DE_LIMMA_JOINT_TESTS else None,
+        "method": STAGE_DE_LIMMA_METHOD,
+        "tmm_atol": STAGE_DE_LIMMA_TMM_ATOL,
+        "script_sha256": versions["script_sha256"],
+        "r_versions": {k: versions[k] for k in ("R", "limma", "edgeR", "jsonlite")},
+    })
+    return fingerprint
+
+
+def _stage_de_limma_model_state(omic_dir: Path, model: str, fingerprint: dict) -> str:
+    """``complete`` (fit record and tables match), ``missing`` (to fit) or ``stale`` (stage-de's resume semantics)."""
+    record_path = omic_dir / STAGE_DE_LIMMA_FIT_TEMPLATE.format(model=model)
+    if not record_path.exists():
+        return "missing"
+    try:
+        record = json.loads(record_path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "stale"
+    if not isinstance(record, dict) or record.get("fingerprint") != fingerprint:
+        return "stale"
+    for path in _STAGE_DE_LIMMA_RECORD_KEYS:
+        node = record
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return "stale"
+            node = node[key]
+    tables = record["tables"]
+    if not isinstance(tables, dict) or not all(
+        isinstance(info, dict) and isinstance(info.get("file"), str) and isinstance(info.get("sha256"), str)
+        for info in tables.values()
+    ):
+        return "stale"
+    for info in tables.values():
+        p = omic_dir / info["file"]
+        if not p.is_file() or _sha256_file(p) != info["sha256"]:
+            return "missing"
+    if set(tables) != {label for label, _ in _stage_de_limma_labels(model)}:
+        return "missing"
+    return "complete"
+
+
+def _read_stage_de_table(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"feature": str}, keep_default_na=False, na_values=[""], float_precision="round_trip")
+
+
+def _stage_de_limma_deseq2_reference(deseq2_dir: Path, cohort: str, prep: dict) -> dict:
+    """Read the DESeq2 stage-DE outputs of one cohort and check they belong to the inputs now on disk (design D10).
+
+    Raises a ``FileNotFoundError`` or ``ValueError`` naming the file and the
+    ``stage-de`` command; nothing is written under ``deseq2_dir``.
+    """
+    d = deseq2_dir / cohort
+    rerun = "rerun `sead-sexdiff stage-de --force` (DESeq2) on the inputs now on disk; nothing was written"
+    manifest_path = d / STAGE_DE_MANIFEST
+    for p in (manifest_path, d / STAGE_DE_SUMMARY):
+        if not p.exists():
+            raise FileNotFoundError(f"{p} is missing; run `sead-sexdiff stage-de` (DESeq2) to produce it; nothing was written")
+    files = {str(p.relative_to(d)): _sha256_file(p) for p in sorted(d.rglob("*")) if p.is_file()}
+    manifest = json.loads(manifest_path.read_text())
+    if not manifest.get("complete") or sorted(manifest.get("omics", [])) != sorted(_STAGE_DE_OMICS):
+        raise ValueError(
+            f"{manifest_path} is not complete for both omics (complete = {manifest.get('complete')}, omics "
+            f"{manifest.get('omics')}); run `sead-sexdiff stage-de --omic both`; nothing was written"
+        )
+    recorded = manifest.get("inputs", {}).get("files", {})
+    for group, names in prep["hashes"].items():
+        for name, sha in names.items():
+            then = recorded.get(group, {}).get(name, {}).get("sha256")
+            if then != sha:
+                raise ValueError(
+                    f"{manifest_path} records sha256 {then} for {group}/{name} but the file now on disk has {sha}: the "
+                    f"DESeq2 run was made from other inputs; {rerun}"
+                )
+    extra = sorted(f"{g}/{n}" for g, names in recorded.items() for n in names if n not in prep["hashes"].get(g, {}))
+    if extra:
+        raise ValueError(f"{manifest_path} records input(s) {extra} that this step does not read; {rerun}")
+    tables = {}
+    for o in _STAGE_DE_OMICS:
+        tables[o] = {}
+        for m, spec in STAGE_DE_MODELS.items():
+            entries = manifest.get("tables", {}).get(o, {}).get(m, {})
+            tables[o][m] = {}
+            for label, _ in spec["tested"]:
+                info = entries.get(label)
+                if not isinstance(info, dict):
+                    raise ValueError(f"{manifest_path} records no table for {o} {m} {label}; {rerun}")
+                p = d / o / info["file"]
+                if not p.is_file() or files.get(str(p.relative_to(d))) != info["sha256"]:
+                    raise ValueError(
+                        f"{p} does not hash as {manifest_path} records (sha256 {info['sha256']}); the DESeq2 table was "
+                        f"edited or replaced; {rerun}"
+                    )
+                tables[o][m][label] = _read_stage_de_table(p)
+    summary = pd.read_csv(d / STAGE_DE_SUMMARY, dtype={"design_column": str}, float_precision="round_trip")
+    rows = []
+    for o in _STAGE_DE_OMICS:
+        rows += _stage_de_summary_rows(cohort, o, tables[o], prep["delta_rejected"])
+    recomputed = pd.DataFrame(rows, columns=list(STAGE_DE_SUMMARY_COLUMNS))
+    keys = ["omic", "model", "coefficient", "feature_set"]
+    merged = recomputed.merge(summary, on=keys, how="outer", suffixes=("_now", "_file"), indicator=True)
+    bad = merged[merged["_merge"] != "both"]
+    if len(bad):
+        raise ValueError(f"{d / STAGE_DE_SUMMARY} lists other rows than its tables give ({len(bad)} row(s) differ); {rerun}")
+    for col in ("n_tested", "n_significant", "n_padj_missing"):
+        diff = merged[merged[f"{col}_now"].astype(int) != merged[f"{col}_file"].astype(int)]
+        if len(diff):
+            r = diff.iloc[0]
+            raise ValueError(
+                f"{d / STAGE_DE_SUMMARY} gives {col} = {int(r[f'{col}_file'])} for {r['omic']} {r['model']} "
+                f"{r['coefficient']} ({r['feature_set']}) but its tables give {int(r[f'{col}_now'])}; {rerun}"
+            )
+    cells = {}
+    rule = STAGE_DE_CONCORDANCE_RULE
+    for o in _STAGE_DE_OMICS:
+        sel = (merged["omic"] == o) & (merged["model"] == rule["model"]) & (merged["coefficient"] == rule["coefficient"]) & (
+            merged["feature_set"] == rule["feature_set"])
+        r = merged[sel].iloc[0]
+        now = {"interaction_detected": bool(r["interaction_detected_now"]), "delta_rejected": bool(r["delta_rejected_now"]),
+               "cell": str(r["concordance_now"])}
+        file = {"interaction_detected": str(r["interaction_detected_file"]) == "True",
+                "delta_rejected": str(r["delta_rejected_file"]) == "True", "cell": str(r["concordance_file"])}
+        recorded_cell = manifest.get("concordance", {}).get(o, {})
+        if now != file or recorded_cell.get("cell") != now["cell"] or recorded_cell.get(
+                "n_interaction_exported") != int(r["n_significant_now"]):
+            raise ValueError(
+                f"{d / STAGE_DE_SUMMARY} or {manifest_path} gives the {o} concordance cell {file} but the tables give "
+                f"{now}; {rerun}"
+            )
+        cells[o] = {**now, "n_interaction_exported": int(r["n_significant_now"])}
+    return {
+        "dir": d, "manifest": manifest, "files": files, "tables": tables, "summary": recomputed, "concordance": cells,
+        "manifest_sha256": files[STAGE_DE_MANIFEST], "summary_sha256": files[STAGE_DE_SUMMARY],
+        "software": manifest.get("software", {}),
+    }
+
+
+def _stage_de_limma_summary_rows(
+    cohort: str, omic: str, tables: dict[str, dict[str, pd.DataFrame]], delta_rejected: bool,
+) -> list[dict]:
+    """Summary rows of one omic: per model × moderated t, joint F and union × feature set."""
+    rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
+    rows = []
+    for model, spec in STAGE_DE_MODELS.items():
+        model_tables = tables[model]
+        labels = _stage_de_limma_labels(model)
+        features = model_tables[labels[0][0]]["feature"].tolist()
+        for label, _ in labels[1:]:
+            if model_tables[label]["feature"].tolist() != features:
+                raise ValueError(f"stage-de-limma: the {model} tables of {cohort} {omic} list different features")
+        exported = model_tables[labels[0][0]]["exported"].to_numpy(dtype=bool)
+        columns = dict(spec["tested"])
+        entries = []
+        for label, kind in labels:
+            column = columns[label] if kind == "moderated_t" else ";".join(
+                columns[c] for c in STAGE_DE_LIMMA_JOINT_TESTS[model][1])
+            entries.append((label, kind, column, model_tables[label]["adj.P.Val"].to_numpy(dtype=float)[:, None]))
+        if len(spec["tested"]) > 1:
+            entries.append((
+                STAGE_DE_UNION, "union", ";".join(col for _, col in spec["tested"]),
+                np.column_stack([model_tables[label]["adj.P.Val"].to_numpy(dtype=float) for label, _ in spec["tested"]]),
+            ))
+        for label, kind, column, padj in entries:
+            for feature_set in STAGE_DE_FEATURE_SETS:
+                keep = exported if feature_set == "exported" else np.ones(len(features), dtype=bool)
+                p = padj[keep]
+                finite = np.isfinite(p)
+                significant = (np.where(finite, p, np.inf) <= STAGE_DE_ALPHA).any(axis=1)
+                row = {
+                    "cohort": cohort, "omic": omic, "model": model, "coefficient": label, "kind": kind,
+                    "design_column": column, "feature_set": feature_set, "n_tested": int(keep.sum()),
+                    "n_padj_missing": int((~finite).all(axis=1).sum()), "n_significant": int(significant.sum()),
+                    "min_padj": float(np.min(p[finite])) if finite.any() else float("nan"),
+                    "interaction_detected": None, "delta_rejected": None, "concordance": None,
+                }
+                if (model, label, feature_set) == (rule["model"], rule["test"], rule["feature_set"]):
+                    detected = row["n_significant"] > 0
+                    row["interaction_detected"] = detected
+                    row["delta_rejected"] = bool(delta_rejected)
+                    row["concordance"] = "concordant" if detected == bool(delta_rejected) else "discordant"
+                rows.append(row)
+    return rows
+
+
+def _stage_de_limma_comparison_rows(
+    cohort: str, omic: str, limma: dict[str, dict[str, pd.DataFrame]], deseq2: dict[str, dict[str, pd.DataFrame]],
+    concordance: dict,
+) -> list[dict]:
+    """Method-comparison rows of one omic (design D9): coefficient, union and joint-F-against-union rows per feature set."""
+    from scipy.stats import spearmanr
+
+    def significant(frame: pd.DataFrame, col: str) -> np.ndarray:
+        p = frame[col].to_numpy(dtype=float)
+        return np.where(np.isfinite(p), p, np.inf) <= STAGE_DE_ALPHA
+
+    rows = []
+    for model, spec in STAGE_DE_MODELS.items():
+        labels = [label for label, _ in spec["tested"]]
+        features = deseq2[model][labels[0]]["feature"].tolist()
+        for label, _ in _stage_de_limma_labels(model):
+            if limma[model][label]["feature"].tolist() != features:
+                raise ValueError(
+                    f"stage-de-limma: the {cohort} {omic} {model} {label} table lists other features than the DESeq2 "
+                    "tables; both must come from the same export"
+                )
+        exported = deseq2[model][labels[0]]["exported"].to_numpy(dtype=bool)
+        if not np.array_equal(exported, limma[model][labels[0]]["exported"].to_numpy(dtype=bool)):
+            raise ValueError(f"stage-de-limma: the {cohort} {omic} {model} tables disagree on `exported`")
+        entries = [
+            (label, "coefficient", label, label, significant(deseq2[model][label], "padj"),
+             significant(limma[model][label], "adj.P.Val"), label)
+            for label in labels
+        ]
+        if len(labels) > 1:
+            d_union = np.any([significant(deseq2[model][label], "padj") for label in labels], axis=0)
+            l_union = np.any([significant(limma[model][label], "adj.P.Val") for label in labels], axis=0)
+            entries.append((STAGE_DE_UNION, "union", STAGE_DE_UNION, STAGE_DE_UNION, d_union, l_union, None))
+            joint = STAGE_DE_LIMMA_JOINT_TESTS[model][0]
+            entries.append((joint, "joint_f_vs_union", STAGE_DE_UNION, joint, d_union,
+                            significant(limma[model][joint], "adj.P.Val"), None))
+        for test, kind, d_test, l_test, d_sig, l_sig, coef in entries:
+            for feature_set in STAGE_DE_FEATURE_SETS:
+                keep = exported if feature_set == "exported" else np.ones(len(features), dtype=bool)
+                ds, ls = d_sig[keep], l_sig[keep]
+                row = {
+                    "cohort": cohort, "omic": omic, "model": model, "test": test, "kind": kind, "deseq2_test": d_test,
+                    "limma_test": l_test, "feature_set": feature_set, "n_tested": int(keep.sum()),
+                    "n_significant_deseq2": int(ds.sum()), "n_significant_limma": int(ls.sum()),
+                    "n_both": int((ds & ls).sum()), "n_only_deseq2": int((ds & ~ls).sum()),
+                    "n_only_limma": int((~ds & ls).sum()), "detected_deseq2": bool(ds.any()),
+                    "detected_limma": bool(ls.any()), "detection_agrees": bool(ds.any()) == bool(ls.any()),
+                    "spearman_log2fc": None, "spearman_stat": None, "n_compared": None,
+                    "delta_rejected": None, "concordance_deseq2": None, "concordance_limma": None, "methods_agree": None,
+                }
+                if coef is not None:
+                    dt, lt = deseq2[model][coef], limma[model][coef]
+                    pairs = {
+                        "spearman_log2fc": (dt["log2FoldChange"], lt["logFC"]),
+                        "spearman_stat": (dt["stat"], lt["t"]),
+                    }
+                    finite = keep.copy()
+                    for a, b in pairs.values():
+                        finite &= np.isfinite(a.to_numpy(dtype=float)) & np.isfinite(b.to_numpy(dtype=float))
+                    row["n_compared"] = int(finite.sum())
+                    for name, (a, b) in pairs.items():
+                        row[name] = float(spearmanr(a.to_numpy(dtype=float)[finite], b.to_numpy(dtype=float)[finite])[0]) \
+                            if finite.sum() > 2 else float("nan")
+                rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
+                if (model, test, feature_set) == (rule["model"], rule["test"], rule["feature_set"]):
+                    row.update({
+                        "delta_rejected": concordance["delta_rejected"],
+                        "concordance_deseq2": concordance["deseq2"]["cell"],
+                        "concordance_limma": concordance["limma"]["cell"],
+                        "methods_agree": concordance["methods_agree"],
+                    })
+                rows.append(row)
+    return rows
+
+
+def render_stage_de_limma(summary: pd.DataFrame, comparison: pd.DataFrame, manifest: dict) -> str:
+    """Render ``stage_de_limma.md`` from the summary, the method comparison and the manifest.
+
+    Parameters
+    ----------
+    summary:
+        The cohort's ``stage_de_limma_summary.csv``.
+    comparison:
+        The cohort's ``method_comparison.csv``.
+    manifest:
+        The cohort's ``stage_de_limma_manifest.json``.
+
+    Returns
+    -------
+    str
+        Markdown: the reading rules, the side-by-side concordance table, one
+        count table per omic with the DESeq2 counts beside limma's, the
+        comparison rows, the sample weights per model and cell, the TMM
+        check, the exact-F diagnostic, the inputs and the findings. Every
+        number comes from the three arguments.
+    """
+    c = manifest["cohort"]
+    alpha = manifest["alpha"]
+    ref = manifest["reference"]
+    sw = manifest["software"]
+    lines = [
+        f"# Pseudobulk stage DE, limma-voom: {c}",
+        "",
+        f"A second predeclared method beside DESeq2 (`stage-de`), on the same {manifest['n_donors']} {c} donors, raw "
+        "pseudobulk counts, registered models, design matrices and abundance-passing features. Method: edgeR TMM on "
+        "the tested counts with the export's trims (checked against the export manifest's factors) → "
+        "voomWithQualityWeights (voom's precision weights times one quality weight per donor) → lmFit → eBayes, with "
+        f"limma's defaults (R {sw['R']}, limma {sw['limma']}, edgeR {sw['edgeR']}; script sha256 "
+        f"`{sw['stage_de_limma_script_sha256'][:12]}…`). Moderated t per tested coefficient; a joint moderated F per "
+        "factor model over its two coefficients (`stage_joint`, `interaction_joint`); a feature is significant when "
+        f"its Benjamini–Hochberg adjusted p ≤ {alpha} over all tested features (limma has no independent filter; "
+        "DESeq2's BH family is smaller where its filter removes features). voom's log-CPM "
+        "(`log2((count + 0.5) / (lib.size × factor + 1) × 1e6)`) is not the export's prior-2 log2-CPM. The joint F "
+        "combines the moderated t's through the unweighted design's coefficient correlation, so with voom's weights "
+        "its claim is approximate (the exact-F diagnostic below measures it); a factor model's `union` counts features "
+        "significant on either moderated t and carries no joint error-rate claim.",
+        "",
+        "Reading rules: this change was proposed after the DESeq2 results were known, and the DESeq2 results stay the "
+        "reported ones; a call that differs between the methods is method dependence, not a result of either; the "
+        "same donors and counts enter both methods, so agreement is not replication; a zero count means none detected "
+        "at this n, not no effect; the concordance cells cross-check the primary analysis and are not a second test "
+        "of its hypothesis, whose non-rejection rules are untouched (`angle` and `shape` non-rejections are "
+        "uninformative). The step read sex and stage, so it is a check beside the analysis, never a filter: no "
+        "export, analysis or sensitivity run reads its outputs.",
+        "",
+        "## Concordance",
+        "",
+        f"Rule (`STAGE_DE_LIMMA_CONCORDANCE_RULE`, predeclared): `interaction_detected` = "
+        f"{manifest['concordance_rule']['interaction_detected']}; `delta_rejected` = "
+        f"{manifest['concordance_rule']['delta_rejected']}; {manifest['concordance_rule']['cell']}. "
+        f"{manifest['concordance_rule']['beside'][:1].upper()}{manifest['concordance_rule']['beside'][1:]}. The primary "
+        f"analysis (`{ref['dir']}`, CV-selected rank "
+        f"{ref['selected_lv']}, MOTCO {ref['motco']}) is read, never rerun or modified.",
+        "",
+        "| omic | DESeq2: exported features (union of two Wald tests) | DESeq2 cell | limma: exported features "
+        "(interaction_joint) | limma cell | delta rejected | methods agree |",
+        "|---|---:|---|---:|---|:---:|:---:|",
+    ]
+    for o, cell in manifest["concordance"].items():
+        lines.append(
+            f"| {o} | {cell['deseq2']['n_interaction_exported']} | {cell['deseq2']['cell']} | "
+            f"{cell['limma']['n_interaction_exported']} | {cell['limma']['cell']} | "
+            f"{'yes' if cell['delta_rejected'] else 'no'} | {'yes' if cell['methods_agree'] else 'no'} |"
+        )
+    kind_label = {"moderated_t": "moderated t", "joint_f": "joint F", "union": "union (no joint error rate)"}
+    for o in manifest["omics"]:
+        sub = summary[summary["omic"] == o]
+        comp = comparison[comparison["omic"] == o]
+        lines += [
+            "",
+            f"## Counts: {o}",
+            "",
+            f"{manifest['feature_sets'][o]['exported']} exported and {manifest['feature_sets'][o]['abundance']} "
+            f"abundance-passing features tested; significant / tested at adjusted p ≤ α. The DESeq2 columns are the "
+            "same coefficient's Wald test, the union for a union row, and DESeq2's union of the model's two Wald tests "
+            "for a joint-F row (a different test, `joint_f_vs_union`).",
+            "",
+            "| model | test | kind | design column | limma exported | limma abundance | DESeq2 exported | DESeq2 abundance "
+            "| min adj. p limma (exported / abundance) |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+        for (model, test), pair in sub.groupby(["model", "coefficient"], sort=False):
+            pair = pair.set_index("feature_set")
+            e, a = pair.loc["exported"], pair.loc["abundance"]
+            cmp = comp[(comp["model"] == model) & (comp["test"] == test)].set_index("feature_set")
+            de, da = cmp.loc["exported"], cmp.loc["abundance"]
+            lines.append(
+                f"| {model} | {test} | {kind_label[e['kind']]} | `{e['design_column']}` | "
+                f"{int(e['n_significant'])} / {int(e['n_tested'])} | {int(a['n_significant'])} / {int(a['n_tested'])} | "
+                f"{int(de['n_significant_deseq2'])} / {int(de['n_tested'])} | "
+                f"{int(da['n_significant_deseq2'])} / {int(da['n_tested'])} | "
+                f"{_fmt_nan(float(e['min_padj']), '.3g')} / {_fmt_nan(float(a['min_padj']), '.3g')} |"
+            )
+        lines += [
+            "",
+            f"## Method comparison: {o}",
+            "",
+            "Features called by both methods and by one only, whether each method detects anything, and, per "
+            "coefficient, the Spearman correlations of DESeq2's log2 fold change with limma's logFC and of the Wald "
+            "statistic with the moderated t (over the features with both values finite). Descriptive: no p-value, "
+            "no gate; a row whose detection differs is a method-dependence finding.",
+            "",
+            "| model | test | kind | set | DESeq2 | limma | both | only DESeq2 | only limma | detection agrees | "
+            "ρ log2FC | ρ statistic | compared |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|:---:|---:|---:|---:|",
+        ]
+        for _, r in comp.iterrows():
+            rho = [_fmt_nan(None if pd.isna(r[k]) else float(r[k]), ".3f") for k in ("spearman_log2fc", "spearman_stat")]
+            n_comp = "" if pd.isna(r["n_compared"]) else str(int(r["n_compared"]))
+            lines.append(
+                f"| {r['model']} | {r['test']} | {r['kind']} | {r['feature_set']} | {int(r['n_significant_deseq2'])} | "
+                f"{int(r['n_significant_limma'])} | {int(r['n_both'])} | {int(r['n_only_deseq2'])} | "
+                f"{int(r['n_only_limma'])} | {'yes' if bool(r['detection_agrees']) else 'no'} | {rho[0]} | {rho[1]} | "
+                f"{n_comp} |"
+            )
+    lines += [
+        "",
+        "## Sample weights",
+        "",
+        "One quality weight per donor and model (arrayWeights inside voomWithQualityWeights, shrunk toward 1 with "
+        "`prior.n = 10`): minimum, median, maximum and the mean per sex × stage cell. Shown without a gate; a cell "
+        "with a low mean weight counts less in that model's fit.",
+        "",
+    ]
+    cell_names = None
+    for o, fits in manifest["fits"].items():
+        for model, fit in fits.items():
+            w = fit["sample_weights"]
+            if cell_names is None:
+                cell_names = list(w["per_cell_mean"])
+                lines += [
+                    "| omic | model | min | median | max | " + " | ".join(cell_names) + " |",
+                    "|---|---|---:|---:|---:|" + "---:|" * len(cell_names),
+                ]
+            lines.append(
+                f"| {o} | {model} | {w['min']:.3f} | {w['median']:.3f} | {w['max']:.3f} | "
+                + " | ".join(f"{w['per_cell_mean'][k]['mean_weight']:.3f}" for k in cell_names) + " |"
+            )
+    lines += [
+        "",
+        "## TMM check",
+        "",
+        f"edgeR's TMM factors on the tested counts (library size = their column sums, the export's trims) against "
+        f"the export manifest's, absolute tolerance {manifest['tmm_atol']}:",
+        "",
+    ]
+    for o, chk in manifest["tmm_check"].items():
+        lines.append(
+            f"- {o}: largest absolute difference {chk['max_abs_diff']:.3g} over {chk['n_donors']} donors and "
+            f"{chk['n_features']} features ({'passed' if chk['passed'] else 'FAILED'})"
+        )
+    lines += [
+        "",
+        "## Joint F diagnostic",
+        "",
+        "limma's F is recomputed from the moderated t's and the unweighted design's coefficient correlation (it must "
+        "equal topTable's), and compared with the exact F from each feature's own weighted coefficient covariance "
+        "(same variance and degrees of freedom; BH over all tested features). limma's F stays the reported test.",
+        "",
+        "| omic | model | test | df1 / df2 | limma F recomputed (max rel. diff) | exact F: max / median rel. diff | "
+        "significant: limma / exact | changed calls |",
+        "|---|---|---|---|---:|---:|---:|---|",
+    ]
+    for o, fits in manifest["fits"].items():
+        for model, fit in fits.items():
+            for label, j in fit["joint"].items():
+                ex = j["exact"]
+                changed = ", ".join(f"`{x['feature']}`" for x in ex["changed_calls"]) or "none"
+                lines.append(
+                    f"| {o} | {model} | {label} | {j['df1']} / {_fmt(j['df2'], '.4g')} | "
+                    f"{j['limma_f_recomputed_max_rel_diff']:.2g} | {ex['max_rel_diff']:.3g} / {ex['median_rel_diff']:.3g} | "
+                    f"{j['n_significant']} / {ex['n_significant_exact']} | {ex['n_changed_calls']}: {changed} |"
+                )
+    lines += [
+        "",
+        "## Fits",
+        "",
+        "| omic | model | features × donors | voom span | df prior | s² prior | runtime (s) |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for o, fits in manifest["fits"].items():
+        for model, fit in fits.items():
+            lines.append(
+                f"| {o} | {model} | {fit['n_features']} × {fit['n_donors']} | {fit['voom']['span']:.4f} | "
+                f"{_fmt(fit['ebayes']['df_prior'], '.4g')} | {_fmt(fit['ebayes']['s2_prior'], '.4g')} | "
+                f"{_fmt(fit['runtime_seconds'], '.1f')} |"
+            )
+    lines += ["", "## Inputs", ""]
+    for group, files in manifest["inputs"]["files"].items():
+        for name, info in files.items():
+            lines.append(f"- {group}: `{info['path']}` sha256 `{info['sha256']}`")
+    dq = manifest["inputs"]["deseq2"]
+    lines.append(
+        f"- DESeq2 (`stage-de`, read and checked, never written): `{dq['dir']}`, manifest sha256 "
+        f"`{dq['manifest_sha256']}`, summary sha256 `{dq['summary_sha256']}`, {len(dq['files'])} files hashed before "
+        "and after the run"
+    )
+    lines += ["", "## Findings", ""]
+    lines += [f"- {msg}" for msg in manifest["findings"]] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def run_stage_de_limma(
+    cohort: str = "all",
+    *,
+    omic: str = "both",
+    pseudobulk_dir: str | Path = "results/pseudobulk",
+    input_dir: str | Path = "results/motco_input",
+    analysis_dir: str | Path = "results/motco_analysis",
+    deseq2_dir: str | Path = "results/stage_de",
+    out_dir: str | Path = "results/stage_de_limma",
+    force: bool = False,
+    debug_dir: str | Path | None = None,
+) -> dict:
+    """limma-voom fits of the registered stage-DE models beside the DESeq2 step, with the method comparison.
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    omic:
+        ``"rna"``, ``"atac"`` or ``"both"``: the omics fitted in this run.
+        The summary covers every omic whose fits are complete under the
+        cohort directory.
+    pseudobulk_dir, input_dir, analysis_dir:
+        As for ``run_stage_de`` (read and checked through the same code
+        path, ``_stage_de_prepare``; never written).
+    deseq2_dir:
+        The DESeq2 step's output root; ``<deseq2_dir>/<cohort>/`` must be a
+        complete ``stage-de`` run made from the inputs now on disk (read and
+        checked, never written).
+    out_dir:
+        Output root: ``<out_dir>/<cohort>/`` with ``<omic>/<model>__<label>.csv``
+        (per tested coefficient and joint test), ``<omic>/<model>__fit.json``
+        (the resume record), ``stage_de_limma_summary.csv``,
+        ``method_comparison.csv``, ``stage_de_limma.md`` and
+        ``stage_de_limma_manifest.json``. It may not lie inside an input
+        directory or the DESeq2 directory.
+    force:
+        Refit the requested omics of a cohort even when their fits are
+        complete; without it a complete fit is skipped and a fit made from
+        other inputs, settings, script or R versions is an error.
+    debug_dir:
+        Python API only: keep the exchange files and R's outputs under
+        ``<debug_dir>/<cohort>_<omic>/<model>/`` so the R script can be rerun
+        by hand (``Rscript --vanilla stage_de_limma.R <model_dir>``). Every
+        requested model must then be fitted in the call.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir", "summary", "comparison", "manifest", "concordance", "findings", "fitted", "skipped"}``.
+
+    Raises
+    ------
+    FileNotFoundError
+        An input file or a DESeq2 output is missing (the message names it and
+        the command that produces it).
+    RuntimeError
+        ``Rscript`` is missing (the message names the Nix shell) or R fails
+        (the message ends with R's error output).
+    ValueError
+        A reference check of the DESeq2 step fails, the DESeq2 outputs do not
+        belong to the inputs now on disk, the TMM factors or a design differ
+        in R, a fit record is stale (without ``force``), or ``out_dir`` lies
+        inside an input or the DESeq2 directory.
+
+    Notes
+    -----
+    Every check of every cohort runs before anything is written: the DESeq2
+    step's preparation and reproduction, the DESeq2 outputs against the
+    inputs, and R's donor-id, TMM and design checks. Fits run one model at a
+    time, tables first and then the record (``.tmp`` files renamed). After a
+    cohort the inputs and the DESeq2 outputs are hashed again and must be
+    unchanged. The step reads sex and stage, so its outputs are an input of no
+    export, analysis or sensitivity step.
+    """
+    import shutil
+    import tempfile
+    from importlib.metadata import PackageNotFoundError, version
+
+    log = "stage-de-limma"
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    omics = list(_STAGE_DE_OMICS) if omic == "both" else [omic]
+    for o in omics:
+        if o not in _STAGE_DE_OMICS:
+            raise ValueError(f"Unknown omic {o!r}; expected one of {_STAGE_DE_OMICS} or 'both'")
+    pb, input_dir, analysis_dir = Path(pseudobulk_dir), Path(input_dir), Path(analysis_dir)
+    deseq2_dir, out_dir = Path(deseq2_dir), Path(out_dir)
+    debug = None if debug_dir is None else Path(debug_dir)
+    for target_name, target in (("--out-dir", out_dir), ("debug_dir", debug)):
+        if target is None:
+            continue
+        for name, d in (("--pseudobulk-dir", pb), ("--input-dir", input_dir), ("--analysis-dir", analysis_dir),
+                        ("--deseq2-dir", deseq2_dir)):
+            if _same_dir(target, d):
+                raise ValueError(
+                    f"{target_name} {target} lies inside the input directory {d} ({name}); the step never writes "
+                    "under its inputs; nothing was written"
+                )
+    versions = stage_de_limma_versions()
+    motco_version = check_motco_version()
+    print(f"[{log}] Pseudobulk directory: {pb}")
+    print(f"[{log}] Primary export directory: {input_dir}")
+    print(f"[{log}] Primary analysis directory: {analysis_dir} (read and checked; it stays primary)")
+    print(f"[{log}] DESeq2 stage-DE directory: {deseq2_dir} (read and checked; its results stay the reported ones)")
+    print(f"[{log}] Output directory: {out_dir}")
+    print(
+        f"[{log}] R {versions['R']}, limma {versions['limma']}, edgeR {versions['edgeR']}; script "
+        f"{stage_de_limma_script().name} sha256 {versions['script_sha256'][:12]}…; models: {', '.join(STAGE_DE_MODELS)}; "
+        f"joint tests: {', '.join(j for j, _ in STAGE_DE_LIMMA_JOINT_TESTS.values())}; alpha {STAGE_DE_ALPHA}; omics "
+        f"fitted: {', '.join(omics)}"
+    )
+
+    work_root = debug if debug is not None else Path(tempfile.mkdtemp(prefix="stage_de_limma_"))
+    try:
+        # Every check of every cohort before anything is written
+        prepared = {}
+        for c in cohorts:
+            prep = _stage_de_prepare(
+                c, pseudobulk_dir=pb, input_dir=input_dir, analysis_dir=analysis_dir, omics=omics,
+                motco_version=motco_version, log=log,
+            )
+            prep["deseq2"] = _stage_de_limma_deseq2_reference(deseq2_dir, c, prep)
+            print(
+                f"[{log}] {c}: DESeq2 outputs {prep['deseq2']['dir']} match the inputs (hashes, tables, summary, "
+                "concordance cells)"
+            )
+            prep["fingerprints"] = {
+                o: {m: _stage_de_limma_fingerprint(prep, c, o, m, versions) for m in STAGE_DE_MODELS}
+                for o in _STAGE_DE_OMICS
+            }
+            states = {}
+            for o in _STAGE_DE_OMICS:
+                for m in STAGE_DE_MODELS:
+                    states[(o, m)] = _stage_de_limma_model_state(out_dir / c / o, m, prep["fingerprints"][o][m])
+                    if states[(o, m)] == "stale" and not (force and o in omics):
+                        hint = "rerun with --force" + ("" if o in omics else f" --omic {o} (or both)")
+                        raise ValueError(
+                            f"{out_dir / c / o / STAGE_DE_LIMMA_FIT_TEMPLATE.format(model=m)} is unreadable or was "
+                            "made from other inputs, settings, script or R versions than those now present; "
+                            f"{hint}; nothing was written"
+                        )
+            prep["states"] = states
+            if debug is not None and not force:
+                done = [f"{o}/{m}" for o in omics for m in STAGE_DE_MODELS if states[(o, m)] == "complete"]
+                if done:
+                    raise ValueError(
+                        f"debug_dir needs every requested model fitted in this call, but {', '.join(done)} of {c} are "
+                        f"complete under {out_dir / c}; pass force=True or another out_dir; nothing was written"
+                    )
+            # R's checks (donor ids, TMM against the export, every design rebuilt) on the exchange files
+            prep["exchange"], prep["r_checks"] = {}, {}
+            for o in omics:
+                tmm = pd.Series({d: v["factor"] for d, v in prep["loaded"]["export_manifest"]["tmm"][o].items()})
+                omic_dir = work_root / f"{c}_{o}"
+                if omic_dir.exists():
+                    shutil.rmtree(omic_dir)
+                prep["exchange"][o] = write_stage_de_limma_exchange(
+                    omic_dir, prep["counts"][o], prep["designs"][o], omic=o, export_tmm=tmm.loc[prep["donors"]],
+                )
+                prep["r_checks"][o] = stage_de_limma_check(omic_dir, prep["exchange"][o])
+                print(
+                    f"[{log}] {c} {o}: edgeR TMM equals the export's to {prep['r_checks'][o]['tmm']['max_abs_diff']:.2g} "
+                    f"(tolerance {STAGE_DE_LIMMA_TMM_ATOL}); every design rebuilt by model.matrix equals the formulaic one"
+                )
+            print(
+                f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
+                f"{motco_version}, seed, permutations, CV selection); delta rejected: "
+                f"{'yes' if prep['delta_rejected'] else 'no'}"
+            )
+            prepared[c] = prep
+
+        software = _software_versions()
+        for pkg in ("pydeseq2", "formulaic", "formulaic-contrasts", "scipy"):
+            try:
+                software[pkg] = version(pkg)
+            except PackageNotFoundError:
+                software[pkg] = None
+        software.update({"motco": motco_version, "R": versions["R"], "limma": versions["limma"],
+                         "edgeR": versions["edgeR"], "jsonlite": versions["jsonlite"],
+                         "stage_de_limma_script_sha256": versions["script_sha256"]})
+
+        results = {}
+        for c in cohorts:
+            prep = prepared[c]
+            cohort_dir = out_dir / c
+            if force:
+                for o in omics:
+                    if (cohort_dir / o).exists():
+                        shutil.rmtree(cohort_dir / o)
+                    for m in STAGE_DE_MODELS:
+                        prep["states"][(o, m)] = "missing"
+                for name in (STAGE_DE_LIMMA_SUMMARY, STAGE_DE_LIMMA_COMPARISON, STAGE_DE_LIMMA_MARKDOWN,
+                             STAGE_DE_LIMMA_MANIFEST):
+                    if (cohort_dir / name).exists():
+                        (cohort_dir / name).unlink()
+            fitted, skipped = [], []
+            for o in omics:
+                omic_dir = cohort_dir / o
+                omic_dir.mkdir(parents=True, exist_ok=True)
+                tmm = pd.Series({d: v["factor"] for d, v in prep["loaded"]["export_manifest"]["tmm"][o].items()})
+                for m in STAGE_DE_MODELS:
+                    if prep["states"][(o, m)] == "complete":
+                        print(f"[{log}] {c} {o} {m}: complete fit record found; skipped (rerun with --force to refit)")
+                        skipped.append((o, m))
+                        continue
+                    out = stage_de_limma_fit(
+                        prep["counts"][o], prep["designs"][o], m, omic=o, export_tmm=tmm.loc[prep["donors"]],
+                        exported=prep["exported"][o], model_dir=prep["exchange"][o][m],
+                    )
+                    table_files = {}
+                    for label, table in out["tables"].items():
+                        name = STAGE_DE_LIMMA_TABLE_TEMPLATE.format(model=m, label=label)
+                        tmp = omic_dir / f"{name}.tmp"
+                        table.to_csv(tmp, index=False, float_format=_csv_float)
+                        os.replace(tmp, omic_dir / name)
+                        table_files[label] = {"file": name, "sha256": _sha256_file(omic_dir / name)}
+                    record = {
+                        "fingerprint": prep["fingerprints"][o][m],
+                        "fit": out["fit"],
+                        "export_reproduction": prep["reproduction"][o],
+                        "tables": table_files,
+                        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    record_path = omic_dir / STAGE_DE_LIMMA_FIT_TEMPLATE.format(model=m)
+                    tmp = record_path.with_name(record_path.name + ".tmp")
+                    tmp.write_text(json.dumps(record, indent=2) + "\n")
+                    os.replace(tmp, record_path)
+                    prep["states"][(o, m)] = "complete"
+                    fitted.append((o, m))
+                    print(
+                        f"[{log}] {c} {o} {m}: {out['fit']['n_features']} features × {out['fit']['n_donors']} donors in "
+                        f"{out['fit']['runtime_seconds']:.1f} s; adj. p <= {STAGE_DE_ALPHA}: "
+                        + ", ".join(f"{label} {info['n_significant']}" for label, info in out["fit"]["coefficients"].items())
+                    )
+                prep["counts"].pop(o, None)
+                gc.collect()
+
+            # Omics not fitted in this run: their state again now
+            for o in _STAGE_DE_OMICS:
+                if o in omics:
+                    continue
+                for m in STAGE_DE_MODELS:
+                    state = _stage_de_limma_model_state(cohort_dir / o, m, prep["fingerprints"][o][m])
+                    if state == "stale":
+                        raise ValueError(
+                            f"{cohort_dir / o / STAGE_DE_LIMMA_FIT_TEMPLATE.format(model=m)} became unreadable or was "
+                            f"replaced by a fit from other inputs during this run; rerun with --force --omic {o}"
+                        )
+                    prep["states"][(o, m)] = state
+            included = [o for o in _STAGE_DE_OMICS if all(prep["states"][(o, m)] == "complete" for m in STAGE_DE_MODELS)]
+            records, tables = {}, {}
+            for o in included:
+                records[o], tables[o] = {}, {}
+                for m in STAGE_DE_MODELS:
+                    records[o][m] = json.loads((cohort_dir / o / STAGE_DE_LIMMA_FIT_TEMPLATE.format(model=m)).read_text())
+                    tables[o][m] = {
+                        label: _read_stage_de_table(cohort_dir / o / STAGE_DE_LIMMA_TABLE_TEMPLATE.format(model=m, label=label))
+                        for label, _ in _stage_de_limma_labels(m)
+                    }
+            rows = []
+            for o in included:
+                rows += _stage_de_limma_summary_rows(c, o, tables[o], prep["delta_rejected"])
+            summary = pd.DataFrame(rows, columns=list(STAGE_DE_LIMMA_SUMMARY_COLUMNS))
+            rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
+            concordance, findings = {}, []
+            for o in included:
+                cell = summary[
+                    (summary["omic"] == o) & (summary["model"] == rule["model"])
+                    & (summary["coefficient"] == rule["test"]) & (summary["feature_set"] == rule["feature_set"])
+                ].iloc[0]
+                limma_cell = {
+                    "interaction_detected": bool(cell["interaction_detected"]),
+                    "n_interaction_exported": int(cell["n_significant"]),
+                    "cell": str(cell["concordance"]),
+                }
+                deseq2_cell = prep["deseq2"]["concordance"][o]
+                concordance[o] = {
+                    "delta_rejected": bool(cell["delta_rejected"]),
+                    "deseq2": {k: deseq2_cell[k] for k in ("interaction_detected", "n_interaction_exported", "cell")},
+                    "limma": limma_cell,
+                    "methods_agree": deseq2_cell["interaction_detected"] == limma_cell["interaction_detected"],
+                }
+                if limma_cell["cell"] == "discordant":
+                    if limma_cell["interaction_detected"]:
+                        what = (
+                            f"{limma_cell['n_interaction_exported']} exported {o} feature(s) have adj. p <= "
+                            f"{STAGE_DE_ALPHA} on {rule['test']} and the primary analysis did not reject delta"
+                        )
+                    else:
+                        what = f"no exported {o} feature has adj. p <= {STAGE_DE_ALPHA} on {rule['test']} and the primary analysis rejected delta"
+                    findings.append(
+                        f"{c} {o}: limma cell discordant: {what}; reported beside both (per-feature FDR and one "
+                        "latent-space permutation test ask related, not identical, questions); the primary analysis "
+                        "stays primary and is unchanged"
+                    )
+                if not concordance[o]["methods_agree"]:
+                    findings.append(
+                        f"{c} {o}: method dependence of the concordance cells: limma's {rule['test']} finds "
+                        f"{limma_cell['n_interaction_exported']} exported feature(s), DESeq2's union of two Wald tests "
+                        f"{deseq2_cell['n_interaction_exported']}; neither cell replaces the other, the DESeq2 cell stays "
+                        "the reported one, and the DESeq2 outputs and the primary analysis are unchanged"
+                    )
+            comp_rows = []
+            for o in included:
+                comp_rows += _stage_de_limma_comparison_rows(
+                    c, o, tables[o], prep["deseq2"]["tables"][o], concordance[o],
+                )
+            comparison = pd.DataFrame(comp_rows, columns=list(STAGE_DE_LIMMA_COMPARISON_COLUMNS))
+            for _, r in comparison[~comparison["detection_agrees"].astype(bool)].iterrows():
+                findings.append(
+                    f"{c} {r['omic']} {r['model']} {r['test']} ({r['kind']}, {r['feature_set']}): method dependence: "
+                    f"DESeq2 {r['deseq2_test']} detects {int(r['n_significant_deseq2'])}, limma {r['limma_test']} detects "
+                    f"{int(r['n_significant_limma'])}; a result of neither method"
+                )
+            for o in included:
+                for m in STAGE_DE_MODELS:
+                    for label, j in records[o][m]["fit"]["joint"].items():
+                        ex = j["exact"]
+                        if ex["n_changed_calls"]:
+                            features = ", ".join(x["feature"] for x in ex["changed_calls"])
+                            findings.append(
+                                f"{c} {o} {m} {label}: the exact F changes {ex['n_changed_calls']} call(s) at adj. p <= "
+                                f"{STAGE_DE_ALPHA} ({features}); limma's F stays the reported test"
+                            )
+            missing = [o for o in _STAGE_DE_OMICS if o not in included]
+            for o in missing:
+                findings.append(f"{c} {o}: not fitted yet (run `sead-sexdiff stage-de-limma --omic {o}`); the summary lacks it")
+
+            hashes_now = {
+                group: {name: _sha256_file(p) for name, p in files.items()} for group, files in prep["paths"].items()
+            }
+            if hashes_now != prep["hashes"]:
+                changed = [f"{g}/{n}" for g in hashes_now for n in hashes_now[g] if hashes_now[g][n] != prep["hashes"][g][n]]
+                raise ValueError(f"input file(s) {changed} changed during the stage-de-limma run of {c}")
+            dq = prep["deseq2"]
+            deseq2_now = {str(p.relative_to(dq["dir"])): _sha256_file(p) for p in sorted(dq["dir"].rglob("*")) if p.is_file()}
+            if deseq2_now != dq["files"]:
+                raise ValueError(f"the DESeq2 outputs under {dq['dir']} changed during the stage-de-limma run of {c}")
+
+            reference = prep["reference"]
+            ref_record = reference["record"]
+            any_fit = {o: records[o][next(iter(STAGE_DE_MODELS))]["fit"] for o in included}
+            manifest = {
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "cohort": c,
+                "n_donors": len(prep["donors"]),
+                "cells": prep["cells"],
+                "k": prep["k"],
+                "omics": included,
+                "complete": not missing,
+                "inputs": {
+                    "files": {
+                        group: {name: {"path": str(p), "sha256": prep["hashes"][group][name]} for name, p in files.items()}
+                        for group, files in prep["paths"].items()
+                    },
+                    "pseudobulk_manifest_sha256": prep["hashes"]["pseudobulk"]["manifest.json"],
+                    "export_manifest_sha256": prep["hashes"]["export"]["manifest.json"],
+                    "export_input": prep["loaded"]["export_manifest"].get("input"),
+                    "deseq2": {
+                        "dir": str(dq["dir"]),
+                        "manifest_sha256": dq["manifest_sha256"],
+                        "summary_sha256": dq["summary_sha256"],
+                        "pydeseq2": dq["software"].get("pydeseq2"),
+                        "files": dq["files"],
+                        "note": (
+                            "complete for both omics, made from the inputs now on disk (every inputs.files sha256), "
+                            "every table hashing as recorded and the summary and concordance cells equal to a "
+                            "recomputation from the tables; hashed before and after the run, never written"
+                        ),
+                    },
+                    "note": (
+                        "every file hashed before it was read and again after the run; the counts are bound to the "
+                        "export by stage-de's reproduction (export_reproduction) and by edgeR's TMM against the export "
+                        "manifest's factors (tmm_check)"
+                    ),
+                },
+                "export_reproduction": {
+                    o: prep["reproduction"].get(o, records[o][next(iter(STAGE_DE_MODELS))]["export_reproduction"])
+                    for o in included
+                },
+                "reference": {
+                    "dir": str(reference["dir"]),
+                    "files": reference["files"],
+                    "result_sha256": reference["files"]["result.json"]["sha256"],
+                    "delta_rejected": prep["delta_rejected"],
+                    "alpha": ANALYSIS_ALPHA,
+                    "rejection_rule": ANALYSIS_REJECTION_RULE,
+                    "component_selection": ref_record["latent"]["component_selection"],
+                    "selected_lv": ref_record["latent"]["selected_lv"],
+                    "motco": reference["manifest"]["software"]["motco"],
+                    "seed": reference["manifest"]["measurement"]["seed"],
+                    "permutations": reference["manifest"]["measurement"]["permutations"],
+                    "note": (
+                        "read and checked (export hashes, MOTCO version, seed, permutations, CV selection), never "
+                        "rerun or modified; only its delta rejection status enters the concordance rules"
+                    ),
+                },
+                "models": {
+                    m: {
+                        "formula": spec["formula"],
+                        "formulas": {o: stage_de_formula(m, o) for o in _STAGE_DE_OMICS},
+                        "stage_coding": spec["stage_coding"],
+                        "interaction": spec["interaction"],
+                        "tested": [{"coefficient": label, "design_column": column} for label, column in spec["tested"]],
+                        "joint": (
+                            {"test": STAGE_DE_LIMMA_JOINT_TESTS[m][0], "coefficients": list(STAGE_DE_LIMMA_JOINT_TESTS[m][1])}
+                            if m in STAGE_DE_LIMMA_JOINT_TESTS else None
+                        ),
+                    }
+                    for m, spec in STAGE_DE_MODELS.items()
+                },
+                "method": STAGE_DE_LIMMA_METHOD,
+                "log_cpm": (
+                    "voom's log2((count + 0.5) / (lib.size × TMM factor + 1) × 1e6), not the export's log2-CPM with "
+                    "prior count 2 scaled by the effective library size"
+                ),
+                "joint_tests": {m: {"test": j, "coefficients": list(labels)} for m, (j, labels) in STAGE_DE_LIMMA_JOINT_TESTS.items()},
+                "joint_f": (
+                    "limma's moderated F (topTable over both coefficients): the moderated t's combined through the "
+                    "correlation of the unweighted design's coefficients (cov.coefficients), df1 = 2, df2 = df.prior + "
+                    "df.residual; approximate with voom's observation weights, measured per feature by the exact-F "
+                    "diagnostic (fits.*.joint.*.exact), which never replaces it"
+                ),
+                "union": (
+                    "a factor model's two moderated t tests are also counted as their union (significant on either); "
+                    "the union carries no joint error-rate claim and is reported for the like-for-like comparison with "
+                    "the DESeq2 union only"
+                ),
+                "covariates": {
+                    "per_omic": {o: list(cols) for o, cols in STAGE_DE_COVARIATES.items()},
+                    "scale": "on their recorded scale, not centered or scaled; nuclei counts on the log10 scale",
+                    "source": str(input_dir / c / "covariates.csv"),
+                    "missing_policy": ANALYSIS_MISSING_COVARIATES,
+                    "imputed": False,
+                },
+                "reference_levels": dict(STAGE_DE_REFERENCE_LEVELS),
+                "alpha": STAGE_DE_ALPHA,
+                "significance": (
+                    "adj.P.Val <= alpha; Benjamini-Hochberg over all tested features (no independent filter); DESeq2's "
+                    "BH family is the tested features passing pydeseq2's per-coefficient independent filter"
+                ),
+                "tmm_atol": STAGE_DE_LIMMA_TMM_ATOL,
+                "tmm_check": {
+                    o: {
+                        "max_abs_diff": any_fit[o]["tmm"]["max_abs_diff"], "atol": STAGE_DE_LIMMA_TMM_ATOL,
+                        "passed": bool(any_fit[o]["tmm"]["passed"]), "n_donors": any_fit[o]["n_donors"],
+                        "n_features": any_fit[o]["n_features"],
+                    }
+                    for o in included
+                },
+                "design_checks": {
+                    o: {
+                        m: {
+                            "python": {k: v for k, v in prep["design_checks"][o][m].items() if k != "formula"},
+                            "r": records[o][m]["fit"]["design_check"],
+                        }
+                        for m in STAGE_DE_MODELS
+                    }
+                    for o in included
+                },
+                "feature_sets": {
+                    o: {
+                        **prep["feature_sets"][o],
+                        "statuses": list(STAGE_DE_FEATURE_STATUSES),
+                        "exported_status": STAGE_DE_EXPORTED_STATUS,
+                        "source": str(input_dir / c / f"features_{o}.csv"),
+                    }
+                    for o in _STAGE_DE_OMICS
+                },
+                "fits": {o: {m: records[o][m]["fit"] for m in STAGE_DE_MODELS} for o in included},
+                "tables": {o: {m: records[o][m]["tables"] for m in STAGE_DE_MODELS} for o in included},
+                "concordance_rule": dict(STAGE_DE_LIMMA_CONCORDANCE_RULE),
+                "deseq2_concordance_rule": dict(STAGE_DE_CONCORDANCE_RULE),
+                "concordance": concordance,
+                "run": {"omics_fitted": [f"{o}/{m}" for o, m in fitted], "skipped": [f"{o}/{m}" for o, m in skipped]},
+                "outputs": sorted([STAGE_DE_LIMMA_SUMMARY, STAGE_DE_LIMMA_COMPARISON, STAGE_DE_LIMMA_MARKDOWN,
+                                   STAGE_DE_LIMMA_MANIFEST]),
+                "software": software,
+                "git": _git_revision(),
+                "findings": findings,
+            }
+            cohort_dir.mkdir(parents=True, exist_ok=True)
+            for name, frame in ((STAGE_DE_LIMMA_SUMMARY, summary), (STAGE_DE_LIMMA_COMPARISON, comparison)):
+                tmp = cohort_dir / f"{name}.tmp"
+                frame.to_csv(tmp, index=False, float_format=_csv_float)
+                os.replace(tmp, cohort_dir / name)
+            written = pd.read_csv(cohort_dir / STAGE_DE_LIMMA_SUMMARY, dtype={"design_column": str}, float_precision="round_trip")
+            written_cmp = pd.read_csv(cohort_dir / STAGE_DE_LIMMA_COMPARISON, float_precision="round_trip")
+            tmp = cohort_dir / f"{STAGE_DE_LIMMA_MARKDOWN}.tmp"
+            tmp.write_text(render_stage_de_limma(written, written_cmp, manifest))
+            os.replace(tmp, cohort_dir / STAGE_DE_LIMMA_MARKDOWN)
+            tmp = cohort_dir / f"{STAGE_DE_LIMMA_MANIFEST}.tmp"
+            tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+            os.replace(tmp, cohort_dir / STAGE_DE_LIMMA_MANIFEST)
+            print(f"[{log}] Wrote {cohort_dir}")
+            for msg in findings:
+                print(f"[{log}] FINDING: {msg}")
+            results[c] = {
+                "dir": cohort_dir, "summary": summary, "comparison": comparison, "manifest": manifest,
+                "concordance": concordance, "findings": findings, "fitted": fitted, "skipped": skipped,
+            }
+            del prepared[c]
+            gc.collect()
+    finally:
+        if debug is None:
+            shutil.rmtree(work_root, ignore_errors=True)
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -10417,4 +11876,14 @@ __all__ = [
     "stage_de_fit",
     "render_stage_de",
     "run_stage_de",
+    "STAGE_DE_LIMMA_METHOD",
+    "STAGE_DE_LIMMA_JOINT_TESTS",
+    "STAGE_DE_LIMMA_CONCORDANCE_RULE",
+    "stage_de_limma_script",
+    "stage_de_limma_versions",
+    "write_stage_de_limma_exchange",
+    "stage_de_limma_check",
+    "stage_de_limma_fit",
+    "render_stage_de_limma",
+    "run_stage_de_limma",
 ]
