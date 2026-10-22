@@ -18,7 +18,7 @@
 
 ## 2. The microglia population and cohorts
 
-Selection (registry `CELL_TYPES["microglia"]`, from the metadata-only spike in `openspec/changes/mtg-microglia-positive-control/spike.md`): RNA `Subclass` `Immune`, ATAC `Subclass` `Microglia-PVM`, the six `Micro-PVM_*` supertypes of both releases (no release has a PVM-only supertype), `Lymphocyte` and `Monocyte` not selected; `Reference` donors excluded; RNA nuclei with ≥ 200 genes. Nuclei per supertype over all donors (spike, Reference included):
+Selection (registry `CELL_TYPES["microglia"]`, from the metadata-only spike in `openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md`): RNA `Subclass` `Immune`, ATAC `Subclass` `Microglia-PVM`, the six `Micro-PVM_*` supertypes of both releases (no release has a PVM-only supertype), `Lymphocyte` and `Monocyte` not selected; `Reference` donors excluded; RNA nuclei with ≥ 200 genes. Nuclei per supertype over all donors (spike, Reference included):
 
 | supertype | RNA (Immune) | ATAC (Microglia-PVM) | selected |
 |---|---:|---:|:---:|

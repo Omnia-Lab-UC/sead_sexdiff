@@ -303,7 +303,7 @@ when behavior or defaults change.
     label, otherwise the run fails. RNA calls microglia `Immune`, ATAC
     `Microglia-PVM`; astrocytes are `Astrocyte` in both. Spike notes:
     `openspec/changes/archive/2026-10-16-mtg-astrocyte-donor-pseudobulks/spike.md`,
-    `openspec/changes/mtg-microglia-positive-control/spike.md`.
+    `openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md`.
   - `MATRIX_SOURCE`, `RNA_MIN_GENES` (RNA nuclei ≥ 200 genes; ATAC no extra QC).
   - `Reference` ADNC donors excluded; `ADNC_STAGES` (`Not AD`+`Low` → `0`,
     `Intermediate` → `1`, `High` → `2`).

@@ -1014,7 +1014,7 @@ _ASTRO_SUPERTYPES = ["Astro_1", "Astro_2", "Astro_3", "Astro_4", "Astro_5", "Ast
 # Microglia / PVM supertypes, the same labels in both releases (the Micro-PVM_*
 # labels bundle microglia and perivascular macrophages); the immune subclass
 # also holds lymphocytes and monocytes, which are not selected. Labels and the
-# decision: openspec/changes/mtg-microglia-positive-control/spike.md.
+# decision: openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md.
 _MICRO_SUPERTYPES = [
     "Micro-PVM_1", "Micro-PVM_2", "Micro-PVM_2_1-SEAAD", "Micro-PVM_2_3-SEAAD", "Micro-PVM_3-SEAAD", "Micro-PVM_4-SEAAD",
 ]
@@ -1029,8 +1029,8 @@ _SHARED_SUBCLASSES = [
 # (``..._final-nuclei.<date>.h5ad``): the omic and the complete ``Subclass``
 # inventory of the release (labels confirmed by the spikes in
 # ``openspec/changes/archive/2026-10-16-mtg-astrocyte-donor-pseudobulks/spike.md``
-# and ``openspec/changes/mtg-microglia-positive-control/spike.md``). Every
-# ``Subclass`` value of a donor object must be listed, otherwise the run
+# and ``openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md``).
+# Every ``Subclass`` value of a donor object must be listed, otherwise the run
 # fails. The population a step selects comes from ``CELL_TYPES`` and is
 # joined to this inventory by :func:`taxonomy_for`.
 TAXONOMY: dict[str, dict] = {
