@@ -93,7 +93,28 @@ export SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data
 
 ## MTG astrocyte donor pseudobulks (RNA + ATAC)
 
-Donor-level astrocyte pseudobulks from the SEA-AD middle temporal gyrus (MTG) releases, for the MOTCO case study.
+Donor-level astrocyte pseudobulks from the SEA-AD middle temporal gyrus (MTG) releases, for the MOTCO case study, and the same pipeline on a second, registered cell type (microglia) as a positive control.
+
+### Cell types (`--cell-type`)
+
+The eight MTG commands `pseudobulk`, `covariates`, `technical-covariates`, `export`, `analyze`, `axis-diagnostics`, `stage-de` and `stage-de-limma` take `--cell-type` (default `astrocyte`), a name of the registry `CELL_TYPES` in `src/sead_sexdiff/data.py`. The name is a flag; the mapping is not (entries are added by a change proposal):
+
+| cell type | RNA 2026-06-22 | ATAC 2024-12-06 | not selected | results root |
+|---|---|---|---|---|
+| `astrocyte` (default) | `Subclass` `Astrocyte`; `Astro_1`–`Astro_5`, `Astro_6-SEAAD` | same | | `results/` |
+| `microglia` | `Subclass` `Immune`; `Micro-PVM_1`, `Micro-PVM_2`, `Micro-PVM_2_1-SEAAD`, `Micro-PVM_2_3-SEAAD`, `Micro-PVM_3-SEAAD`, `Micro-PVM_4-SEAAD` | `Subclass` `Microglia-PVM`; the same six | `Lymphocyte`, `Monocyte` | `results/microglia/` |
+
+The microglia labels and preregistered cohort cells come from a metadata-only spike over all 170 donor objects (`openspec/changes/mtg-microglia-positive-control/spike.md`); neither release has a PVM-only supertype, so the six `Micro-PVM_*` labels (microglia and perivascular macrophages) are kept in both. Any other `Supertype` of the selected subclass stops the run.
+
+The flag sets the population (one selection path, `select_nuclei`, shared by `pseudobulk` and `technical-covariates`; `select_astrocyte_nuclei` is its astrocyte wrapper) and every default directory: `<root>/pseudobulk/`, `<root>/motco_input/`, `<root>/motco_analysis/`, `<root>/motco_diagnostics/`, `<root>/motco_rank_sensitivity/` (read by `axis-diagnostics`), `<root>/stage_de/`, `<root>/stage_de_limma/` (`cell_type_dirs`). Explicit directory flags take precedence. Thresholds, stage coding and every export, analysis and stage-DE setting are the same for every cell type.
+
+Every manifest of these steps records `cell_type`, and every reader checks it: `export` and `technical-covariates` refuse a pseudobulk manifest of another cell type; `analyze`, `axis-diagnostics`, `stage-de` and `stage-de-limma` an export manifest of another; `stage-de-limma` also a DESeq2 manifest of another. Each refusal names the file and both cell types and writes nothing. A manifest written before the registry existed has no `cell_type`; it reads as `astrocyte` and the reader records that as a finding, so the existing astrocyte outputs are not rerun. The per-donor caches record the cell type and a cache of another one is refused; the stage-DE fit-record fingerprints do not include it (their input hashes already differ between cell types). The sensitivity commands (`rank-sensitivity`, `preprocessing-sensitivity`, `latent-sensitivity`) have no flag and read astrocytes.
+
+```
+sead-sexdiff pseudobulk --cell-type microglia --omic both      # results/microglia/pseudobulk/
+sead-sexdiff export --cell-type microglia                      # results/microglia/motco_input/<cohort>/
+sead-sexdiff analyze --cell-type microglia                     # results/microglia/motco_analysis/<cohort>/
+```
 
 ### Download the MTG donor objects
 
@@ -122,15 +143,15 @@ sead-sexdiff pseudobulk --donors H19.33.004,H21.33.020
 sead-sexdiff pseudobulk --force                   # recompute cached donors
 ```
 
-Options: `--omic {rna,atac,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`), `--limit N`, `--donors id,...`, `--force`.
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--omic {rna,atac,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`), `--limit N`, `--donors id,...`, `--force`.
 
 What it does, per donor object (one file in memory at a time):
 
 - Excludes donors whose ADNC is `Reference`.
-- Selects astrocytes through the per-release taxonomy mapping `TAXONOMY` in `src/sead_sexdiff/data.py` (`Subclass == "Astrocyte"`, supertypes `Astro_1`–`Astro_5`, `Astro_6-SEAAD`). Any `Subclass` or astrocyte `Supertype` label not in the mapping stops the run.
-- RNA: sums the raw `UMIs` layer over astrocyte nuclei with ≥ 200 detected genes. ATAC: sums the raw peak counts in `X` over all astrocyte nuclei (release `final-nuclei` QC only). Both matrices are checked to be non-negative integers; no feature filtering or normalization.
+- Selects the cell type's nuclei through the per-release `Subclass` inventory `TAXONOMY` and the registry `CELL_TYPES` in `src/sead_sexdiff/data.py` (astrocytes: `Subclass == "Astrocyte"`, supertypes `Astro_1`–`Astro_5`, `Astro_6-SEAAD`; microglia: the table above). Any `Subclass` label not in the inventory, or `Supertype` of the selected subclass not in the cell type's mapping, stops the run.
+- RNA: sums the raw `UMIs` layer over the selected nuclei with ≥ 200 detected genes. ATAC: sums the raw peak counts in `X` over all selected nuclei (release `final-nuclei` QC only). Both matrices are checked to be non-negative integers; no feature filtering or normalization.
 - Requires the same ordered feature set across donors of an omic.
-- Caches the result in `results/pseudobulk/per_donor/<omic>/<donor>.npz`; a rerun skips cached donors.
+- Caches the result (with the cell type) in `<out-dir>/per_donor/<omic>/<donor>.npz`; a rerun skips cached donors, and a cache of another cell type is an error.
 
 Outputs in `results/pseudobulk/`:
 
@@ -141,14 +162,14 @@ Outputs in `results/pseudobulk/`:
 | `donor_table.csv` | `donor_id`, `sex`, `adnc_raw`, `stage`, `n_rna`, `n_atac`, `cohort_30`, `cohort_50` (one row per non-Reference donor in either omic) |
 | `supertype_composition.csv` | `donor_id`, `omic`, `supertype`, `n_nuclei` (nuclei summed per donor × supertype) |
 | `cohort_summary.csv` | donors per sex × stage for each cohort, with totals |
-| `manifest.json` | release files (key, size, ETag), taxonomy mapping, QC, matrix source, excluded donors, thresholds, cohort counts vs preregistered, partial flag, software versions, git revision |
+| `manifest.json` | cell type, release files (key, size, ETag), the cell type's taxonomy mapping per release, QC, matrix source, excluded donors, thresholds, cohort counts vs the cell type's preregistered cells, partial flag, software versions, git revision |
 
 Donor table rules (scientific choices; change only deliberately):
 
 - `stage`: `Not AD` and `Low` → `0`, `Intermediate` → `1`, `High` → `2`. Other values are an error.
 - Sex and ADNC must agree between the RNA and ATAC objects of a donor; sex must have exactly two labels (a warning only in partial runs).
-- `cohort_30` / `cohort_50`: ≥ 30 / ≥ 50 astrocyte nuclei in **both** omics.
-- A full run compares the cohorts with the preregistered counts (≥ 30: n = 80, F 11/10/28, M 9/10/12 over stages 0/1/2; ≥ 50: n = 74) and records any deviation under `findings` in the manifest. A cohort with an empty sex × stage cell is flagged as not analysable.
+- `cohort_30` / `cohort_50`: ≥ 30 / ≥ 50 nuclei of the cell type in **both** omics.
+- A full run compares the cohorts with the cell type's preregistered counts (astrocyte ≥ 30: n = 80, F 11/10/28, M 9/10/12 over stages 0/1/2; ≥ 50: n = 74; microglia, from the metadata-only spike, ≥ 30: n = 76, F 11/10/24, M 9/11/11; ≥ 50: n = 63, F 8/10/18, M 8/10/9) and records any deviation under `findings` in the manifest. A cohort with an empty sex × stage cell is flagged as not analysable.
 
 ### Cluster workflow (`cluster.ing.uc.cl`)
 
@@ -170,12 +191,22 @@ sbatch scripts/pseudobulk.sbatch
 
 `scripts/pseudobulk.sbatch` uses partition `512x1024`, 4 CPUs, 16 GB, 12 h, BLAS threads pinned to 1, `SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data`, and logs to `results/pseudobulk/logs/`. It stops early unless all 84 RNA and 86 ATAC objects are present. Resubmitting the download or the job is safe: complete downloads and cached donors are skipped. Do not submit to the `full` partition: its node n14 has glibc 2.17 and cannot load the wheels `uv sync` installs on the login node (glibc 2.34); `512x1024` and `gpus` nodes match the login node.
 
-On a workstation, pull the outputs (the per-donor cache is excluded unless `--with-cache`; extra arguments go to rsync):
+Another cell type: both sbatch scripts read `CELL_TYPE` (default `astrocyte`) and pass it as `--cell-type`. Their `#SBATCH` log paths are the astrocyte ones, so give the cell type's own (Slurm needs the directory to exist):
+
+```
+mkdir -p results/microglia/pseudobulk/logs
+sbatch --export=ALL,CELL_TYPE=microglia \
+    --output=results/microglia/pseudobulk/logs/pseudobulk-%j.out \
+    --error=results/microglia/pseudobulk/logs/pseudobulk-%j.err scripts/pseudobulk.sbatch
+```
+
+On a workstation, pull the outputs (the per-donor cache is excluded unless `--with-cache`; extra arguments go to rsync; `--cell-type NAME` syncs `results/NAME/pseudobulk/` instead of `results/pseudobulk/`):
 
 ```
 scripts/sync_pseudobulk.sh -n          # dry run
 scripts/sync_pseudobulk.sh
 scripts/sync_pseudobulk.sh --with-cache
+scripts/sync_pseudobulk.sh --cell-type microglia
 ```
 
 ### Donor covariates
@@ -185,7 +216,7 @@ sead-sexdiff covariates                 # RNA values, cross-checked against ATAC
 sead-sexdiff covariates --omic rna      # RNA only, no cross-check
 ```
 
-Options: `--omic {rna,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`).
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--omic {rna,both}` (default `both`), `--data-root`, `--out-dir` (default `results/pseudobulk`).
 
 Reads only `obs` columns of every MTG donor object (no matrices; seconds per file), so it needs the raw objects and runs on the cluster login node:
 
@@ -217,9 +248,9 @@ sead-sexdiff technical-covariates --omic rna      # RNA only
 sead-sexdiff technical-covariates --force         # recompute cached donors
 ```
 
-Options: `--omic {rna,both}` (default `both`), `--data-root`, `--pseudobulk-dir` (default `results/pseudobulk`; the `pseudobulk` step's outputs, read for the cross-check), `--out-dir` (default `results/pseudobulk`), `--force` (recompute donors already in the per-donor cache).
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--omic {rna,both}` (default `both`), `--data-root`, `--pseudobulk-dir` (default `results/pseudobulk`; the `pseudobulk` step's outputs, read for the cross-check), `--out-dir` (default `results/pseudobulk`), `--force` (recompute donors already in the per-donor cache).
 
-Per RNA donor object it selects the astrocyte nuclei exactly as the pseudobulk step does, through the shared `select_astrocyte_nuclei` (taxonomy mapping of the release, `Reference` donors excluded, ≥ 200 detected genes in the `UMIs` layer), reads their rows of the raw `UMIs` layer and their `obs` QC columns, and never loads the normalized `X`. From the ATAC objects it reads `obs` columns only. It needs the raw donor objects and the pseudobulk outputs, so it runs on the cluster after `pseudobulk` (`scripts/technical.sbatch`, the same partition and resources as `pseudobulk.sbatch`; a `nohup` run on the login node is also acceptable, since the per-donor read is the pseudobulk's, a few seconds per donor):
+Per RNA donor object it selects the cell type's nuclei exactly as the pseudobulk step of the same cell type does, through the shared `select_nuclei` (the cell type's mapping of the release, `Reference` donors excluded, ≥ 200 detected genes in the `UMIs` layer; the pseudobulk manifest must record the same cell type), reads their rows of the raw `UMIs` layer and their `obs` QC columns, and never loads the normalized `X`. From the ATAC objects it reads `obs` columns only. It needs the raw donor objects and the pseudobulk outputs, so it runs on the cluster after `pseudobulk` (`scripts/technical.sbatch`, the same partition and resources as `pseudobulk.sbatch`; a `nohup` run on the login node is also acceptable, since the per-donor read is the pseudobulk's, a few seconds per donor):
 
 ```
 sbatch scripts/technical.sbatch
@@ -260,7 +291,7 @@ sead-sexdiff export                     # both cohorts
 sead-sexdiff export --cohort cohort_30 --force
 ```
 
-Options: `--pseudobulk-dir` (default `results/pseudobulk`), `--out-dir` (default `results/motco_input`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--data-root` (only to locate the annotation), `--force` (replace existing cohort directories; without it an existing cohort directory is an error).
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--pseudobulk-dir` (default `results/pseudobulk`), `--out-dir` (default `results/motco_input`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--data-root` (only to locate the annotation), `--force` (replace existing cohort directories; without it an existing cohort directory is an error).
 
 Reads only the pseudobulk outputs (`rna_counts.h5ad`, `atac_counts.h5ad`, `donor_table.csv`, `manifest.json`, `donor_covariates.csv`), so it runs on any workstation after `scripts/sync_pseudobulk.sh`. It refuses a partial pseudobulk run, missing files and cohorts marked not analysable. On first use it downloads the GENCODE v32 basic annotation (the reference of 10x GRCh38-2020-A / Cell Ranger 6.0) into `<data root>/annotation/gencode.v32.basic.annotation.gtf.gz` and records its sha256; this needs internet once.
 
@@ -308,7 +339,7 @@ sead-sexdiff analyze                    # both cohorts
 sead-sexdiff analyze --cohort cohort_50 --force
 ```
 
-Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--out-dir` (default `results/motco_analysis`), `--n-jobs` (parallel jobs for MOTCO's CV and RRPP, `-1` = all CPUs; default 1; MOTCO seeds one RRPP stream per worker, so other values change the permutation draws, p-values and null summaries, though not the statistics, rank or latent space; the reported results use 1), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--out-dir` (default `results/motco_analysis`), `--n-jobs` (parallel jobs for MOTCO's CV and RRPP, `-1` = all CPUs; default 1; MOTCO seeds one RRPP stream per worker, so other values change the permutation draws, p-values and null summaries, though not the statistics, rank or latent space; the reported results use 1), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
 
 Reads only the export (`rna.csv`, `atac.csv`, `metadata.csv`, `covariates.csv`, `manifest.json` per cohort), so it runs on any workstation. It needs MOTCO ≥ 0.8.0, a dependency pinned to the tag `v0.9.0` of [tomszar/MOTCO](https://github.com/tomszar/MOTCO) (0.9.0 adds the latent adjustment used by `latent-sensitivity`; without that setting every output equals 0.8.0's apart from the runtime); an older install stops the run before any file is read. It stops when a file is missing (naming the `export` command), when the four tables list different donors, or when the export manifest's donor or feature counts disagree with the tables.
 
@@ -435,7 +466,7 @@ sead-sexdiff axis-diagnostics                      # both cohorts
 sead-sexdiff axis-diagnostics --cohort cohort_30 --force
 ```
 
-Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--analysis-dir` (default `results/motco_analysis`; the `analyze` step's output, read as the primary analysis and never written), `--rank-dir` (default `results/motco_rank_sensitivity`; the `rank-sensitivity` step's output, whose `rank_*/` analyses are read when present), `--pseudobulk-dir` (default `results/pseudobulk`; holds `donor_technical.csv`), `--out-dir` (default `results/motco_diagnostics`), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--input-dir` (default `results/motco_input`), `--analysis-dir` (default `results/motco_analysis`; the `analyze` step's output, read as the primary analysis and never written), `--rank-dir` (default `results/motco_rank_sensitivity`; the `rank-sensitivity` step's output, whose `rank_*/` analyses are read when present), `--pseudobulk-dir` (default `results/pseudobulk`; holds `donor_technical.csv`), `--out-dir` (default `results/motco_diagnostics`), `--force` (replace existing cohort directories; without it an existing cohort directory is an error and nothing is written).
 
 Measures, from kept outputs only, what the MOTCO latent axes and the exported blocks' principal axes correlate with, so that preprocessing decisions rest on recorded diagnostics rather than on scratch checks. Per cohort it reads the primary export, the primary analysis, `results/pseudobulk/donor_technical.csv` (synced from the cluster after `technical-covariates`; `technical_manifest.json` is read beside it for the pseudobulk-hash check) and every `results/motco_rank_sensitivity/<cohort>/rank_*/` analysis found (an absent sweep is a finding, not an error), and nothing else; it runs on any workstation in seconds. A missing input stops the run naming the file and the command that produces it. Before writing, every analysis manifest's recorded input hashes are compared with the sha256 of the export files now on disk; a difference stops the run naming the file and both hashes. Nothing under the input directories is written.
 
@@ -516,7 +547,7 @@ sead-sexdiff stage-de --n-cpus 8                     # both cohorts, both omics
 sead-sexdiff stage-de --cohort cohort_30 --omic rna --force
 ```
 
-Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--omic {rna,atac,both}` (default `both`; the omics fitted in this run, while the summary covers every omic whose fits are complete in the cohort directory), `--pseudobulk-dir` (default `results/pseudobulk`; `rna_counts.h5ad`, `atac_counts.h5ad`, `donor_table.csv`, `manifest.json`, read and never written), `--input-dir` (default `results/motco_input`; the primary export, read and never written), `--analysis-dir` (default `results/motco_analysis`; the primary analysis, read and never written), `--out-dir` (default `results/stage_de`; may not lie inside an input directory), `--n-cpus` (pydeseq2 worker processes, default 1; the tables do not depend on it, but warnings raised in the worker processes are not captured, so a fit made with more than one CPU has an incomplete warning record; recorded), `--force` (refit the requested omics even when their fits are complete, replacing their directories and the cohort's summary files). The models, covariates, reference levels and α are constants, not flags. The step needs `results/pseudobulk/`, `results/motco_input/` and `results/motco_analysis/` on the same workstation; it reads no donor object.
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--omic {rna,atac,both}` (default `both`; the omics fitted in this run, while the summary covers every omic whose fits are complete in the cohort directory), `--pseudobulk-dir` (default `results/pseudobulk`; `rna_counts.h5ad`, `atac_counts.h5ad`, `donor_table.csv`, `manifest.json`, read and never written), `--input-dir` (default `results/motco_input`; the primary export, read and never written), `--analysis-dir` (default `results/motco_analysis`; the primary analysis, read and never written), `--out-dir` (default `results/stage_de`; may not lie inside an input directory), `--n-cpus` (pydeseq2 worker processes, default 1; the tables do not depend on it, but warnings raised in the worker processes are not captured, so a fit made with more than one CPU has an incomplete warning record; recorded), `--force` (refit the requested omics even when their fits are complete, replacing their directories and the cohort's summary files). The models, covariates, reference levels and α are constants, not flags. The step needs `results/pseudobulk/`, `results/motco_input/` and `results/motco_analysis/` on the same workstation; it reads no donor object.
 
 The MOTCO analysis cannot tell an astrocyte pseudobulk with little stage signal from one whose stage signal is the same in both sexes. A per-feature model on the same donors and features can. Per cohort (`cohort_30` primary, `cohort_50` sensitivity) and omic, the step fits with pydeseq2 the covariate-adjusted models of the registry `STAGE_DE_MODELS` on the raw pseudobulk counts of the cohort donors:
 
@@ -564,7 +595,7 @@ sead-sexdiff stage-de-limma --cohort cohort_30 --omic rna --force
 nix develop -c uv run sead-sexdiff stage-de-limma    # outside the Nix shell
 ```
 
-Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--omic {rna,atac,both}` (default `both`; the omics fitted in this run, while the summary covers every omic whose fits are complete in the cohort directory), `--pseudobulk-dir`, `--input-dir`, `--analysis-dir` (as for `stage-de`; read and never written), `--deseq2-dir` (default `results/stage_de`; the DESeq2 step's outputs, read and checked, never written), `--out-dir` (default `results/stage_de_limma`; may not lie inside an input directory or the DESeq2 directory), `--force` (refit the requested omics even when their fits are complete). The method, the joint tests, α, the TMM tolerance and the concordance rule are constants, not flags; there is no `--n-cpus` (limma runs single-threaded). The step needs `results/pseudobulk/`, `results/motco_input/`, `results/motco_analysis/` and `results/stage_de/` on the same workstation, and R with limma and edgeR: it runs `Rscript` from the Nix shell (`flake.nix` provides R 4.6.1, limma 3.68.4, edgeR 4.10.1), and stops before writing anything, naming the Nix shell, when `Rscript` is not on `PATH`.
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; every directory default below is the cell type's, under its results root, shown here for `astrocyte`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--omic {rna,atac,both}` (default `both`; the omics fitted in this run, while the summary covers every omic whose fits are complete in the cohort directory), `--pseudobulk-dir`, `--input-dir`, `--analysis-dir` (as for `stage-de`; read and never written), `--deseq2-dir` (default `results/stage_de`; the DESeq2 step's outputs, read and checked, never written), `--out-dir` (default `results/stage_de_limma`; may not lie inside an input directory or the DESeq2 directory), `--force` (refit the requested omics even when their fits are complete). The method, the joint tests, α, the TMM tolerance and the concordance rule are constants, not flags; there is no `--n-cpus` (limma runs single-threaded). The step needs `results/pseudobulk/`, `results/motco_input/`, `results/motco_analysis/` and `results/stage_de/` on the same workstation, and R with limma and edgeR: it runs `Rscript` from the Nix shell (`flake.nix` provides R 4.6.1, limma 3.68.4, edgeR 4.10.1), and stops before writing anything, naming the Nix shell, when `Rscript` is not on `PATH`.
 
 It fits the registered stage-DE models (`STAGE_DE_MODELS`, the table above) a second time with limma-voom, on the same cohort donors, raw counts, design matrices (the formulaic matrix pydeseq2 fits, with the same column names), covariates, reference levels and abundance-passing features as `stage-de`, in the export's order, each row carrying `exported`. It sits beside the DESeq2 step and never replaces it: the DESeq2 results stay the reported ones. The method was predeclared before any limma run (`STAGE_DE_LIMMA_METHOD`):
 
@@ -603,6 +634,41 @@ Reading rules, binding for the report (`reports/motco-astrocyte-stage-de-limma-<
 - A call that differs between the methods is method dependence, not a result of either. The same donors and counts enter both methods, so agreement is not replication.
 - A zero count means "none detected at this n". The union counts carry no joint error-rate claim, and the joint F's claim is approximate (the exact-F diagnostic beside it).
 - The concordance cells cross-check the primary analysis and are not a second test of its hypothesis; the primary analysis stays primary with its non-rejection rules (`angle` and `shape` non-rejections uninformative; a `delta` rejection a difference, not specifically of size).
+
+### Positive control (microglia against astrocytes)
+
+```
+sead-sexdiff positive-control                      # both cohorts
+sead-sexdiff positive-control --cohort cohort_30 --force
+```
+
+Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--control-root` (default `results/microglia`, the results root of the control cell type, `POSITIVE_CONTROL_CELL_TYPES["control"]`), `--reference-root` (default `results`, the astrocyte root; read, never rerun), `--out-dir` (default `<control root>/positive_control`), `--force` (replace existing cohort directories).
+
+It evaluates, per cohort and from the generated files of both cell types only, the expectations written before any microglia run (`POSITIVE_CONTROL_EXPECTATIONS`, constants, never changed from results):
+
+| | expectation | read from | holds when |
+|---|---|---|---|
+| E1 | stage signal | both roots' `stage_de/<cohort>/stage_de_summary.csv` (`rna`, `factor_additive`, `union`, `exported`) and `stage_de_limma/<cohort>/stage_de_limma_summary.csv` (`rna`, `factor_additive`, `stage_joint`, `exported`): `n_significant` at FDR 0.05 | microglia > astrocyte under **both** methods, compared within each method; under one only E1 is `method_dependent`, which counts as not holding, and the method under which it held is named |
+| E2 | latent separation | both roots' `motco_analysis/<cohort>/result.json`: `latent.cv_mean_auroc` | microglia > astrocyte |
+| E3 | axis identity | the microglia root's `motco_diagnostics/<cohort>/axis_correlations.csv`: raw Spearman of the primary `pls_0` | \|ρ\| with `stage` > the largest \|ρ\| with a technical variable (sources `donor_technical.csv` and `manifest.json (export, tmm)`, `POSITIVE_CONTROL_TECHNICAL_SOURCES`; the six analysis covariates and `male` are not technical variables) |
+
+The control holds when E1, E2 and E3 all hold in `POSITIVE_CONTROL_PRIMARY_COHORT` (`cohort_30`); the `cohort_50` table is descriptive. Ties do not hold. No expectation reads a p-value, a rejection status or a trajectory statistic: the values are compared, not tested.
+
+Before anything is written, every cohort's inputs are checked: each file is present (a missing one stops the step naming it and the command that produces it, e.g. `sead-sexdiff stage-de-limma --cell-type microglia`), every manifest read records its root's cell type (`microglia` for the control root, `astrocyte` for the reference root; an astrocyte manifest written before the registry has no `cell_type` and reads as astrocyte, listed as a finding), and the chain holds: both stage-DE manifests and the diagnostic manifest name the `result.json` read for E2 (by sha256), the stage-DE manifests and the analysis manifest name the same export manifest, the limma manifest names the DESeq2 summary read for E1, and the diagnostic's technical table was made from the export's pseudobulk.
+
+Outputs under `<out-dir>/<cohort>/`:
+
+| file | content |
+|---|---|
+| `positive_control.csv` | one row per compared quantity (E1 per method, E1 over both, E2, E3) and the overall row: `cohort`, `primary_cohort`, `expectation`, `method`, `quantity`, `control`, `control_value`, `reference`, `reference_value`, `comparison`, `holds`, `outcome` (`holds`, `fails`, `method_dependent`; overall `holds` / `does_not_hold`), `detail` |
+| `positive_control.md` | the table, the expectations, the inputs with sha256 and the findings |
+| `positive_control_manifest.json` | the cell types, the expectations and rule, every file read with its sha256 per root, the compared values, the outcomes, findings, software, git |
+
+Reading rules, binding for the report (`reports/motco-microglia-positive-control-<date>.md`):
+
+- The control is about the stage signal, not the sex × stage hypothesis. If it holds, the pipeline resolves stage structure on real data and the astrocyte null is not a pipeline failure; if it does not, the latent construction is in question for any cell type, and that is reported.
+- The microglia sex × stage analysis is a second case-study result, read under the existing rules: a `delta` rejection is a difference, not specifically of size; `angle` and `shape` non-rejections are uninformative; the CV-selected rank beside `angle`; MOTCO's operating characteristics were measured on neither cell type's blocks. Both stage-DE concordance cells (DESeq2, the reported one, and limma beside it with `methods_agree`) apply to it as to the astrocytes.
+- Nothing found in microglia changes any astrocyte output or reading.
 
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
