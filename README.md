@@ -13,7 +13,8 @@ Project layout:
 ├── src/
 │   └── sead_sexdiff/
 │       ├── cli.py
-│       └── data.py
+│       ├── data.py
+│       └── stage_de_limma.R   # R side of `stage-de-limma` (limma-voom), run with Rscript
 ├── pyproject.toml   # project configuration (uv/pip compatible)
 ├── LICENSE
 └── README.md
@@ -555,6 +556,54 @@ Reading rules, binding for the report (`reports/motco-astrocyte-stage-de-<date>.
 - The `union` counts carry no joint error-rate claim; the per-coefficient counts stand beside them. The FDR of `padj ≤ 0.05` is approximate (Wald tests with estimated dispersions; about 0.06–0.09 realized in simulations under DESeq2's own model), and Cook's handling is inactive with continuous covariates, so the per-feature results carry no outlier protection.
 - The primary analysis stays primary with its non-rejection rules (`angle` and `shape` non-rejections uninformative; a `delta` rejection a difference, not specifically of size); the covariate set and the feature set are reported beside the counts, and DESeq2's normalization is not the export's TMM.
 
+### Pseudobulk stage DE, limma-voom (second method)
+
+```
+sead-sexdiff stage-de-limma                          # both cohorts, both omics (in the Nix shell)
+sead-sexdiff stage-de-limma --cohort cohort_30 --omic rna --force
+nix develop -c uv run sead-sexdiff stage-de-limma    # outside the Nix shell
+```
+
+Options: `--cohort {cohort_30,cohort_50,all}` (default `all`), `--omic {rna,atac,both}` (default `both`; the omics fitted in this run, while the summary covers every omic whose fits are complete in the cohort directory), `--pseudobulk-dir`, `--input-dir`, `--analysis-dir` (as for `stage-de`; read and never written), `--deseq2-dir` (default `results/stage_de`; the DESeq2 step's outputs, read and checked, never written), `--out-dir` (default `results/stage_de_limma`; may not lie inside an input directory or the DESeq2 directory), `--force` (refit the requested omics even when their fits are complete). The method, the joint tests, α, the TMM tolerance and the concordance rule are constants, not flags; there is no `--n-cpus` (limma runs single-threaded). The step needs `results/pseudobulk/`, `results/motco_input/`, `results/motco_analysis/` and `results/stage_de/` on the same workstation, and R with limma and edgeR: it runs `Rscript` from the Nix shell (`flake.nix` provides R 4.6.1, limma 3.68.4, edgeR 4.10.1), and stops before writing anything, naming the Nix shell, when `Rscript` is not on `PATH`.
+
+It fits the registered stage-DE models (`STAGE_DE_MODELS`, the table above) a second time with limma-voom, on the same cohort donors, raw counts, design matrices (the formulaic matrix pydeseq2 fits, with the same column names), covariates, reference levels and abundance-passing features as `stage-de`, in the export's order, each row carrying `exported`. It sits beside the DESeq2 step and never replaces it: the DESeq2 results stay the reported ones. The method was predeclared before any limma run (`STAGE_DE_LIMMA_METHOD`):
+
+1. edgeR TMM on the tested counts (library size = their column sums) with the export's trims (`TMM_LOGRATIO_TRIM` 0.3, `TMM_SUM_TRIM` 0.05) and edgeR's other defaults. The factors must equal the export manifest's to an absolute `STAGE_DE_LIMMA_TMM_ATOL` (1e-8, the tolerance of `scripts/check_tmm_edger.R`), otherwise the cohort stops naming the omic, the largest difference and the `export` command. So the fit uses the export's own normalization, the one MOTCO's blocks were built with (DESeq2 used median of ratios). voom's log-CPM, `log2((count + 0.5) / (lib.size × factor + 1) × 1e6)`, is not the export's prior-2 log2-CPM.
+2. `voomWithQualityWeights` with limma's defaults (`span = 0.5`, `adaptive.span = TRUE`, `method = "genebygene"`, `maxiter = 50`, `tol = 1e-5`, `normalize.method = "none"`, no `var.design` / `var.group`; `arrayWeights` shrinks toward equal weights with `prior.n = 10`): voom's precision weights times one quality weight per donor, estimated with each model's own design, so a noisy donor counts less instead of being removed. Each donor's weight per model, and the minimum, median, maximum and mean per sex × stage cell, are recorded and shown, without a gate.
+3. `lmFit`, then `eBayes` with its defaults (`trend = FALSE`, `robust = FALSE`, `legacy = NULL`, which resolves to the legacy estimate since every feature has the same residual df; `df.prior` and `s2.prior` recorded).
+
+The R script checks that every one of these defaults is the installed one and stops otherwise; the versions and the script's sha256 enter every fit record, so a record made under other versions is stale.
+
+Tests: a moderated t per tested coefficient, with the DESeq2 step's labels; a joint moderated F per factor model over its two coefficients (`STAGE_DE_LIMMA_JOINT_TESTS`: `stage_joint` for `factor_additive`, `interaction_joint` for `factor_interaction`; df1 = 2, df2 = `df.prior + df.residual`), the joint test pydeseq2 0.5.3 cannot run; and, for the like-for-like comparison only, each factor model's `union` of its two moderated t's, which carries no joint error-rate claim. A feature is significant when its Benjamini–Hochberg adjusted p ≤ 0.05 over all tested features (limma has no independent filter; pydeseq2's per-coefficient baseMean filter makes DESeq2's BH families smaller, mostly in ATAC). limma's joint F combines the moderated t's through the correlation of the unweighted design's coefficients, so with voom's observation weights its claim is approximate. Per joint test, an exact-F diagnostic recomputes each feature's F from its own weighted coefficient covariance (same variance and degrees of freedom, BH over all features); the fit record keeps the largest relative difference and every call at α that changes, each a finding. limma's F stays the reported test.
+
+Before anything is fitted, for every requested cohort, the step runs every check of `stage-de` through its own code path (`_stage_de_prepare`: inputs, pseudobulk manifest hash, the reproduction of the export from the counts, donors, sex, stage, `k`, cells, feature statuses, the primary analysis against the export). Then it checks the DESeq2 outputs: `<deseq2-dir>/<cohort>/stage_de_manifest.json` must be complete for both omics and record, file for file, the sha256 of the inputs now on disk; every DESeq2 table must hash as that manifest records; and the summary's counts and concordance cells must equal a recomputation from the tables. A failure names the file and `stage-de` (`--force` for a run made from other inputs). Finally R checks, per omic, that the donors of the counts, the design and the export's TMM factors agree, the TMM factors, and that each design rebuilt by `model.matrix` from the design table equals the formulaic matrix column by column under the name map (`sex[T.Male]` ↔ `sexMale`, `stage[T.1]` ↔ `stage1`, `Intercept` ↔ `(Intercept)`). Nothing is written when one of these fails. Every input and every DESeq2 file is hashed again after each cohort and must be unchanged.
+
+Predeclared limma concordance rule (`STAGE_DE_LIMMA_CONCORDANCE_RULE`): `interaction_detected` (at least one exported feature with adjusted p ≤ 0.05 on `interaction_joint`) against the primary analysis's `delta` rejection status, read as `stage-de` reads it; `concordant` when both agree, `discordant` otherwise (a finding). It is reported beside the DESeq2 cell (the union of two Wald tests, from the checked DESeq2 summary), which stays the reported cell of `stage-de`, with `methods_agree`; a disagreement is a method-dependence finding naming both counts, and neither cell replaces the other or changes a MOTCO reading.
+
+The method comparison (`method_comparison.csv`) has one row per omic × model × test × feature set: every tested coefficient (Wald ↔ moderated t, kind `coefficient`), every union (`union`), and every joint F against DESeq2's union of the same model (`joint_f_vs_union`, labelled as different tests). Each row gives `n_tested`, the significant count per method, `n_both`, `n_only_deseq2`, `n_only_limma`, whether each method detects anything and `detection_agrees`; a coefficient row adds the Spearman correlations of DESeq2's `log2FoldChange` with limma's `logFC` and of the Wald `stat` with the moderated `t`, and `n_compared`. DESeq2's missing `padj` counts as not significant. The table is descriptive (no p-value of its own, no gate); every row whose detection differs is a method-dependence finding. The `factor_interaction` / `interaction_joint` / `exported` row also carries the two concordance cells and `methods_agree`.
+
+Outputs under `results/stage_de_limma/<cohort>/` (each file written as `.tmp` and renamed):
+
+| path | content |
+|---|---|
+| `<omic>/<model>__<label>.csv` | per tested coefficient: `feature`, `AveExpr`, `logFC`, `SE`, `t`, `P.Value`, `adj.P.Val`, `B`, `exported`; per joint test (`factor_additive__stage_joint.csv`, `factor_interaction__interaction_joint.csv`): `feature`, `AveExpr`, the two `logFC_<coefficient>`, `F`, `P.Value`, `adj.P.Val`, `exported`; floats in their shortest round-trip form (R writes 17 significant digits) |
+| `<omic>/<model>__fit.json` | the fit record: the fingerprint (`stage-de`'s without pydeseq2, plus the joint test, `STAGE_DE_LIMMA_METHOD`, the TMM tolerance, the script's sha256 and the R / limma / edgeR / jsonlite versions), the fit (formula, design columns, resolved tests, the TMM check and factors, R's design check, the installed-defaults check, voom's span, the sample weights, `df.prior`, `s2.prior`, per-test counts, the exact-F diagnostic, versions, runtime), the reproduction of the export and each table's sha256. Resume semantics are `stage-de`'s: a complete model is skipped without `--force`; a record made from other inputs, settings, script or versions is an error |
+| `stage_de_limma_summary.csv` | `stage-de`'s summary columns per omic × model × test × feature set, `kind` ∈ {`moderated_t`, `joint_f`, `union`}; the limma concordance cell on the `factor_interaction` / `interaction_joint` / `exported` row. Byte-identical across reruns |
+| `method_comparison.csv` | the method comparison above. Byte-identical across reruns |
+| `stage_de_limma.md` | rendered from the summary, the comparison and the manifest: the reading rules, the concordance cells side by side, the count tables with the DESeq2 counts beside limma's, the comparison rows, the sample weights per cell, the TMM check, the exact-F diagnostic, the fits, the inputs and the findings |
+| `stage_de_limma_manifest.json` | inputs with sha256 (the DESeq2 manifest, summary and every DESeq2 file under `inputs.deseq2`), the reproduction, the primary analysis, the models and joint tests, the method, the significance and log-CPM notes, the TMM and design checks, the feature sets, the fit records, both concordance rules and the cells, `omics` / `complete`, the run, software (incl. R, limma, edgeR and the script's sha256), git revision and findings |
+
+The R side is one packaged script, `src/sead_sexdiff/stage_de_limma.R`, run as a separate process (`Rscript --vanilla`, `OMP_NUM_THREADS = OPENBLAS_NUM_THREADS = 1`) on exchange files, not through rpy2. `run_stage_de_limma(..., debug_dir=...)` (Python API only) keeps them under `<debug_dir>/<cohort>_<omic>/`: `counts.csv` (features × donors), `export_tmm.csv` and `check.json` there, and per model a directory with links to both, `design_matrix.csv`, `design_table.csv` (`%.17g`), `settings.json` and R's outputs (`coef__<label>.csv`, `joint__<label>.csv`, `sample_weights.csv`, `tmm.csv`, `fit.json`). One fit can be rerun by hand in the Nix shell with `Rscript --vanilla src/sead_sexdiff/stage_de_limma.R <debug_dir>/<cohort>_<omic>/<model>`, the checks of one omic with `Rscript --vanilla src/sead_sexdiff/stage_de_limma.R --check <omic_dir> <model_dir>...`, and the versions with `--versions`. With `debug_dir` every requested model must be fitted in the call (a complete model without `force=True` is an error).
+
+The step reads sex and stage, so it is a check beside the analysis and never a filter: its outputs are an input of no `export`, `analyze` or sensitivity run.
+
+Reading rules, binding for the report (`reports/motco-astrocyte-stage-de-limma-<date>.md`):
+
+- The change was proposed after the DESeq2 results were known. The DESeq2 results stay the reported ones, and no later change may promote whichever method finds more.
+- A call that differs between the methods is method dependence, not a result of either. The same donors and counts enter both methods, so agreement is not replication.
+- A zero count means "none detected at this n". The union counts carry no joint error-rate claim, and the joint F's claim is approximate (the exact-F diagnostic beside it).
+- The concordance cells cross-check the primary analysis and are not a second test of its hypothesis; the primary analysis stays primary with its non-rejection rules (`angle` and `shape` non-rejections uninformative; a `delta` rejection a difference, not specifically of size).
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.
@@ -718,6 +767,18 @@ stage_de_formula("factor_interaction", "rna")
 results = run_stage_de("cohort_30", omic="rna", n_cpus=8)
 results["cohort_30"]["summary"]      # counts per model × coefficient × feature set
 results["cohort_30"]["concordance"]  # {'rna': {'interaction_detected': ..., 'delta_rejected': ..., 'cell': ...}}
+```
+
+- The limma-voom stage DE beside it (in the Nix shell; the DESeq2 outputs are read and checked, never written):
+
+```python
+from sead_sexdiff.data import STAGE_DE_LIMMA_JOINT_TESTS, run_stage_de_limma, stage_de_limma_versions
+
+stage_de_limma_versions()  # {'R': '4.6.1', 'limma': '3.68.4', 'edgeR': '4.10.1', ..., 'script_sha256': ...}
+STAGE_DE_LIMMA_JOINT_TESTS["factor_interaction"]  # ('interaction_joint', ('male_x_stage_1', 'male_x_stage_2'))
+results = run_stage_de_limma("cohort_30", debug_dir="scratch/limma_debug")
+results["cohort_30"]["comparison"]   # method_comparison.csv
+results["cohort_30"]["concordance"]  # {'rna': {'deseq2': {...}, 'limma': {...}, 'delta_rejected': ..., 'methods_agree': ...}}
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:

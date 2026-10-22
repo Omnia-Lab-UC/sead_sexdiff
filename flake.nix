@@ -31,6 +31,7 @@
               rPackages.MAST
               rPackages.anndataR
               rPackages.edgeR
+              rPackages.limma
               rPackages.DESeq2
             ];
 

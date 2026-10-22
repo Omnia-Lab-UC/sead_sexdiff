@@ -27,6 +27,7 @@ from .data import (
     LATENT_MOTCO_MIN_VERSION,
     STAGE_DE_ALPHA,
     STAGE_DE_MODELS,
+    STAGE_DE_LIMMA_JOINT_TESTS,
     run_analysis,
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
@@ -35,6 +36,7 @@ from .data import (
     run_axis_diagnostics,
     run_latent_sensitivity,
     run_stage_de,
+    run_stage_de_limma,
     run_export,
     run_pseudobulk,
     write_subset_from_folder,
@@ -822,6 +824,81 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Refit the requested omics even when their fits are complete, replacing them and the cohort's summary",
     )
+
+    # stage-de-limma command: the same models with limma-voom, beside the DESeq2 step
+    joints = ", ".join(f"{j} ({m})" for m, (j, _) in STAGE_DE_LIMMA_JOINT_TESTS.items())
+    sub_sl = sub.add_parser(
+        "stage-de-limma",
+        help="limma-voom fits of the stage-DE models beside the DESeq2 step (second predeclared method)",
+        description=(
+            "Per cohort and omic, on the same donors, raw counts, registered models (STAGE_DE_MODELS: "
+            f"{models}), design matrices and abundance-passing features as `stage-de`: edgeR TMM with the export's "
+            "trims (checked against the export manifest's factors to 1e-8) -> voomWithQualityWeights -> lmFit -> "
+            "eBayes with limma's defaults (STAGE_DE_LIMMA_METHOD, a constant), run in R through the packaged script "
+            "stage_de_limma.R (Rscript from the Nix shell, one BLAS thread). A moderated t per tested coefficient and "
+            f"a joint moderated F per factor model ({joints}); Benjamini-Hochberg over all tested features at "
+            f"alpha = {STAGE_DE_ALPHA}. The predeclared limma concordance cell (exported interaction_joint count "
+            "against the primary analysis's delta rejection status) is reported beside the DESeq2 cell, which stays "
+            "the reported one; method_comparison.csv compares the two methods per coefficient, union and joint test. "
+            "Every check of `stage-de` runs first, and its outputs (--deseq2-dir) must be complete and made from the "
+            "inputs now on disk; nothing is written under the inputs or the DESeq2 directory. Writes "
+            "<out-dir>/<cohort>/ (<omic>/<model>__<label>.csv, <omic>/<model>__fit.json, stage_de_limma_summary.csv, "
+            "method_comparison.csv, stage_de_limma.md, stage_de_limma_manifest.json); resumable per model."
+        ),
+    )
+    sub_sl.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to run (default: %(default)s)",
+    )
+    sub_sl.add_argument(
+        "--omic",
+        choices=["rna", "atac", "both"],
+        default="both",
+        help=(
+            "Omic(s) to fit; the summary covers every omic whose fits are complete in the cohort directory "
+            "(default: %(default)s)"
+        ),
+    )
+    sub_sl.add_argument(
+        "--pseudobulk-dir",
+        default=Path("results/pseudobulk"),
+        type=Path,
+        help=(
+            "Directory holding rna_counts.h5ad, atac_counts.h5ad, donor_table.csv and manifest.json; read, never "
+            "written (default: %(default)s)"
+        ),
+    )
+    sub_sl.add_argument(
+        "--input-dir",
+        default=Path("results/motco_input"),
+        type=Path,
+        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+    )
+    sub_sl.add_argument(
+        "--analysis-dir",
+        default=Path("results/motco_analysis"),
+        type=Path,
+        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+    )
+    sub_sl.add_argument(
+        "--deseq2-dir",
+        default=Path("results/stage_de"),
+        type=Path,
+        help="Output root of `stage-de` (DESeq2); read and checked, never written (default: %(default)s)",
+    )
+    sub_sl.add_argument(
+        "--out-dir",
+        default=Path("results/stage_de_limma"),
+        type=Path,
+        help="Output root; one subdirectory per cohort (default: %(default)s)",
+    )
+    sub_sl.add_argument(
+        "--force",
+        action="store_true",
+        help="Refit the requested omics even when their fits are complete, replacing them and the cohort's summary",
+    )
     return parser
 
 
@@ -1138,6 +1215,39 @@ def main(argv: list[str] | None = None) -> int:
                     f"features; primary delta rejected: {'yes' if cell['delta_rejected'] else 'no'})"
                 )
         print("[stage-de] Done.")
+        return 0
+
+    if args.command == "stage-de-limma":
+        import pandas as pd
+
+        print("[stage-de-limma] Running the limma-voom stage and sex x stage models beside the DESeq2 step...")
+        results = run_stage_de_limma(
+            args.cohort,
+            omic=args.omic,
+            pseudobulk_dir=args.pseudobulk_dir,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            deseq2_dir=args.deseq2_dir,
+            out_dir=args.out_dir,
+            force=args.force,
+        )
+        columns = ["cohort", "omic", "model", "coefficient", "kind", "feature_set", "n_tested", "n_significant", "min_padj"]
+        table = pd.concat([res["summary"][columns] for res in results.values()], ignore_index=True)
+        print(
+            f"[stage-de-limma] Counts at adj. p <= {STAGE_DE_ALPHA} (joint_f = moderated F over both coefficients; "
+            "union = either coefficient, no joint error-rate claim):"
+        )
+        print(table.to_string(index=False))
+        for cohort, res in results.items():
+            for omic, cell in res["concordance"].items():
+                print(
+                    f"[stage-de-limma] {cohort} {omic}: limma cell {cell['limma']['cell']} "
+                    f"({cell['limma']['n_interaction_exported']} exported features on the joint F), DESeq2 cell "
+                    f"{cell['deseq2']['cell']} ({cell['deseq2']['n_interaction_exported']} on the union); primary delta "
+                    f"rejected: {'yes' if cell['delta_rejected'] else 'no'}; methods agree: "
+                    f"{'yes' if cell['methods_agree'] else 'no'}"
+                )
+        print("[stage-de-limma] Done.")
         return 0
 
     parser.error("Unknown command")

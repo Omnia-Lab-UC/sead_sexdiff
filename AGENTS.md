@@ -162,6 +162,28 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `<omic>/<model>__fit.json` (the resume record), `stage_de_summary.csv`,
    `stage_de.md`, `stage_de_manifest.json`). It reads sex and stage, so its
    outputs feed no export, analysis or sensitivity command.
+12. `stage-de-limma` – from the same inputs as `stage-de` plus its outputs
+   (`results/stage_de/<cohort>/`), per cohort and omic: the four models of
+   `STAGE_DE_MODELS` fitted a second time with limma-voom through the
+   packaged R script `stage_de_limma.R` (`Rscript`, one BLAS thread, exchange
+   files; never rpy2): edgeR TMM on the tested counts with the export's
+   trims, checked against the export manifest's factors to
+   `STAGE_DE_LIMMA_TMM_ATOL` → `voomWithQualityWeights` → `lmFit` → `eBayes`
+   (`STAGE_DE_LIMMA_METHOD`, limma's defaults, checked against the installed
+   ones). A moderated t per tested coefficient, a joint moderated F per factor
+   model (`STAGE_DE_LIMMA_JOINT_TESTS`: `stage_joint`, `interaction_joint`)
+   and the union, BH over all tested features. The same donors, counts,
+   designs (the formulaic matrix, rebuilt by R's `model.matrix` as a check)
+   and features as `stage-de`, by reusing `_stage_de_prepare` unchanged; the
+   DESeq2 outputs are checked (complete, made from the inputs now on disk,
+   tables hashing as recorded, summary equal to a recomputation) and never
+   written. The predeclared `STAGE_DE_LIMMA_CONCORDANCE_RULE`
+   (`interaction_joint`) sits beside the DESeq2 cell with `methods_agree`.
+   Writes `results/stage_de_limma/<cohort>/` (`<omic>/<model>__<label>.csv`,
+   `<omic>/<model>__fit.json` (the resume record), `stage_de_limma_summary.csv`,
+   `method_comparison.csv`, `stage_de_limma.md`, `stage_de_limma_manifest.json`).
+   It reads sex and stage, so its outputs feed no export, analysis or
+   sensitivity command.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -173,7 +195,14 @@ when behavior or defaults change.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
   pseudobulk, differential expression, covariates, technical covariates,
   MOTCO export, analysis, the rank / preprocessing / latent-adjustment
-  sensitivity analyses, the axis diagnostics and the pseudobulk stage DE.
+  sensitivity analyses, the axis diagnostics and the pseudobulk stage DE
+  (DESeq2, and limma-voom through the R script below).
+- `src/sead_sexdiff/stage_de_limma.R` – the R side of `stage-de-limma`
+  (TMM, voomWithQualityWeights, lmFit, eBayes, the R-side checks and the
+  exact-F diagnostic); packaged beside `data.py` and run with `Rscript` on
+  exchange files (`--check`, `--versions` modes; rerunnable by hand on
+  `run_stage_de_limma(debug_dir=...)` files). Its sha256 enters every fit
+  record, so editing it makes the existing records stale.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
 - `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
@@ -194,10 +223,10 @@ when behavior or defaults change.
 
 - Python `>=3.12,<3.14`, managed with **uv** (`uv.lock` is committed).
 - Setup: the Nix flake (`flake.nix`) provides Python 3.12, uv, R, and the R
-  packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R` and `check_stage_de_deseq2.R` (DESeq2); its shell hook runs `uv sync --locked`. Enter it
+  packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R`, `check_stage_de_deseq2.R` (DESeq2) and `stage_de_limma.R` (limma, edgeR; `stage-de-limma` needs `Rscript` on `PATH`, so it runs inside the shell or through `nix develop -c`); its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
   `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -491,6 +520,42 @@ when behavior or defaults change.
   pydeseq2's trend type plus a plug-in Wald test on pydeseq2's dispersions;
   exit 0 / 2 / 3 / 4, see README; the full fit is not expected to meet 1e-3
   on every feature).
+- Stage-DE limma constants (flag and ask before changing any of them):
+  `STAGE_DE_LIMMA_METHOD` (edgeR TMM on the tested counts, library size =
+  their column sums, `TMM_LOGRATIO_TRIM` / `TMM_SUM_TRIM` (tied at import),
+  `doWeighting`, `Acutoff` −1e10, automatic reference; `voomWithQualityWeights`
+  with `normalize.method = "none"`, `span` 0.5, `adaptive.span`, no
+  `var.design` / `var.group`, `genebygene`, `maxiter` 50, `tol` 1e-5,
+  `arrayWeights`' `prior.n` 10; `lmFit` `ls`; `eBayes` `proportion` 0.01,
+  `stdev.coef.lim` (0.1, 4), `trend` / `robust` false, `legacy` NULL; BH over
+  all tested features, no independent filter: limma 3.68.4 / edgeR 4.10.1
+  defaults, which the R script checks against the installed ones; never a
+  flag, never changed from results), `STAGE_DE_LIMMA_JOINT_TESTS`
+  (`stage_joint` for `factor_additive`, `interaction_joint` for
+  `factor_interaction`, tied at import to the factor models' tested labels;
+  limma's F is the reported joint test and the exact-F diagnostic only
+  measures its approximation), `STAGE_DE_LIMMA_CONCORDANCE_RULE` (exported
+  `interaction_joint` count > 0 against the primary `delta` rejection
+  status, tied at import to `STAGE_DE_CONCORDANCE_RULE`'s model and set;
+  reported beside the DESeq2 cell with `methods_agree`),
+  `STAGE_DE_LIMMA_TMM_ATOL` (1e-8 absolute, the `check_tmm_edger.R`
+  tolerance), the output names (`STAGE_DE_LIMMA_*`), the R bridge (one
+  packaged script through `Rscript`, one BLAS thread; its sha256 and the R /
+  limma / edgeR / jsonlite versions in every fingerprint) and the rule that
+  the DESeq2 results and the primary analysis stay primary. Reading rules for
+  the report: the change was proposed after the DESeq2 results were known,
+  and no later change may promote whichever method finds more; a call that
+  differs between the methods is method dependence, not a result of either,
+  and agreement is not replication (same donors and counts); a zero count is
+  "none detected at this n"; the union counts carry no joint error-rate
+  claim and the joint F's claim is approximate; the concordance cells
+  cross-check the primary analysis and are not a second test of its
+  hypothesis, whose non-rejection rules are untouched; voom's log-CPM, the
+  BH family and the normalization (the export's TMM, not DESeq2's median of
+  ratios) are stated beside the counts. The calibration of the change
+  (simulations under DESeq2's own model, rebuilt; realized FDR of the
+  additive tables 0.054 / 0.038 against DESeq2's 0.078 / 0.081) is not a
+  gate on real data.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
