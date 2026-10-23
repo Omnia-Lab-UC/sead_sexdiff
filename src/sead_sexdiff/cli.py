@@ -32,7 +32,9 @@ from .data import (
     STAGE_DE_ALPHA,
     STAGE_DE_MODELS,
     STAGE_DE_LIMMA_JOINT_TESTS,
+    POSITIVE_CONTROL_BASES,
     POSITIVE_CONTROL_CELL_TYPES,
+    POSITIVE_CONTROL_DEFAULT_BASIS,
     POSITIVE_CONTROL_PRIMARY_COHORT,
     run_analysis,
     run_rank_sensitivity,
@@ -734,9 +736,12 @@ def build_parser() -> argparse.ArgumentParser:
             "covariate's Spearman correlation with stage (all donors and per sex; flagged at |rho| >= "
             f"{DIAGNOSTIC_CORRELATION_THRESHOLD}, no p-value, never a gate). Writes <out-dir>/<arm>/motco_analysis/<cohort>/ "
             "(the files analyze writes) and <out-dir>/comparison/<cohort>/ (latent_sensitivity.csv, "
-            "latent_sensitivity.md, mediator_check.csv, latent_sensitivity_manifest.json)."
+            "latent_sensitivity.md, mediator_check.csv, latent_sensitivity_manifest.json). The arms run per registered "
+            "cell type (--cell-type; the registry, the covariate set and every setting are the same for every cell "
+            "type); every manifest read must record the cell type."
         ),
     )
+    _add_cell_type_argument(sub_ls)
     sub_ls.add_argument(
         "--cohort",
         choices=list(EXPORT_COHORTS) + ["all"],
@@ -745,30 +750,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_ls.add_argument(
         "--input-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+        help=f"Export root of the export step; read as the primary export, never written {_dir_default('motco_input')}",
     )
     sub_ls.add_argument(
         "--analysis-dir",
-        default=Path("results/motco_analysis"),
+        default=None,
         type=Path,
-        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+        help=(
+            "Analysis root of the analyze step; read as the primary analysis, never written "
+            f"{_dir_default('motco_analysis')}"
+        ),
     )
     sub_ls.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
         help=(
             "Directory holding manifest.json, donor_technical.csv and technical_manifest.json; read, never written "
-            "(default: %(default)s)"
+            f"{_dir_default('pseudobulk')}"
         ),
     )
     sub_ls.add_argument(
         "--out-dir",
-        default=Path("results/motco_latent_sensitivity"),
+        default=None,
         type=Path,
-        help="Output root; one subdirectory per arm plus comparison/ (default: %(default)s)",
+        help=f"Output root; one subdirectory per arm plus comparison/ {_dir_default('motco_latent_sensitivity')}",
     )
     sub_ls.add_argument(
         "--n-jobs",
@@ -955,7 +963,10 @@ def build_parser() -> argparse.ArgumentParser:
             f"E1, E2 and E3 all hold in {POSITIVE_CONTROL_PRIMARY_COHORT}. No p-value, rejection status or trajectory "
             "statistic is read; nothing is tested. Every manifest read must record its root's cell type, and the "
             "stage-DE steps and the diagnostic must have been made from the analysis read for E2. Writes "
-            "<out-dir>/<cohort>/ (positive_control.csv, positive_control.md, positive_control_manifest.json)."
+            "<out-dir>/<cohort>/ (positive_control.csv, positive_control.md, positive_control_manifest.json). With "
+            "--basis latent_adjusted, E2 and E3 read each cell type's latent_adjusted arm of latent-sensitivity and "
+            "the diagnostic made on it (E1 unchanged; the arm chain checked), writing <out-dir>/latent_adjusted/<cohort>/; "
+            "the restated control is read as a diagnosis of the primary-basis control, never as adopting the arm."
         ),
     )
     sub_pc.add_argument(
@@ -963,6 +974,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(EXPORT_COHORTS) + ["all"],
         default="all",
         help="Cohort(s) to evaluate (default: %(default)s)",
+    )
+    sub_pc.add_argument(
+        "--basis",
+        choices=list(POSITIVE_CONTROL_BASES),
+        default=POSITIVE_CONTROL_DEFAULT_BASIS,
+        help=(
+            "The analysis and diagnostic E2 and E3 read (registry POSITIVE_CONTROL_BASES): primary, or latent_adjusted "
+            "(the latent_adjusted arm of latent-sensitivity of each cell type and the diagnostic made on it; outputs "
+            "under <out-dir>/latent_adjusted/<cohort>/) (default: %(default)s)"
+        ),
     )
     sub_pc.add_argument(
         "--control-root",
@@ -1265,6 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[latent-sensitivity] Running the covariate-set and latent-basis sensitivity analysis...")
         results = run_latent_sensitivity(
             args.cohort,
+            cell_type=args.cell_type,
             input_dir=args.input_dir,
             analysis_dir=args.analysis_dir,
             pseudobulk_dir=args.pseudobulk_dir,
@@ -1354,6 +1376,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[positive-control] Evaluating the predeclared positive-control expectations...")
         results = run_positive_control(
             args.cohort,
+            basis=args.basis,
             control_root=args.control_root,
             reference_root=args.reference_root,
             out_dir=args.out_dir,
@@ -1362,7 +1385,8 @@ def main(argv: list[str] | None = None) -> int:
         for cohort, res in results.items():
             o = res["outcomes"]
             print(
-                f"[positive-control] {cohort}{' (primary cohort)' if res['manifest']['primary_cohort'] else ''}: "
+                f"[positive-control] {cohort}{' (primary cohort)' if res['manifest']['primary_cohort'] else ''}"
+                f"{'' if args.basis == POSITIVE_CONTROL_DEFAULT_BASIS else f' (basis {args.basis})'}: "
                 f"E1 {o['E1']}, E2 {o['E2']}, E3 {o['E3']}; all three hold: {'yes' if o['all_hold'] else 'no'}"
             )
         print("[positive-control] Done.")

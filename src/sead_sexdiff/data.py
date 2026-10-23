@@ -1113,6 +1113,7 @@ CELL_TYPE_SUBDIRS: dict[str, str] = {
     "motco_analysis": "motco_analysis",
     "motco_rank_sensitivity": "motco_rank_sensitivity",
     "motco_diagnostics": "motco_diagnostics",
+    "motco_latent_sensitivity": "motco_latent_sensitivity",
     "stage_de": "stage_de",
     "stage_de_limma": "stage_de_limma",
     "positive_control": "positive_control",
@@ -8658,10 +8659,11 @@ def _same_dir(a: Path, b: Path) -> bool:
 def run_latent_sensitivity(
     cohort: str = "all",
     *,
-    input_dir: str | Path = "results/motco_input",
-    analysis_dir: str | Path = "results/motco_analysis",
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    out_dir: str | Path = "results/motco_latent_sensitivity",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    input_dir: str | Path | None = None,
+    analysis_dir: str | Path | None = None,
+    pseudobulk_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     n_jobs: int = 1,
     force: bool = False,
 ) -> dict:
@@ -8671,18 +8673,31 @@ def run_latent_sensitivity(
     ----------
     cohort:
         ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    cell_type:
+        A registered cell type (``CELL_TYPES``, default ``astrocyte``). The
+        directory defaults below come from its results root
+        (``cell_type_dirs``); every manifest read (export, analysis,
+        technical, pseudobulk) must record it, a manifest without the key
+        reading as ``astrocyte`` with a finding (``check_manifest_cell_type``),
+        and the arm and comparison manifests record it. The registry of arms,
+        the covariate set, the conditioning, the mediator check and every
+        analysis setting are the same for every cell type.
     input_dir:
-        Export root of the ``export`` step; ``<input_dir>/<cohort>/`` is the
-        primary export, read, never written. Both arms run on it.
+        Export root of the ``export`` step (default ``<root>/motco_input``);
+        ``<input_dir>/<cohort>/`` is the primary export, read, never written.
+        Both arms run on it.
     analysis_dir:
-        Analysis root of the ``analyze`` step; ``<analysis_dir>/<cohort>/`` is
-        the primary analysis (the reference row), read and checked, never
-        rerun or written.
+        Analysis root of the ``analyze`` step (default
+        ``<root>/motco_analysis``); ``<analysis_dir>/<cohort>/`` is the
+        primary analysis (the reference row), read and checked, never rerun
+        or written.
     pseudobulk_dir:
         Directory holding ``manifest.json``, ``donor_technical.csv`` and
-        ``technical_manifest.json`` (read, never written).
+        ``technical_manifest.json`` (default ``<root>/pseudobulk``; read,
+        never written).
     out_dir:
-        Output root: ``<out_dir>/<arm>/motco_analysis/<cohort>/`` per arm of
+        Output root (default ``<root>/motco_latent_sensitivity``):
+        ``<out_dir>/<arm>/motco_analysis/<cohort>/`` per arm of
         ``LATENT_SENSITIVITY_ARMS`` (the files ``analyze`` writes) and
         ``<out_dir>/comparison/<cohort>/`` (``latent_sensitivity.csv``,
         ``latent_sensitivity.md``, ``mediator_check.csv``,
@@ -8717,12 +8732,16 @@ def run_latent_sensitivity(
         the seed, the permutations or the CV selection (``_check_reference``);
         the technical table does not match the pseudobulk manifest or
         ``TECHNICAL_GENE_SETS``, or lacks an added covariate for a cohort donor
-        (``_check_technical_reference``); or ``out_dir`` lies inside an input
-        directory.
+        (``_check_technical_reference``); a manifest read records another
+        cell type (``check_manifest_cell_type``); or ``out_dir`` lies inside
+        an input directory.
 
     Notes
     -----
     Every check runs for every requested cohort before anything is written.
+    The cell-type findings of the manifests read (a manifest written before
+    the cell-type registry) go to the comparison manifest's ``findings``,
+    not to ``latent_sensitivity.md``, whose findings are the comparison's.
     Per cohort, ``mediator_check.csv`` is written to
     ``comparison/<cohort>.tmp/`` before the first arm runs; each arm is one
     ``_analyze_cohort`` call on the primary export with
@@ -8747,8 +8766,12 @@ def run_latent_sensitivity(
     )
     from motco.analysis import TrajectoryAnalysisParams
 
-    input_dir, analysis_dir = Path(input_dir), Path(analysis_dir)
-    pb, out_dir = Path(pseudobulk_dir), Path(out_dir)
+    cell_type_entry(cell_type)
+    flag = "" if cell_type == DEFAULT_CELL_TYPE else f" --cell-type {cell_type}"
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    analysis_dir = _resolve_dir(analysis_dir, cell_type, "motco_analysis")
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    out_dir = _resolve_dir(out_dir, cell_type, "motco_latent_sensitivity")
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
@@ -8771,17 +8794,20 @@ def run_latent_sensitivity(
                 )
     for c in cohorts:
         if not (input_dir / c).is_dir():
-            raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce the primary export")
+            raise FileNotFoundError(
+                f"{input_dir / c} does not exist; run `sead-sexdiff export{flag}` to produce the primary export"
+            )
         if not (analysis_dir / c).is_dir():
             raise FileNotFoundError(
-                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze` to produce the primary analysis"
+                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze{flag}` to produce the primary analysis"
             )
     if not (pb / "manifest.json").exists():
         raise FileNotFoundError(
-            f"{pb / 'manifest.json'} is missing; run `sead-sexdiff pseudobulk` on the cluster and sync results/pseudobulk/ "
-            "(scripts/sync_pseudobulk.sh) to produce it"
+            f"{pb / 'manifest.json'} is missing; run `sead-sexdiff pseudobulk{flag}` on the cluster and sync {pb}/ "
+            f"(scripts/sync_pseudobulk.sh{flag}) to produce it"
         )
     print(f"[{log}] MOTCO {motco_version} (latent adjustment needs >= {LATENT_MOTCO_MIN_VERSION})")
+    print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Primary export directory: {input_dir}")
     print(f"[{log}] Primary analysis directory: {analysis_dir}")
     print(f"[{log}] Pseudobulk directory: {pb}")
@@ -8803,7 +8829,11 @@ def run_latent_sensitivity(
     for c in cohorts:
         cohort_dir = input_dir / c
         loaded = load_analysis_inputs(cohort_dir)
+        cell_type_findings = check_manifest_cell_type(loaded["export_manifest"], cohort_dir / "manifest.json", cell_type)
         reference = _check_reference(cohort_dir, analysis_dir / c, loaded["inputs"], motco_version)
+        cell_type_findings += check_manifest_cell_type(
+            reference["manifest"], reference["dir"] / "analysis_manifest.json", cell_type
+        )
         meas = reference["manifest"].get("measurement", {})
         for arm, p in params.items():
             used = {
@@ -8822,6 +8852,12 @@ def run_latent_sensitivity(
                     )
         donors = loaded["metadata"]["donor_id"].tolist()
         technical = _check_technical_reference(pb, donors=donors, columns=LATENT_SENSITIVITY_ADDED_COVARIATES)
+        cell_type_findings += check_manifest_cell_type(
+            technical["manifest"], pb / TECHNICAL_OUTPUTS["manifest"], cell_type
+        )
+        cell_type_findings += check_manifest_cell_type(
+            json.loads((pb / "manifest.json").read_text()), pb / "manifest.json", cell_type
+        )
         extra = technical["table"][["donor_id", *LATENT_SENSITIVITY_ADDED_COVARIATES]].copy()
         extra["donor_id"] = extra["donor_id"].astype(str)
         extra = extra[extra["donor_id"].isin(donors)]
@@ -8837,7 +8873,10 @@ def run_latent_sensitivity(
             f"TECHNICAL_GENE_SETS and is complete for {len(donors)} donors × "
             f"{len(LATENT_SENSITIVITY_ADDED_COVARIATES)} added covariates"
         )
-        prepared[c] = {"loaded": loaded_arms, "reference": reference, "technical": technical}
+        prepared[c] = {
+            "loaded": loaded_arms, "reference": reference, "technical": technical,
+            "cell_type_findings": cell_type_findings,
+        }
 
     software = _software_versions()
     software["motco"] = motco_version
@@ -8895,7 +8934,7 @@ def run_latent_sensitivity(
                     out_dir=arm_roots[arm], final_name=f"{c}.tmp", published_dir=arm_roots[arm] / c, n_jobs=n_jobs,
                     findings=[f"latent-sensitivity arm {arm}: the primary analysis in {reference['dir']} is primary"],
                     log_prefix=log, covariates=spec["covariates"], covariate_sources=sources,
-                    extra_inputs=technical_inputs,
+                    extra_inputs=technical_inputs, cell_type=cell_type,
                 )
             for arm, spec in LATENT_SENSITIVITY_ARMS.items():
                 rec = runs[arm]["record"]
@@ -8980,8 +9019,10 @@ def run_latent_sensitivity(
             if reference_now != {name: info["sha256"] for name, info in reference["files"].items()}:
                 raise ValueError(f"the primary analysis files under {reference['dir']} changed during the run")
             ref_record = reference["record"]
+            manifest_findings = [*prep["cell_type_findings"], *findings]
             manifest = {
                 "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "cell_type": cell_type,
                 "cohort": c,
                 "n_donors": int(len(loaded["metadata"])),
                 "covariates": {
@@ -9062,7 +9103,7 @@ def run_latent_sensitivity(
                 ]),
                 "software": software,
                 "git": _git_revision(),
-                "findings": findings,
+                "findings": manifest_findings,
             }
             (comp_tmp / LATENT_SENSITIVITY_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
             # Arms first, the comparison last: a complete comparison directory marks a complete cohort
@@ -9081,11 +9122,11 @@ def run_latent_sensitivity(
             runs[arm]["dir"] = arm_roots[arm] / c
         final = comp_root / c
         print(f"[{log}] Wrote {final} and " + ", ".join(str(arm_roots[arm] / c) for arm in arms))
-        for msg in findings:
+        for msg in manifest_findings:
             print(f"[{log}] FINDING: {c}: {msg}")
         results[c] = {
             "dir": final, "arms": runs, "reference": reference, "technical": technical, "rows": rows,
-            "table": table, "mediator": mediator, "manifest": manifest, "findings": findings,
+            "table": table, "mediator": mediator, "manifest": manifest, "findings": manifest_findings,
         }
     return results
 
@@ -12223,6 +12264,66 @@ POSITIVE_CONTROL_RULE = (
     "holds, the pipeline resolves stage structure on real data and the reference's null is not a pipeline failure; "
     "if not, the latent construction is in question for any cell type"
 )
+# The analysis and the diagnostic E2 and E3 read, per cell type: the primary
+# analysis (the default; today's inputs, output path and bytes) or the
+# latent_adjusted arm of latent-sensitivity and the diagnostic made on it
+# (outputs under <out_dir>/latent_adjusted/<cohort>/). E1 is read unchanged
+# on every basis (basis-independent). A registry, never a free directory,
+# never extended from results; the expectations, their comparisons, E3's
+# technical sources and the all-three rule do not change with the basis.
+# The restated control's reading was written before any microglia arm ran
+# (proposal of mtg-microglia-latent-sensitivity) and is never changed from
+# results. Flag and ask before changing.
+POSITIVE_CONTROL_DEFAULT_BASIS = "primary"
+POSITIVE_CONTROL_BASES: dict[str, dict] = {
+    "primary": {
+        "description": "the primary analysis of each cell type and the diagnostic made from it",
+        "analysis_subdir": CELL_TYPE_SUBDIRS["motco_analysis"],
+        "diagnostics_subdir": CELL_TYPE_SUBDIRS["motco_diagnostics"],
+        "arm": None,
+        "reading": None,
+    },
+    "latent_adjusted": {
+        "description": "the latent_adjusted arm of latent-sensitivity of each cell type and the diagnostic made from it",
+        "analysis_subdir": f"{CELL_TYPE_SUBDIRS['motco_latent_sensitivity']}/latent_adjusted/{LATENT_SENSITIVITY_ANALYSIS_DIR}",
+        "diagnostics_subdir": f"{CELL_TYPE_SUBDIRS['motco_latent_sensitivity']}/diagnostics/latent_adjusted",
+        "arm": "latent_adjusted",
+        "reading": (
+            "a diagnosis of the primary-basis control, which stays the control's outcome: if the restated control "
+            "holds in the primary cohort, the measured quality gradient explains the primary control's failure (once "
+            "the library-quality direction is conditioned out of the basis, the pipeline resolves stage in the cell "
+            "type with the stronger stage signal), without promoting the arm (MOTCO's power comparison, "
+            "candidate_fails, excludes the latent adjustment as a replacement of the primary), changing the "
+            "primary-basis outcome or changing the reference cell type's reading; if it does not hold, the latent "
+            "construction is in question beyond the quality gradient (the composition of the control population, the "
+            "rank-1 selection and the control's ATAC nuclei per donor are the stated candidates) and the diagnosis "
+            "'technical gradient' is not supported. E3 on this basis carries the mediator caveat in both directions: "
+            "the adjustment removes the quality direction and, with it, any stage signal the added fractions carry, "
+            "so the stage |rho| may rise or fall; a failure for that reason is still a failure and the expectation "
+            "is not re-tuned. The sensitivity cohort is descriptive, as on the primary basis"
+        ),
+    },
+}
+# Only an arm with a latent adjustment of its own can be a basis: with the
+# covariate-blind basis (extended_covariates) the latent space, CV rank and
+# AUROC equal the primary's by MOTCO's contract, so E2 and E3 would repeat
+# the primary's values; that equality is stated and checked in the report.
+for _name, _entry in POSITIVE_CONTROL_BASES.items():
+    _arm = _entry["arm"]
+    if _name == POSITIVE_CONTROL_DEFAULT_BASIS:
+        if _arm is not None:
+            raise AssertionError("the default positive-control basis is the primary analysis, not an arm")
+        continue
+    if _arm not in LATENT_SENSITIVITY_ARMS or not LATENT_SENSITIVITY_ARMS[_arm]["latent_adjustment"]:
+        raise AssertionError(
+            f"positive-control basis {_name!r} must be an arm of LATENT_SENSITIVITY_ARMS with a latent adjustment; "
+            f"got {_arm!r}"
+        )
+    if _entry["analysis_subdir"] != (
+        f"{CELL_TYPE_SUBDIRS['motco_latent_sensitivity']}/{_arm}/{LATENT_SENSITIVITY_ANALYSIS_DIR}"
+    ) or _entry["diagnostics_subdir"] != f"{CELL_TYPE_SUBDIRS['motco_latent_sensitivity']}/diagnostics/{_arm}":
+        raise AssertionError(f"positive-control basis {_name!r} must point at the {_arm} arm's layout")
+del _name, _entry, _arm
 POSITIVE_CONTROL_TABLE = "positive_control.csv"
 POSITIVE_CONTROL_MARKDOWN = "positive_control.md"
 POSITIVE_CONTROL_MANIFEST = "positive_control_manifest.json"
@@ -12232,24 +12333,37 @@ POSITIVE_CONTROL_COLUMNS = (
 )
 
 
-def _positive_control_read(root: Path, cohort: str, role: str, *, diagnostics: bool) -> dict:
+def _positive_control_read(
+    root: Path, cohort: str, role: str, *, diagnostics: bool, basis: str = POSITIVE_CONTROL_DEFAULT_BASIS
+) -> dict:
     """Read and check one root's files of one cohort for the positive control (design D7).
 
     Checks the cell type of every manifest read (``POSITIVE_CONTROL_CELL_TYPES[role]``)
-    and the chain: both stage-DE steps and the diagnostic were made from the
-    analysis read for E2 (``result.json`` sha256), and the limma step from
-    the DESeq2 summary read for E1.
+    and the chain: both stage-DE steps were made from the primary analysis
+    (``result.json`` sha256) and the limma step from the DESeq2 summary read
+    for E1; the diagnostic read for E3 from the analysis read for E2. On a
+    non-primary ``basis`` (``POSITIVE_CONTROL_BASES``) E2 and E3 read the
+    arm analysis and the diagnostic made on it, and the chain also checks
+    that the arm was made from the primary export now on disk (its recorded
+    input hashes, the check ``axis-diagnostics`` runs), that the arm's
+    comparison manifest names the primary analysis now on disk as its
+    reference (so E1, E2 and E3 hang off one primary analysis) and that it
+    lists this arm directory, and that the arm's conditioning is the
+    registered one.
 
     Returns
     -------
     dict
-        ``files`` (label → path and sha256), ``findings``, ``e1`` (method →
-        the summary row's ``n_significant`` and ``n_tested``), ``e2``
-        (``cv_mean_auroc``) and, with ``diagnostics``, ``e3`` (the primary
-        ``pls_0`` rows of ``axis_correlations.csv``).
+        ``files`` (label → path and sha256), ``findings``, ``basis``,
+        ``arm`` (``None`` on the primary basis; the arm's directory, hashes
+        and adjustment block otherwise), ``e1`` (method → the summary row's
+        ``n_significant`` and ``n_tested``), ``e2`` (``cv_mean_auroc``) and,
+        with ``diagnostics``, ``e3`` (the ``pls_0`` rows of
+        ``axis_correlations.csv`` labelled ``primary`` by the diagnostic).
     """
     cell_type = POSITIVE_CONTROL_CELL_TYPES[role]
     flag = "" if cell_type == DEFAULT_CELL_TYPE else f" --cell-type {cell_type}"
+    entry = POSITIVE_CONTROL_BASES[basis]
     files, findings = {}, []
 
     def need(path: Path, command: str) -> Path:
@@ -12266,17 +12380,90 @@ def _positive_control_read(root: Path, cohort: str, role: str, *, diagnostics: b
         findings.extend(check_manifest_cell_type(m, path, cell_type))
         return m
 
+    # The primary analysis: E1's stage-DE steps are chained to it on every basis
     an_dir = root / CELL_TYPE_SUBDIRS["motco_analysis"] / cohort
-    result_path = need(an_dir / "result.json", "analyze")
+    primary_path = need(an_dir / "result.json", "analyze")
     an_manifest = manifest(an_dir / "analysis_manifest.json", "analyze")
-    record = json.loads(result_path.read_text())
-    if record.get("latent", {}).get("component_selection") != "cv":
-        raise ValueError(f"{result_path} is not a CV-selected analysis; the positive control reads the primary analysis")
-    result_sha = files[str(result_path.relative_to(root))]["sha256"]
+    primary_record = json.loads(primary_path.read_text())
+    if primary_record.get("latent", {}).get("component_selection") != "cv":
+        raise ValueError(f"{primary_path} is not a CV-selected analysis; the positive control reads the primary analysis")
+    primary_sha = files[str(primary_path.relative_to(root))]["sha256"]
+    export_sha = an_manifest.get("inputs", {}).get("export_manifest_sha256")
+    arm_info = None
+    if entry["arm"] is None:
+        result_path, record, result_sha = primary_path, primary_record, primary_sha
+        diag_command = "axis-diagnostics"
+    else:
+        arm = entry["arm"]
+        arm_command = "latent-sensitivity"
+        arm_dir = root / entry["analysis_subdir"] / cohort
+        result_path = need(arm_dir / "result.json", arm_command)
+        arm_manifest = manifest(arm_dir / "analysis_manifest.json", arm_command)
+        record = json.loads(result_path.read_text())
+        if record.get("latent", {}).get("component_selection") != "cv":
+            raise ValueError(f"{result_path} is not a CV-selected analysis; the {arm} arm keeps the primary's CV rank selection")
+        conditioning = (record.get("latent_adjustment") or {}).get("conditioning")
+        if conditioning != LATENT_SENSITIVITY_ARMS[arm]["latent_adjustment"]:
+            raise ValueError(
+                f"{result_path} records latent-adjustment conditioning {conditioning!r}, not "
+                f"{LATENT_SENSITIVITY_ARMS[arm]['latent_adjustment']!r} (the {arm} arm of LATENT_SENSITIVITY_ARMS); "
+                "nothing was written"
+            )
+        result_sha = files[str(result_path.relative_to(root))]["sha256"]
+        # The arm was made from the primary export now on disk (the check axis-diagnostics runs) ...
+        export_dir = root / CELL_TYPE_SUBDIRS["motco_input"] / cohort
+        recorded = arm_manifest.get("inputs", {}).get("files", {})
+        if not recorded:
+            raise ValueError(f"{arm_dir / 'analysis_manifest.json'} records no input hashes; nothing was written")
+        for name, info in recorded.items():
+            path = export_dir / name
+            now = _sha256_file(path) if path.exists() else None
+            if info.get("sha256") != now:
+                raise ValueError(
+                    f"{path} differs from the file the {arm} arm in {arm_dir} was made from (sha256 "
+                    f"{info.get('sha256')} recorded, {now} now); rerun `sead-sexdiff {arm_command}{flag}` or restore "
+                    "the export; nothing was written"
+                )
+            files[str(path.relative_to(root))] = {"path": str(path), "sha256": now}
+        if arm_manifest.get("inputs", {}).get("export_manifest_sha256") != export_sha:
+            raise ValueError(
+                f"{arm_dir / 'analysis_manifest.json'} and {an_dir / 'analysis_manifest.json'} record different export "
+                "manifests; nothing was written"
+            )
+        # ... and compared with the primary analysis now on disk, the one E1's stage-DE steps are checked against
+        comp_dir = root / CELL_TYPE_SUBDIRS["motco_latent_sensitivity"] / LATENT_SENSITIVITY_COMPARISON_DIR / cohort
+        comp_path = comp_dir / LATENT_SENSITIVITY_MANIFEST
+        comp_manifest = manifest(comp_path, arm_command)
+        comp_ref = comp_manifest.get("reference", {}).get("files", {}).get("result.json", {}).get("sha256")
+        if comp_ref != primary_sha:
+            raise ValueError(
+                f"{comp_path} compared the arms with a primary analysis whose result.json sha256 is {comp_ref}, not "
+                f"{primary_path} ({primary_sha}), the analysis E1's stage-DE steps are checked against; rerun "
+                f"`sead-sexdiff {arm_command}{flag}`; nothing was written"
+            )
+        comp_arm = comp_manifest.get("arms", {}).get(arm, {}).get("files", {}).get("result.json", {}).get("sha256")
+        if comp_arm != result_sha:
+            raise ValueError(
+                f"{comp_path} records result.json sha256 {comp_arm} for the {arm} arm, not {result_path} "
+                f"({result_sha}); rerun `sead-sexdiff {arm_command}{flag}`; nothing was written"
+            )
+        diag_command = (
+            f"axis-diagnostics --analysis-dir {root / entry['analysis_subdir']} "
+            f"--out-dir {root / entry['diagnostics_subdir']}"
+        )
+        arm_info = {
+            "arm": arm,
+            "dir": str(arm_dir),
+            "result_sha256": result_sha,
+            "selected_lv": record["latent"]["selected_lv"],
+            "covariates": (record.get("covariates") or {}).get("columns"),
+            "latent_adjustment": record.get("latent_adjustment"),
+            "comparison_manifest": {"path": str(comp_path), "sha256": files[str(comp_path.relative_to(root))]["sha256"]},
+            "primary": {"dir": str(an_dir), "result_sha256": primary_sha},
+        }
     auroc = record["latent"].get("cv_mean_auroc")
     if auroc is None:
         raise ValueError(f"{result_path} records no latent.cv_mean_auroc")
-    export_sha = an_manifest.get("inputs", {}).get("export_manifest_sha256")
 
     e1, summaries = {}, {}
     for method, spec in POSITIVE_CONTROL_EXPECTATIONS["E1"]["methods"].items():
@@ -12286,10 +12473,10 @@ def _positive_control_read(root: Path, cohort: str, role: str, *, diagnostics: b
         if not m.get("complete") or spec["omic"] not in m.get("omics", []):
             raise ValueError(f"{d / spec['manifest']} is not complete for {spec['omic']}; run `sead-sexdiff {spec['command']}{flag}`")
         ref_sha = m.get("reference", {}).get("result_sha256")
-        if ref_sha != result_sha:
+        if ref_sha != primary_sha:
             raise ValueError(
                 f"{d / spec['manifest']} was made against an analysis with result.json sha256 {ref_sha}, not "
-                f"{result_path} ({result_sha}); rerun `sead-sexdiff {spec['command']}{flag}`"
+                f"{primary_path} ({primary_sha}); rerun `sead-sexdiff {spec['command']}{flag}`"
             )
         if m.get("inputs", {}).get("export_manifest_sha256") != export_sha:
             raise ValueError(f"{d / spec['manifest']} and {an_dir / 'analysis_manifest.json'} record different export manifests")
@@ -12312,18 +12499,18 @@ def _positive_control_read(root: Path, cohort: str, role: str, *, diagnostics: b
                     f"{d / spec['manifest']} checked a DESeq2 summary with sha256 {recorded}, not the one read for E1 "
                     f"({summaries['deseq2']}); rerun `sead-sexdiff stage-de-limma{flag}`"
                 )
-    out = {"files": files, "findings": findings, "e1": e1, "e2": float(auroc)}
+    out = {"files": files, "findings": findings, "basis": basis, "arm": arm_info, "e1": e1, "e2": float(auroc)}
 
     if diagnostics:
         spec = POSITIVE_CONTROL_EXPECTATIONS["E3"]
-        d = root / spec["subdir"] / cohort
-        axis_path = need(d / spec["file"], "axis-diagnostics")
-        m = manifest(d / DIAGNOSTIC_OUTPUTS["manifest"], "axis-diagnostics")
+        d = root / entry["diagnostics_subdir"] / cohort
+        axis_path = need(d / spec["file"], diag_command)
+        m = manifest(d / DIAGNOSTIC_OUTPUTS["manifest"], diag_command)
         primary = [a for a in m.get("inputs", {}).get("analyses", []) if a.get("label") == spec["analysis"]]
         if len(primary) != 1 or primary[0].get("files", {}).get("result.json", {}).get("sha256") != result_sha:
             raise ValueError(
                 f"{d / DIAGNOSTIC_OUTPUTS['manifest']} was not made from {result_path}; rerun "
-                f"`sead-sexdiff axis-diagnostics{flag}`"
+                f"`sead-sexdiff {diag_command}{flag}`"
             )
         if m.get("inputs", {}).get("technical", {}).get("manifest", {}).get("matches_export") is not True:
             raise ValueError(
@@ -12341,6 +12528,10 @@ def _positive_control_rows(cohort: str, control: dict, reference: dict) -> tuple
     primary = cohort == POSITIVE_CONTROL_PRIMARY_COHORT
     rows, outcomes, findings = [], {}, []
     base = {"cohort": cohort, "primary_cohort": primary}
+    arm = POSITIVE_CONTROL_BASES[control["basis"]]["arm"]
+    if reference["basis"] != control["basis"]:
+        raise ValueError(f"the control was read on basis {control['basis']!r} and the reference on {reference['basis']!r}")
+    analysis_name = "the primary analysis" if arm is None else f"the {arm} arm analysis (basis {control['basis']})"
 
     held = {}
     for method, spec in POSITIVE_CONTROL_EXPECTATIONS["E1"]["methods"].items():
@@ -12373,7 +12564,7 @@ def _positive_control_rows(cohort: str, control: dict, reference: dict) -> tuple
     a, b = control["e2"], reference["e2"]
     outcomes["E2"] = "holds" if a > b else "fails"
     rows.append({
-        **base, "expectation": "E2", "method": "", "quantity": "CV mean AUROC of the primary analysis (latent.cv_mean_auroc)",
+        **base, "expectation": "E2", "method": "", "quantity": f"CV mean AUROC of {analysis_name} (latent.cv_mean_auroc)",
         "control": types["control"], "control_value": a, "reference": types["reference"], "reference_value": b,
         "comparison": ">", "holds": a > b, "outcome": outcomes["E2"], "detail": "",
     })
@@ -12399,7 +12590,9 @@ def _positive_control_rows(cohort: str, control: dict, reference: dict) -> tuple
     outcomes["E3_technical_max"] = {"variable": str(top["variable"]), "source": str(top["source"]), "abs_spearman": b}
     rows.append({
         **base, "expectation": "E3", "method": "",
-        "quantity": f"|Spearman| of {spec['component']} ({spec['analysis']}) with stage vs the largest with a technical variable",
+        "quantity": f"|Spearman| of {spec['component']} ("
+                    + (spec["analysis"] if arm is None else f"{arm} arm, labelled {spec['analysis']} by its diagnostic")
+                    + ") with stage vs the largest with a technical variable",
         "control": spec["stage_variable"], "control_value": a, "reference": str(top["variable"]), "reference_value": b,
         "comparison": ">", "holds": a > b, "outcome": outcomes["E3"],
         "detail": f"{len(finite)} technical variables compared ({', '.join(spec['technical_sources'])})",
@@ -12424,9 +12617,12 @@ def render_positive_control(table: pd.DataFrame, manifest: dict) -> str:
     """Render ``positive_control.md`` from the written table and the manifest."""
     c = manifest["cohort"]
     types = manifest["cell_types"]
+    basis = manifest.get("basis", POSITIVE_CONTROL_DEFAULT_BASIS)
+    entry = POSITIVE_CONTROL_BASES[basis]
     overall = table[table["expectation"] == "overall"].iloc[0]
     lines = [
-        f"# Positive control: {types['control']} against {types['reference']} ({c})",
+        f"# Positive control: {types['control']} against {types['reference']} ({c})"
+        + ("" if entry["arm"] is None else f", basis `{basis}`"),
         "",
         f"Predeclared expectations (POSITIVE_CONTROL_EXPECTATIONS), evaluated from the generated files of both cell "
         f"types. {POSITIVE_CONTROL_RULE[0].upper() + POSITIVE_CONTROL_RULE[1:]}. No expectation reads a p-value, a "
@@ -12436,6 +12632,15 @@ def render_positive_control(table: pd.DataFrame, manifest: dict) -> str:
         f"{types['control']} trajectory result is read under the same binding rules as the {types['reference']} one, "
         f"and nothing here changes any {types['reference']} output or reading.",
         "",
+    ]
+    if entry["arm"] is not None:
+        lines += [
+            f"**Basis `{basis}`** (POSITIVE_CONTROL_BASES): E2 and E3 read {entry['description']}; E1 is "
+            "basis-independent and equals the primary-basis rows. The expectations, their comparisons, E3's technical "
+            f"variables and the all-three rule are the primary basis's. Read as {entry['reading']}.",
+            "",
+        ]
+    lines += [
         ("**Primary cohort.** " if manifest["primary_cohort"] else f"**Not the primary cohort** "
          f"({POSITIVE_CONTROL_PRIMARY_COHORT} is): descriptive. ")
         + f"Overall: **{overall['outcome'].replace('_', ' ')}**"
@@ -12473,6 +12678,7 @@ def render_positive_control(table: pd.DataFrame, manifest: dict) -> str:
 def run_positive_control(
     cohort: str = "all",
     *,
+    basis: str = POSITIVE_CONTROL_DEFAULT_BASIS,
     control_root: str | Path | None = None,
     reference_root: str | Path | None = None,
     out_dir: str | Path | None = None,
@@ -12484,6 +12690,15 @@ def run_positive_control(
     ----------
     cohort:
         ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    basis:
+        A name of ``POSITIVE_CONTROL_BASES``: ``primary`` (the default; E2
+        and E3 from each cell type's primary analysis and the diagnostic made
+        from it, outputs under ``<out_dir>/<cohort>/``) or ``latent_adjusted``
+        (E2 and E3 from each cell type's ``latent_adjusted`` arm of
+        ``latent-sensitivity`` and the diagnostic made on that arm, outputs
+        under ``<out_dir>/<basis>/<cohort>/``). E1 is read unchanged on every
+        basis. The expectations, their comparisons, E3's technical sources
+        and the all-three rule do not change with the basis.
     control_root:
         Results root of the control cell type (``POSITIVE_CONTROL_CELL_TYPES["control"]``,
         default its registry root ``results/microglia``): ``stage_de/``,
@@ -12495,8 +12710,9 @@ def run_positive_control(
         every manifest must record the reference cell type (a manifest with
         no ``cell_type`` reads as astrocyte, with a finding).
     out_dir:
-        Output root; each cohort goes to ``<out_dir>/<cohort>/`` (default
-        ``<control_root>/positive_control``).
+        Output root; each cohort goes to ``<out_dir>/<cohort>/`` on the
+        primary basis and to ``<out_dir>/<basis>/<cohort>/`` otherwise
+        (default ``<control_root>/positive_control``).
     force:
         Replace existing cohort directories.
 
@@ -12511,10 +12727,13 @@ def run_positive_control(
         A summary, analysis or diagnostic file is missing; the message names
         it and the command that produces it.
     ValueError
-        A manifest records another cell type than its root's role, or the
-        chain does not hold (the stage-DE steps or the diagnostic were made
-        from another analysis, the limma step checked another DESeq2
-        summary, the technical table belongs to another pseudobulk).
+        ``basis`` is not registered; a manifest records another cell type
+        than its root's role; or the chain does not hold (the stage-DE steps
+        or the diagnostic were made from another analysis, the limma step
+        checked another DESeq2 summary, the technical table belongs to
+        another pseudobulk; on a non-primary basis also an arm made from
+        another export, compared with another primary analysis or with
+        another conditioning than the registered one).
 
     Notes
     -----
@@ -12533,25 +12752,30 @@ def run_positive_control(
 
     log = "positive-control"
     types = POSITIVE_CONTROL_CELL_TYPES
+    if basis not in POSITIVE_CONTROL_BASES:
+        raise ValueError(f"Unknown basis {basis!r}; registered bases (POSITIVE_CONTROL_BASES): {list(POSITIVE_CONTROL_BASES)}")
+    entry = POSITIVE_CONTROL_BASES[basis]
     control_root = Path(control_root) if control_root is not None else Path(cell_type_entry(types["control"])["results_root"])
     reference_root = (
         Path(reference_root) if reference_root is not None else Path(cell_type_entry(types["reference"])["results_root"])
     )
     out_dir = Path(out_dir) if out_dir is not None else control_root / CELL_TYPE_SUBDIRS["positive_control"]
+    cohort_root = out_dir if entry["arm"] is None else out_dir / basis
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
             raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
-        if (out_dir / c).exists() and not force:
-            raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+        if (cohort_root / c).exists() and not force:
+            raise FileExistsError(f"{cohort_root / c} exists; rerun with --force to replace it")
     print(f"[{log}] Control ({types['control']}): {control_root}")
     print(f"[{log}] Reference ({types['reference']}): {reference_root} (read, never rerun)")
-    print(f"[{log}] Output directory: {out_dir}")
+    print(f"[{log}] Basis: {basis} ({entry['description']})")
+    print(f"[{log}] Output directory: {cohort_root}")
 
     prepared = {}
     for c in cohorts:
-        control = _positive_control_read(control_root, c, "control", diagnostics=True)
-        reference = _positive_control_read(reference_root, c, "reference", diagnostics=False)
+        control = _positive_control_read(control_root, c, "control", diagnostics=True, basis=basis)
+        reference = _positive_control_read(reference_root, c, "reference", diagnostics=False, basis=basis)
         rows, outcomes = _positive_control_rows(c, control, reference)
         prepared[c] = (control, reference, rows, outcomes)
 
@@ -12570,11 +12794,14 @@ def run_positive_control(
             "cell_types": dict(types),
             "cohort": c,
             "primary_cohort": c == POSITIVE_CONTROL_PRIMARY_COHORT,
+            "basis": basis,
+            "basis_entry": dict(entry),
+            "e1_basis_independent": True,
             "expectations": POSITIVE_CONTROL_EXPECTATIONS,
             "rule": POSITIVE_CONTROL_RULE,
             "inputs": {
-                "control": {"root": str(control_root), "files": control["files"]},
-                "reference": {"root": str(reference_root), "files": reference["files"]},
+                "control": {"root": str(control_root), "files": control["files"], "arm": control["arm"]},
+                "reference": {"root": str(reference_root), "files": reference["files"], "arm": reference["arm"]},
             },
             "values": {
                 "E1": {m: {"control": control["e1"][m], "reference": reference["e1"][m]} for m in control["e1"]},
@@ -12592,14 +12819,14 @@ def run_positive_control(
             "git": _git_revision(),
             "findings": findings,
         }
-        tmp = out_dir / f"{c}.tmp"
+        tmp = cohort_root / f"{c}.tmp"
         if tmp.exists():
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
         table.to_csv(tmp / POSITIVE_CONTROL_TABLE, index=False, float_format=_csv_float)
         (tmp / POSITIVE_CONTROL_MARKDOWN).write_text(render_positive_control(table, manifest))
         (tmp / POSITIVE_CONTROL_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
-        final = out_dir / c
+        final = cohort_root / c
         if final.exists():
             shutil.rmtree(final)
         os.replace(tmp, final)
@@ -12691,6 +12918,7 @@ __all__ = [
     "run_stage_de_limma",
     "POSITIVE_CONTROL_EXPECTATIONS",
     "POSITIVE_CONTROL_PRIMARY_COHORT",
+    "POSITIVE_CONTROL_BASES",
     "render_positive_control",
     "run_positive_control",
 ]
