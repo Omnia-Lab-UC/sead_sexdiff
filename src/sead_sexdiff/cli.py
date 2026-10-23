@@ -33,6 +33,7 @@ from .data import (
     STAGE_DE_MODELS,
     STAGE_DE_LIMMA_JOINT_TESTS,
     POSITIVE_CONTROL_BASES,
+    DONOR_EXCLUSION_VARIANTS,
     POSITIVE_CONTROL_CELL_TYPES,
     POSITIVE_CONTROL_DEFAULT_BASIS,
     POSITIVE_CONTROL_PRIMARY_COHORT,
@@ -40,9 +41,11 @@ from .data import (
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
     run_covariates,
+    run_donor_flags,
     run_technical_covariates,
     run_axis_diagnostics,
     run_latent_sensitivity,
+    run_exclusion_sensitivity,
     run_stage_de,
     run_stage_de_limma,
     run_positive_control,
@@ -350,6 +353,40 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
     )
     sub_cov.add_argument(
+        "--out-dir",
+        default=None,
+        type=Path,
+        help="Output directory " + _dir_default("pseudobulk"),
+    )
+
+    # donor-flags command: SEA-AD's donor flag and staging labels (obs only)
+    sub_df = sub.add_parser(
+        "donor-flags",
+        help="Write SEA-AD's severely-affected flag and staging labels from the MTG donor object metadata",
+        description=(
+            "Read Severely Affected Donor (Y/N, coded as severely_affected), Cognitive Status, Braak, CERAD score, "
+            "Thal and LATE (recorded as read), plus the Continuous Pseudo-progression Score where the objects hold "
+            "it (the ATAC release), from the obs of every MTG donor object (no matrices); cross-check RNA against "
+            "ATAC (a flag disagreement is an error, any other a finding, RNA value used); leave out the Reference "
+            "donors (listed); and write donor_flags.csv plus donor_flags_manifest.json beside, never into, the "
+            "covariate table. The table is an input of exclusion-sensitivity only. Needs the raw donor objects "
+            "(cluster login node; seconds per object)."
+        ),
+    )
+    _add_cell_type_argument(sub_df)
+    sub_df.add_argument(
+        "--omic",
+        choices=["rna", "both"],
+        default="both",
+        help="Read RNA only, or RNA plus the ATAC cross-check and score (default: %(default)s)",
+    )
+    sub_df.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
+    )
+    sub_df.add_argument(
         "--out-dir",
         default=None,
         type=Path,
@@ -793,6 +830,102 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replace a cohort's existing arm and comparison directories under --out-dir",
     )
 
+    # exclusion-sensitivity command: the export and the analysis without SEA-AD's flagged donors
+    exclusion_variants = ", ".join(DONOR_EXCLUSION_VARIANTS)
+    sub_es = sub.add_parser(
+        "exclusion-sensitivity",
+        help="Rerun the export and the analysis without the donors SEA-AD flagged as severely affected, beside the primary",
+        description=(
+            "Per variant of the registry DONOR_EXCLUSION_VARIANTS (a constant, not a flag; now: "
+            f"{exclusion_variants}) and per cohort: write the flag check (flag_check.csv: the flagged donors per sex x "
+            "stage cell; the rank-biserial AUC of flagged against unflagged donors, over the cohort and within stage 2, "
+            "for each technical variable, the primary export's TMM factors and log10 library sizes and the primary "
+            "pls_0; among the unflagged donors their Spearman correlations with stage and pls_0; no p-value, never a "
+            "gate) before any run; rerun the whole export on the cohort donors minus the flagged ones (the cohort "
+            "thresholds unchanged, k recomputed from the remaining cells, the exclusion recorded as the export "
+            "manifest's donor_exclusion block) and the covariate-adjusted analysis on it with the analyze step's "
+            "settings (CV-selected rank, 999 RRPP permutations, same seed); evaluate the predeclared axis check "
+            "(axis_check.csv: along the variant's first component, |Spearman| with stage against the largest with a "
+            "technical variable; the control cell type's value is the expectation); and compare with the primary "
+            "analysis. The primary export and analysis, the technical table and donor_flags.csv are read and checked, "
+            "never rerun or modified, and the primary analysis stays the primary result. Writes "
+            "<out-dir>/<variant>/flag_check/<cohort>/, motco_input/<cohort>/, motco_analysis/<cohort>/ (the primary "
+            "layout, readable by axis-diagnostics, stage-de and stage-de-limma) and comparison/<cohort>/ "
+            "(exclusion_sensitivity.csv, axis_check.csv, exclusion_sensitivity.md, exclusion_sensitivity_manifest.json). "
+            "With --variant all, a variant x cohort whose comparison exists is skipped unless --force is given."
+        ),
+    )
+    _add_cell_type_argument(sub_es)
+    sub_es.add_argument(
+        "--variant",
+        choices=list(DONOR_EXCLUSION_VARIANTS) + ["all"],
+        default="all",
+        help="Registered variant(s) to run (default: %(default)s)",
+    )
+    sub_es.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to run (default: %(default)s)",
+    )
+    sub_es.add_argument(
+        "--pseudobulk-dir",
+        default=None,
+        type=Path,
+        help=(
+            "Directory with the pseudobulk, covariates, technical and flag outputs (the export's inputs, the technical "
+            f"table, donor_flags.csv); read, never written {_dir_default('pseudobulk')}"
+        ),
+    )
+    sub_es.add_argument(
+        "--input-dir",
+        default=None,
+        type=Path,
+        help=f"Export root of the export step; read as the primary export, never written {_dir_default('motco_input')}",
+    )
+    sub_es.add_argument(
+        "--analysis-dir",
+        default=None,
+        type=Path,
+        help=(
+            "Analysis root of the analyze step; read as the primary analysis, never written "
+            f"{_dir_default('motco_analysis')}"
+        ),
+    )
+    sub_es.add_argument(
+        "--out-dir",
+        default=None,
+        type=Path,
+        help=f"Output root; one subdirectory per variant {_dir_default('motco_exclusion_sensitivity')}",
+    )
+    sub_es.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=(
+            "Data root holding <root>/annotation/ for the GENCODE GTF "
+            f"(default: ${DATA_ROOT_ENV}, else data)"
+        ),
+    )
+    sub_es.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Parallel jobs for MOTCO's CV and RRPP, -1 = all CPUs. Values other than 1 change the RRPP "
+            "draws (p-values); results are reported at 1 (default: %(default)s)"
+        ),
+    )
+    sub_es.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Replace a cohort's existing flag check, variant export, analysis and comparison directories under "
+            "--out-dir (without it, --variant all skips complete variant x cohort pairs; a named variant with "
+            "existing output is an error)"
+        ),
+    )
+
     # stage-de command: per-feature DESeq2 of stage and sex x stage beside the primary analysis
     models = ", ".join(STAGE_DE_MODELS)
     sub_sd = sub.add_parser(
@@ -1148,6 +1281,16 @@ def main(argv: list[str] | None = None) -> int:
         print("[covariates] Done.")
         return 0
 
+    if args.command == "donor-flags":
+        print("[donor-flags] Reading donor flags and staging labels...")
+        outputs = run_donor_flags(
+            omic=args.omic, cell_type=args.cell_type, data_root=args.data_root, out_dir=args.out_dir
+        )
+        for name in ("table", "manifest"):
+            print(f"[donor-flags] Wrote {outputs[name]}")
+        print("[donor-flags] Done.")
+        return 0
+
     if args.command == "technical-covariates":
         print(f"[technical-covariates] Summarizing the {args.cell_type} nuclei of every donor object...")
         outputs = run_technical_covariates(
@@ -1307,6 +1450,39 @@ def main(argv: list[str] | None = None) -> int:
                   + ("no flag" if not flags else ", ".join(
                       f"{f['covariate']} {f['subset']} rho {f['spearman']:.3f}" for f in flags)))
         print("[latent-sensitivity] Done.")
+        return 0
+
+    if args.command == "exclusion-sensitivity":
+        import pandas as pd
+
+        print("[exclusion-sensitivity] Running the donor-exclusion sensitivity analysis...")
+        results = run_exclusion_sensitivity(
+            args.variant,
+            args.cohort,
+            cell_type=args.cell_type,
+            pseudobulk_dir=args.pseudobulk_dir,
+            input_dir=args.input_dir,
+            analysis_dir=args.analysis_dir,
+            out_dir=args.out_dir,
+            data_root=args.data_root,
+            n_jobs=args.n_jobs,
+            force=args.force,
+        )
+        columns = ["variant", "cohort", "n_donors", "k", "rank"]
+        for s in ANALYSIS_STATISTICS:
+            columns += [s, f"{s}_p", f"{s}_rejected"]
+        tables = [res["table"][columns] for by_cohort in results.values() for res in by_cohort.values()]
+        if tables:
+            print("[exclusion-sensitivity] Comparison table (primary = the analyze step's result, primary; the "
+                  "variants are sensitivity):")
+            print(pd.concat(tables, ignore_index=True).to_string(index=False))
+        for v, by_cohort in results.items():
+            for cohort, res in by_cohort.items():
+                a = res["axis_check"].iloc[0]
+                print(f"[exclusion-sensitivity] {v} {cohort}: axis check {'holds' if a['holds'] else 'does not hold'} "
+                      f"({a['reading']}): |rho| stage {a['stage_abs_spearman']:.4f} vs {a['technical_variable']} "
+                      f"{a['technical_abs_spearman']:.4f}")
+        print("[exclusion-sensitivity] Done.")
         return 0
 
     if args.command == "stage-de":

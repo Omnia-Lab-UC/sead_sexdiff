@@ -1117,6 +1117,7 @@ CELL_TYPE_SUBDIRS: dict[str, str] = {
     "stage_de": "stage_de",
     "stage_de_limma": "stage_de_limma",
     "positive_control": "positive_control",
+    "motco_exclusion_sensitivity": "motco_exclusion_sensitivity",
 }
 
 
@@ -2299,6 +2300,319 @@ def run_covariates(
         print(f"[covariates] WARNING: {w}")
     if not cross_check["done"]:
         print(f"[covariates] {cross_check['note']}")
+    return {**outputs, "findings": findings}
+
+
+# ---------------------------------------------------------------------------
+# MTG donor flags (SEA-AD's donor-level flag and staging labels, obs only)
+# ---------------------------------------------------------------------------
+
+# SEA-AD's donor-level obs columns → coded names. ``Severely Affected Donor``
+# (DONOR_FLAG_SOURCE) is coded with DONOR_FLAG_VALUES; the staging labels are
+# recorded as read and used by nothing (a later staging proposal may). The
+# table is written beside, never into, donor_covariates.csv, whose hash every
+# export and analysis manifest records, and it is an input of
+# exclusion-sensitivity only. Flag and ask before changing.
+DONOR_FLAG_COLUMNS: dict[str, str] = {
+    "Severely Affected Donor": "severely_affected",
+    "Cognitive Status": "cognitive_status",
+    "Braak": "braak",
+    "CERAD score": "cerad_score",
+    "Thal": "thal",
+    "LATE": "late",
+}
+# Read where present (the ATAC 2024-12-06 release holds it, the RNA 2026-06-22
+# release does not); an absent column is recorded as a finding, not an error
+DONOR_FLAG_ATAC_ONLY_COLUMNS: dict[str, str] = {"Continuous Pseudo-progression Score": "cps"}
+DONOR_FLAG_SOURCE = "Severely Affected Donor"
+DONOR_FLAG_VALUES: dict[str, bool] = {"Y": True, "N": False}
+DONOR_FLAG_OUTPUTS: dict[str, str] = {"table": "donor_flags.csv", "manifest": "donor_flags_manifest.json"}
+# The number of flagged donors SEA-AD reports (Gabitto et al. 2024: 11 of the
+# 42 high-ADNC donors); a different count is recorded as a finding, never corrected
+DONOR_FLAG_EXPECTED_FLAGGED = 11
+# Reference donors are identified as the donor table identifies them (ADNC
+# ``Reference``, which ADNC_STAGES does not map); they are listed, not tabled
+DONOR_FLAG_REFERENCE_LABEL = "Reference"
+
+
+def read_donor_flags(path: str | Path, omic: str) -> tuple[dict[str, str], list[str]]:
+    """Read the donor-level flag and staging columns of one donor object.
+
+    Parameters
+    ----------
+    path:
+        Donor ``.h5ad`` object.
+    omic:
+        ``"rna"`` or ``"atac"`` (recorded in error messages only; the same
+        columns are read from both).
+
+    Returns
+    -------
+    (dict, list[str])
+        ``Donor ID``, ``ADNC_COLUMN``, each column of ``DONOR_FLAG_COLUMNS`` and
+        each column of ``DONOR_FLAG_ATAC_ONLY_COLUMNS`` the object holds → its
+        single value as a string; and the ``DONOR_FLAG_ATAC_ONLY_COLUMNS`` the
+        object lacks.
+
+    Notes
+    -----
+    Only the listed ``obs`` columns are read; ``X`` and the layers are never
+    opened. A column holding more than one value fails naming the file and
+    the column; a missing column of ``DONOR_FLAG_COLUMNS`` (or ``Donor ID``,
+    ``ADNC_COLUMN``) fails naming the file.
+    """
+    import h5py
+
+    if omic not in MTG_PREFIXES:
+        raise ValueError(f"omic must be one of {list(MTG_PREFIXES)}, not {omic!r}")
+    path = Path(path)
+    required = ["Donor ID", ADNC_COLUMN, *DONOR_FLAG_COLUMNS]
+    with h5py.File(path, "r") as f:
+        present = set(f["obs"].keys())
+        optional = [c for c in DONOR_FLAG_ATAC_ONLY_COLUMNS if c in present]
+        absent = [c for c in DONOR_FLAG_ATAC_ONLY_COLUMNS if c not in present]
+        obs = _read_obs_columns(f, required + optional, path)
+    return {c: _single_value(obs[c], path, c) for c in required + optional}, absent
+
+
+def _flag_label(value: str) -> str | None:
+    """A recorded label as read, with the missing forms (``nan``, empty) as ``None``."""
+    return _code_string(value)
+
+
+def run_donor_flags(
+    *,
+    omic: str = "both",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    data_root: str | Path | None = None,
+    out_dir: str | Path | None = None,
+) -> dict:
+    """Write SEA-AD's donor flag and staging labels (``donor_flags.csv``) and their manifest.
+
+    Parameters
+    ----------
+    omic:
+        ``"both"`` (RNA values, cross-checked against ATAC; the pseudo-progression
+        score from ATAC) or ``"rna"`` (no cross-check; the score is then absent).
+    cell_type:
+        Registered cell type (default ``astrocyte``). The flags are
+        donor-level and do not depend on it; it sets the default output
+        directory (the cell type's pseudobulk directory) and is recorded.
+    data_root:
+        Data root (resolved with :func:`resolve_data_root`).
+    out_dir:
+        Output directory (default the cell type's pseudobulk directory).
+
+    Returns
+    -------
+    dict
+        Paths ``table`` and ``manifest`` plus ``findings``.
+
+    Raises
+    ------
+    ValueError
+        A non-Reference donor's ``Severely Affected Donor`` is not a key of
+        ``DONOR_FLAG_VALUES`` (donor and value named), the flag or the
+        Reference status disagrees between a donor's RNA and ATAC objects
+        (donor and both values named), a column holds more than one value, or
+        the ``Donor ID`` differs from the file name. Nothing is written.
+
+    Notes
+    -----
+    Outputs: ``donor_flags.csv`` (one row per non-Reference donor: ``donor_id``,
+    ``severely_affected``, ``cognitive_status``, ``braak``, ``cerad_score``,
+    ``thal``, ``late``, ``cps``; labels as read, missing values empty) and
+    ``donor_flags_manifest.json``. Only ``obs`` columns are read; no other
+    file in the output directory is written. Reference donors (ADNC
+    ``Reference``) are listed in the manifest with their labels. A label
+    other than the flag that differs between the omics is a finding (both
+    values recorded) and the RNA value is used; a donor with an ATAC object
+    only takes its ATAC values (a finding).
+    """
+    if omic not in ("rna", "both"):
+        raise ValueError(f"omic must be 'rna' or 'both', not {omic!r}")
+    cell_type_entry(cell_type)
+    root = resolve_data_root(data_root)
+    out_dir = _resolve_dir(out_dir, cell_type, "pseudobulk")
+    omics = ["rna", "atac"] if omic == "both" else ["rna"]
+    print(f"[donor-flags] Cell type: {cell_type} (output directory only; the flags are donor-level)")
+    print(f"[donor-flags] Data root: {root.resolve()}")
+    print(f"[donor-flags] Output directory: {out_dir}")
+
+    labels = {**DONOR_FLAG_COLUMNS, **DONOR_FLAG_ATAC_ONLY_COLUMNS}
+    raw: dict[str, dict[str, dict[str, str]]] = {}
+    files: dict[str, list[str]] = {}
+    absent_columns: dict[str, dict[str, int]] = {}
+    for o in omics:
+        folder = root / MTG_PREFIXES[o]
+        paths = sorted(folder.glob("*_final-nuclei.*.h5ad"))
+        if not paths:
+            raise FileNotFoundError(f"No donor objects for {o} in {folder}")
+        raw[o], absent_columns[o] = {}, {}
+        for i, p in enumerate(paths, 1):
+            rec, absent = read_donor_flags(p, o)
+            donor = rec.pop("Donor ID")
+            if donor != donor_id_of(p):
+                raise ValueError(f"{p.name}: obs Donor ID {donor} differs from file name")
+            if donor in raw[o]:
+                raise ValueError(f"{o}: donor {donor} has more than one object under {folder}")
+            raw[o][donor] = rec
+            for col in absent:
+                absent_columns[o][col] = absent_columns[o].get(col, 0) + 1
+            print(f"[donor-flags] {o} {i}/{len(paths)} {donor}")
+        files[o] = [p.relative_to(root).as_posix() for p in paths]
+
+    findings: list[str] = []
+    for o in omics:
+        for col, n in absent_columns[o].items():
+            if n == len(files[o]):
+                findings.append(f"{o}: obs lacks {col!r} in all {n} objects; {labels[col]} is not read from {o}")
+            else:
+                findings.append(f"{o}: obs lacks {col!r} in {n} of {len(files[o])} objects")
+    if "atac" not in omics:
+        findings.append(
+            f"RNA-only run: no ATAC object was read, so no cross-omic check was done and "
+            f"{', '.join(DONOR_FLAG_ATAC_ONLY_COLUMNS.values())} come(s) from the RNA objects only"
+        )
+
+    def is_reference(rec: dict[str, str]) -> bool:
+        return str(rec[ADNC_COLUMN]).strip() == DONOR_FLAG_REFERENCE_LABEL
+
+    rna, atac = raw["rna"], raw.get("atac", {})
+    donors = sorted(set(rna) | set(atac))
+    reference, disagreements, rows = [], [], []
+    for donor in donors:
+        r, a = rna.get(donor), atac.get(donor)
+        if r is not None and a is not None and is_reference(r) != is_reference(a):
+            raise ValueError(
+                f"Donor {donor}: {ADNC_COLUMN} reads {r[ADNC_COLUMN]!r} in the RNA object and {a[ADNC_COLUMN]!r} in "
+                "the ATAC object, so its Reference status differs between omics; nothing was written"
+            )
+        base = r if r is not None else a
+        if is_reference(base):
+            reference.append({
+                "donor_id": donor,
+                "omics": [o for o in omics if donor in raw[o]],
+                "labels": {labels[c]: base.get(c) for c in labels if c in base},
+            })
+            continue
+        for o, rec in (("RNA", r), ("ATAC", a)):
+            if rec is not None and str(rec[DONOR_FLAG_SOURCE]).strip() not in DONOR_FLAG_VALUES:
+                raise ValueError(
+                    f"Donor {donor}: unexpected {DONOR_FLAG_SOURCE!r} value {rec[DONOR_FLAG_SOURCE]!r} in the {o} "
+                    f"object (expected one of {list(DONOR_FLAG_VALUES)}); nothing was written"
+                )
+        if r is not None and a is not None:
+            fr, fa = str(r[DONOR_FLAG_SOURCE]).strip(), str(a[DONOR_FLAG_SOURCE]).strip()
+            if fr != fa:
+                raise ValueError(
+                    f"Donor {donor}: {DONOR_FLAG_SOURCE!r} is {fr!r} in the RNA object and {fa!r} in the ATAC object; "
+                    "the flag must agree between omics; nothing was written"
+                )
+            for col in labels:
+                if col == DONOR_FLAG_SOURCE or col not in r or col not in a:
+                    continue
+                if _flag_label(r[col]) != _flag_label(a[col]):
+                    disagreements.append({"donor_id": donor, "column": col, "rna": r[col], "atac": a[col]})
+        if r is None:
+            findings.append(f"donor {donor} has an ATAC object only; its values are the ATAC ones")
+        row = {"donor_id": donor, "severely_affected": DONOR_FLAG_VALUES[str(base[DONOR_FLAG_SOURCE]).strip()]}
+        for col, name in labels.items():
+            if col == DONOR_FLAG_SOURCE:
+                continue
+            # RNA value first; a column the RNA objects lack (the score) from ATAC
+            source = r if r is not None and col in r else a
+            row[name] = None if source is None or col not in source else _flag_label(source[col])
+        rows.append(row)
+    findings += [
+        f"{d['donor_id']} {d['column']}: RNA {d['rna']!r}, ATAC {d['atac']!r} (RNA value used)" for d in disagreements
+    ]
+    columns = ["donor_id", "severely_affected"] + [n for c, n in labels.items() if c != DONOR_FLAG_SOURCE]
+    table = pd.DataFrame(rows, columns=columns)
+    n_flagged = int(table["severely_affected"].sum())
+    if n_flagged != DONOR_FLAG_EXPECTED_FLAGGED:
+        findings.append(
+            f"{n_flagged} donors are flagged {DONOR_FLAG_SOURCE!r} = Y, not the {DONOR_FLAG_EXPECTED_FLAGGED} SEA-AD "
+            "reports (Gabitto et al. 2024); recorded, not corrected"
+        )
+    missing = [
+        {"donor_id": row["donor_id"], "column": name}
+        for row in rows for name in columns[2:] if row[name] is None
+    ]
+    warnings = [
+        f"{o}: {len(files[o])} donor objects read, expected {EXPECTED_DONORS[o]}"
+        for o in omics if len(files[o]) != EXPECTED_DONORS[o]
+    ]
+    cross_check = (
+        {
+            "done": True,
+            "columns": [c for c in labels if c != DONOR_FLAG_SOURCE],
+            "flag": f"{DONOR_FLAG_SOURCE}: a disagreement is an error",
+            "comparison": "labels compared as read (stripped; nan and empty are missing and agree)",
+            "n_compared": len(set(rna) & set(atac)),
+            "n_disagreements": len(disagreements),
+            "rna_only_donors": sorted(set(rna) - set(atac)),
+            "atac_only_donors": sorted(set(atac) - set(rna)),
+        }
+        if "atac" in omics else {"done": False, "note": "RNA-only run: no cross-omic check was done"}
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {k: out_dir / v for k, v in DONOR_FLAG_OUTPUTS.items()}
+    table.to_csv(outputs["table"], index=False)
+    flagged = table.loc[table["severely_affected"], "donor_id"].tolist()
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
+        "partial": bool(warnings) or len(omics) < 2,
+        "git": _git_revision(),
+        "software": _software_versions(),
+        "data_root": str(root.resolve()),
+        "value_source": "rna (a column the RNA objects lack from atac)",
+        "columns": {
+            src: {"coded": name, "omics": [o for o in omics if absent_columns[o].get(src, 0) < len(files[o])]}
+            for src, name in labels.items()
+        },
+        "flag": {
+            "column": DONOR_FLAG_SOURCE,
+            "coded": DONOR_FLAG_COLUMNS[DONOR_FLAG_SOURCE],
+            "values": dict(DONOR_FLAG_VALUES),
+            "other_values": "an error naming the donor and the value",
+            "expected_flagged": DONOR_FLAG_EXPECTED_FLAGGED,
+            "expected_source": "Gabitto et al. 2024 (11 of the 42 high-ADNC donors)",
+        },
+        "coding": {
+            "labels": "recorded as read (strings); empty, nan and none are missing and left empty; nothing is imputed",
+            "single_value": "each column must hold exactly one value per donor object",
+            "reference": f"donors whose {ADNC_COLUMN!r} is {DONOR_FLAG_REFERENCE_LABEL!r} are left out and listed",
+        },
+        "use": (
+            "an input of exclusion-sensitivity only; the flag enters no model as a covariate or a variable, and no "
+            "export, analysis or diagnostic step reads this table"
+        ),
+        "objects_read": {o: {"n": len(files[o]), "n_expected": EXPECTED_DONORS[o], "files": files[o]} for o in omics},
+        "n_donors": int(len(table)),
+        "n_flagged": n_flagged,
+        "flagged_donors": flagged,
+        "reference_donors": reference,
+        "n_reference_donors": len(reference),
+        "missing": missing,
+        "cross_check": cross_check,
+        "disagreements": disagreements,
+        "findings": findings,
+        "warnings": warnings,
+        "outputs": {k: v.name for k, v in outputs.items()},
+    }
+    outputs["manifest"].write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print(f"[donor-flags] {len(table)} non-Reference donors, {n_flagged} flagged ({', '.join(flagged) or 'none'}); "
+          f"{len(reference)} Reference donor(s) left out ({', '.join(d['donor_id'] for d in reference) or 'none'})")
+    for msg in findings:
+        print(f"[donor-flags] FINDING: {msg}")
+    for w in warnings:
+        print(f"[donor-flags] WARNING: {w}")
+    if not cross_check["done"]:
+        print(f"[donor-flags] {cross_check['note']}")
     return {**outputs, "findings": findings}
 
 
@@ -4201,6 +4515,7 @@ def _export_cohort(
     normalization: dict[str, str] | str | None = None,
     residualize: pd.DataFrame | None = None,
     variant: dict | None = None,
+    donor_exclusion: dict | None = None,
     debug_dir: Path | None = None,
     log_prefix: str = "export",
     cell_type: str = DEFAULT_CELL_TYPE,
@@ -4267,6 +4582,13 @@ def _export_cohort(
         "settings", "reference_export_dir"}``, written as the manifest's
         ``variant`` block; ``None`` for the primary export, whose manifest then
         has no such key.
+    donor_exclusion:
+        For a donor-exclusion variant (``run_exclusion_sensitivity``), the
+        exclusion record (variant, flag, flag-table sha256, excluded donors,
+        cells and ``k`` before and after), written as the manifest's
+        ``donor_exclusion`` block; ``sub`` then holds the cohort's rows minus
+        the excluded donors and ``k`` follows from them by the export's rule.
+        ``None`` for the primary export, whose manifest then has no such key.
     debug_dir:
         If given, the filtered counts, TMM factors and log2-CPM per omic go
         there, plus the normalized log2-CPM and the loess settings of a
@@ -4394,7 +4716,11 @@ def _export_cohort(
         ),
         "mean": "mean log2-CPM",
     }
-    order_lines = ["restrict to cohort donors", "remove features on excluded chromosomes"]
+    order_lines = [
+        "restrict to cohort donors" if donor_exclusion is None
+        else "restrict to cohort donors minus the excluded donors (donor_exclusion)",
+        "remove features on excluded chromosomes",
+    ]
     if gene_sets:
         order_lines.append(f"remove RNA features of the excluded gene sets ({', '.join(gene_sets)}; TECHNICAL_GENE_SETS)")
         order_lines.append("keep features with CPM >= min_cpm in >= k donors (raw library sizes after chromosome and gene-set removal)")
@@ -4491,6 +4817,7 @@ def _export_cohort(
             "float_format": EXPORT_FLOAT_FORMAT,
         },
         **({"variant": dict(variant)} if variant is not None else {}),
+        **({"donor_exclusion": dict(donor_exclusion)} if donor_exclusion is not None else {}),
         "feature_counts": {o: res[o]["steps"] for o in ("rna", "atac")},
         "removed_by_chromosome": {o: res[o]["removed_by_chromosome"] for o in ("rna", "atac")},
         "excluded_gene_sets": list(gene_sets),
@@ -9785,6 +10112,10 @@ def _stage_de_prepare(
     """Every check of one cohort before anything is written; the loaded counts, designs and references.
 
     The export manifest must record ``cell_type`` (:func:`check_manifest_cell_type`).
+    When it records a ``donor_exclusion`` (an exclusion-cohort export of
+    ``exclusion-sensitivity``), the recorded excluded donors are removed from
+    the donor table's cohort before the donor-agreement check; they must be
+    cohort donors, and the rest must equal the export's donors.
 
     Returns
     -------
@@ -9792,7 +10123,8 @@ def _stage_de_prepare(
         ``paths``, ``hashes`` (group → name → sha256 of every input file),
         ``cell_type_findings``,
         ``loaded`` (``load_analysis_inputs``), ``reference`` (``_check_reference``),
-        ``delta_rejected``, ``donors``, ``cells``, ``k``, ``features`` (omic →
+        ``delta_rejected``, ``donor_exclusion`` (the export manifest's block, or
+        ``None``), ``donors``, ``cells``, ``k``, ``features`` (omic →
         ``features_<omic>.csv``), ``feature_sets`` (omic → abundance / exported
         counts), ``designs`` and, for the requested omics, ``counts`` (donors ×
         tested features), ``exported`` (mask) and ``reproduction``.
@@ -9842,9 +10174,28 @@ def _stage_de_prepare(
     if c not in table.columns:
         raise ValueError(f"{pb / 'donor_table.csv'} has no {c} column")
     sub = table[table[c].astype(bool)].set_index("donor_id")
+    # An exclusion-cohort export (exclusion-sensitivity) records the donors it
+    # removed from the cohort; the donor table's cohort minus exactly those
+    # donors must then equal the export's donors
+    exclusion = export_manifest.get("donor_exclusion")
+    table_label = f"{pb / 'donor_table.csv'}"
+    if exclusion is not None:
+        excluded = [str(d) for d in exclusion.get("excluded_donors") or []]
+        unknown = sorted(set(excluded) - set(sub.index))
+        if unknown:
+            raise ValueError(
+                f"{ex_dir / 'manifest.json'} records excluded donor(s) {unknown} that are not {c} donors of "
+                f"{pb / 'donor_table.csv'}; rerun `sead-sexdiff exclusion-sensitivity --force`; nothing was written"
+            )
+        sub = sub.drop(index=excluded)
+        table_label += f" (minus the {len(excluded)} donor(s) excluded by {ex_dir / 'manifest.json'})"
+        print(
+            f"[{log}] {c}: the export records donor_exclusion {exclusion.get('variant')!r}: {len(excluded)} donor(s) "
+            f"removed from the donor table's {c} before the agreement check ({', '.join(excluded) or 'none'})"
+        )
     if set(sub.index) != set(donors):
         raise ValueError(
-            f"{pb / 'donor_table.csv'} and {ex_dir / 'metadata.csv'} list different {c} donors (only in the donor "
+            f"{table_label} and {ex_dir / 'metadata.csv'} list different {c} donors (only in the donor "
             f"table: {sorted(set(sub.index) - set(donors))}; only in the export: {sorted(set(donors) - set(sub.index))}); "
             f"{rerun_export}"
         )
@@ -9943,7 +10294,7 @@ def _stage_de_prepare(
         raise ValueError(f"{an_dir / 'result.json'} has no delta p-value; rerun `sead-sexdiff analyze`")
     return {
         "paths": paths, "hashes": hashes, "cell_type_findings": cell_type_findings, "loaded": loaded,
-        "reference": reference, "delta_rejected": delta_rejected,
+        "reference": reference, "delta_rejected": delta_rejected, "donor_exclusion": exclusion,
         "donors": donors, "cells": cells, "k": k, "features": features, "feature_sets": feature_sets,
         "designs": designs, "design_checks": design_checks, "counts": counts, "exported": exported,
         "reproduction": reproduction,
@@ -10577,6 +10928,7 @@ def run_stage_de(
             "n_donors": len(prep["donors"]),
             "cells": prep["cells"],
             "k": prep["k"],
+            **({"donor_exclusion": prep["donor_exclusion"]} if prep["donor_exclusion"] is not None else {}),
             "omics": included,
             "complete": not missing,
             "inputs": {
@@ -12031,6 +12383,7 @@ def run_stage_de_limma(
                 "n_donors": len(prep["donors"]),
                 "cells": prep["cells"],
                 "k": prep["k"],
+                **({"donor_exclusion": prep["donor_exclusion"]} if prep["donor_exclusion"] is not None else {}),
                 "omics": included,
                 "complete": not missing,
                 "inputs": {
@@ -12843,6 +13196,1072 @@ def run_positive_control(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Donor-exclusion sensitivity (the export and the analysis without SEA-AD's flagged donors)
+# ---------------------------------------------------------------------------
+
+# The variants, a registry and not a flag: each removes the cohort donors whose
+# donor_flags.csv column ``flag`` equals ``exclude_when`` and reruns the whole
+# export on the rest (the cohort thresholds unchanged, k recomputed from the
+# remaining sex x stage cells by the export's rule) and the primary analysis
+# on that export. The exclusion is SEA-AD's own handling of expression tests,
+# never chosen from our values or from any result; entries are added by a
+# change proposal only. Flag and ask before changing.
+DONOR_EXCLUSION_VARIANTS: dict[str, dict] = {
+    "excluding_severely_affected": {
+        "description": (
+            "the cohort donors minus those SEA-AD flagged as severely affected (Gabitto et al. 2024: QC-outlying "
+            "high-ADNC donors excluded from the gene-expression tests)"
+        ),
+        "flag": "severely_affected",
+        "exclude_when": True,
+    },
+}
+for _name, _entry in DONOR_EXCLUSION_VARIANTS.items():
+    if _entry["flag"] not in DONOR_FLAG_COLUMNS.values():
+        raise AssertionError(f"DONOR_EXCLUSION_VARIANTS[{_name!r}] reads {_entry['flag']!r}, not a DONOR_FLAG_COLUMNS name")
+del _name, _entry
+# The flag check's variables (written before any variant run; descriptive, no
+# p-value, never a gate): the technical table's numeric columns and the
+# primary export's TMM factors and log10 library sizes (E3's technical
+# sources, POSITIVE_CONTROL_TECHNICAL_SOURCES), stage, and the primary
+# analysis's first latent component
+DONOR_EXCLUSION_CHECK_VARIABLES = (
+    "technical table numeric columns", "primary export tmm_<omic>, log10_lib_<omic>", "primary pls_0",
+)
+DONOR_EXCLUSION_COMPONENT = "pls_0"
+# The AUC is computed over the cohort donors and within this stage (the flag
+# marks high-ADNC donors, so stage 2 separates the flag from stage itself)
+DONOR_EXCLUSION_FLAG_CHECK_STAGE = "2"
+DONOR_EXCLUSION_AXIS_RULE = (
+    "along the variant analysis's first latent component, |Spearman| with stage exceeds the largest |Spearman| with a "
+    "technical variable of POSITIVE_CONTROL_TECHNICAL_SOURCES (technical table columns for the variant donors; the "
+    "variant export's TMM factors and log10 library sizes); the control cell type's value is the expectation, the "
+    "reference's descriptive"
+)
+DONOR_EXCLUSION_READING = (
+    "the flag check and the axis check are read together: if the flagged donors carry the quality tail (high AUC for "
+    "the mitochondrial fraction and the primary pls_0) and the axis check holds in the control cell type, the quality "
+    "gradient of the primary analyses sits in the donors SEA-AD excluded from expression tests, and excluding them is "
+    "a donor-selection route to the same end as the latent adjustment; if the axis check fails although the flagged "
+    "donors carry the tail, the gradient extends beyond them and donor selection does not resolve it; if the flagged "
+    "donors do not carry the tail, the flag is not the gradient's carrier and the variant is an ordinary cohort "
+    "sensitivity. In every case the primary analyses and the primary-basis positive control stay as they are; a "
+    "rejection status that differs between the variant and the primary is cohort dependence, not a result of the "
+    "variant; a CV-selected rank that differs is reported beside angle; the non-rejection rules hold in the variant"
+)
+DONOR_EXCLUSION_PRIMARY_LABEL = "primary"
+# Layout under <out_dir>/<variant>/: flag_check/<cohort>/, motco_input/<cohort>/
+# and motco_analysis/<cohort>/ (mirroring results/, so axis-diagnostics,
+# stage-de and stage-de-limma read a variant through their directory flags)
+# and comparison/<cohort>/, written last (a complete comparison marks a complete cohort)
+DONOR_EXCLUSION_FLAG_CHECK_DIR = "flag_check"
+DONOR_EXCLUSION_INPUT_DIR = "motco_input"
+DONOR_EXCLUSION_ANALYSIS_DIR = "motco_analysis"
+DONOR_EXCLUSION_COMPARISON_DIR = "comparison"
+DONOR_EXCLUSION_FLAG_TABLE = "flag_check.csv"
+DONOR_EXCLUSION_AXIS_TABLE = "axis_check.csv"
+DONOR_EXCLUSION_TABLE = "exclusion_sensitivity.csv"
+DONOR_EXCLUSION_MARKDOWN = "exclusion_sensitivity.md"
+DONOR_EXCLUSION_MANIFEST = "exclusion_sensitivity_manifest.json"
+DONOR_EXCLUSION_FLAG_CHECK_COLUMNS = (
+    "cohort", "variable", "source", "n_flagged", "n_unflagged", "auc_all", "auc_stage2",
+    "spearman_unflagged_stage", "spearman_unflagged_pls0",
+)
+DONOR_EXCLUSION_AXIS_COLUMNS = (
+    "cohort", "cell_type", "role", "reading", "component", "n_donors", "stage_spearman", "stage_abs_spearman",
+    "technical_variable", "technical_source", "technical_spearman", "technical_abs_spearman", "n_technical", "holds",
+)
+_DONOR_EXCLUSION_SUBDIRS = (
+    DONOR_EXCLUSION_FLAG_CHECK_DIR, DONOR_EXCLUSION_INPUT_DIR, DONOR_EXCLUSION_ANALYSIS_DIR, DONOR_EXCLUSION_COMPARISON_DIR,
+)
+_DONOR_EXCLUSION_CELL_SOURCE = "cell"
+_DONOR_EXCLUSION_COMPONENT_SOURCE = "latent_scores.csv (primary analysis)"
+_DONOR_EXCLUSION_STAGE_SOURCE = "metadata.csv"
+
+
+def rank_biserial_auc(flagged, unflagged) -> float:
+    """``P(x_flagged > x_unflagged) + ½ P(x_flagged = x_unflagged)`` over the finite values.
+
+    The Mann–Whitney U of the first group (average ranks of the pooled
+    values) over ``n₁ n₀``; no p-value is computed. NaN when either group has
+    no finite value or the pooled finite values are constant (no ordering to
+    measure).
+    """
+    from scipy.stats import rankdata
+
+    a = np.asarray(flagged, dtype=float)
+    b = np.asarray(unflagged, dtype=float)
+    a, b = a[np.isfinite(a)], b[np.isfinite(b)]
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    pooled = np.concatenate([a, b])
+    if np.ptp(pooled) == 0:
+        return float("nan")
+    ranks = rankdata(pooled)
+    u = ranks[: a.size].sum() - a.size * (a.size + 1) / 2
+    return float(u / (a.size * b.size))
+
+
+def _exclusion_cells(meta: pd.DataFrame, flagged: np.ndarray) -> list[dict]:
+    """Flagged and unflagged donors per sex × stage cell (the cells' names as ``smallest_cell`` gives them)."""
+    rows = []
+    for sex in sorted(meta["sex"].astype(str).unique()):
+        for st in STAGES:
+            cell = (meta["sex"].astype(str) == sex).to_numpy() & (meta["stage"].astype(str) == st).to_numpy()
+            rows.append({
+                "cell": f"{sex}/stage {st}", "n": int(cell.sum()),
+                "n_flagged": int((cell & flagged).sum()), "n_unflagged": int((cell & ~flagged).sum()),
+            })
+    return rows
+
+
+def flag_check(
+    variables: pd.DataFrame,
+    sources: dict[str, str],
+    meta: pd.DataFrame,
+    flagged: pd.Series,
+    *,
+    cohort: str,
+    component: str = DONOR_EXCLUSION_COMPONENT,
+    stage: str = DONOR_EXCLUSION_FLAG_CHECK_STAGE,
+) -> pd.DataFrame:
+    """Where the flagged donors sit on the technical variables and the primary first component.
+
+    Parameters
+    ----------
+    variables:
+        Cohort donors × variables, indexed by ``donor_id``: ``component`` (the
+        primary analysis's first latent component), ``stage`` (ordinal) and
+        the technical variables.
+    sources:
+        Variable → source label, written in the ``source`` column.
+    meta:
+        The cohort's design table (``donor_id``, ``sex``, ``stage``).
+    flagged:
+        Boolean flag per ``donor_id`` (every cohort donor).
+    cohort:
+        Written in the ``cohort`` column.
+    component, stage:
+        The component column and the stage within which ``auc_stage2`` is
+        computed.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``DONOR_EXCLUSION_FLAG_CHECK_COLUMNS``. First one row per sex × stage
+        cell (``source`` ``cell``, ``variable`` the cell name, the flagged and
+        unflagged donor counts; the statistics empty), then one row per
+        variable (``component``, ``stage``, then the technical variables in
+        table order): the finite flagged and unflagged counts, the
+        rank-biserial AUC of flagged against unflagged donors over the cohort
+        (``auc_all``) and within ``stage`` (``auc_stage2``), and among the
+        unflagged donors the variable's Spearman correlation with stage and
+        with the component (empty where it would be the variable with itself).
+
+    Notes
+    -----
+    Written before the variant export runs; descriptive, no p-value, and no
+    value changes a run.
+    """
+    meta = meta.copy()
+    meta["donor_id"] = meta["donor_id"].astype(str)
+    donors = meta["donor_id"].tolist()
+    absent = sorted(set(donors) - set(flagged.index.astype(str)))
+    if absent:
+        raise ValueError(f"flag_check: no flag for donor(s) {absent}")
+    f = flagged.loc[donors].to_numpy(dtype=bool)
+    in_stage = (meta["stage"].astype(str) == stage).to_numpy()
+    table = variables.loc[donors]
+    comp = table[component].to_numpy(dtype=float)
+    stage_num = table["stage"].to_numpy(dtype=float)
+    nan = float("nan")
+    rows = [
+        {"cohort": cohort, "variable": c["cell"], "source": _DONOR_EXCLUSION_CELL_SOURCE,
+         "n_flagged": c["n_flagged"], "n_unflagged": c["n_unflagged"]}
+        for c in _exclusion_cells(meta, f)
+    ]
+    order = [component, "stage"] + [v for v in table.columns if v not in (component, "stage")]
+    for var in order:
+        x = table[var].to_numpy(dtype=float)
+        rows.append({
+            "cohort": cohort,
+            "variable": var,
+            "source": sources[var],
+            "n_flagged": int(np.isfinite(x[f]).sum()),
+            "n_unflagged": int(np.isfinite(x[~f]).sum()),
+            "auc_all": rank_biserial_auc(x[f], x[~f]),
+            "auc_stage2": rank_biserial_auc(x[f & in_stage], x[~f & in_stage]),
+            "spearman_unflagged_stage": nan if var == "stage" else spearman(x[~f], stage_num[~f])[0],
+            "spearman_unflagged_pls0": nan if var == component else spearman(x[~f], comp[~f])[0],
+        })
+    out = pd.DataFrame(rows, columns=list(DONOR_EXCLUSION_FLAG_CHECK_COLUMNS))
+    for col in ("n_flagged", "n_unflagged"):
+        out[col] = out[col].astype(int)
+    return out
+
+
+def axis_check(
+    scores: pd.DataFrame,
+    variables: pd.DataFrame,
+    sources: dict[str, str],
+    *,
+    cohort: str,
+    cell_type: str,
+    component: str = DONOR_EXCLUSION_COMPONENT,
+) -> tuple[pd.DataFrame, list[str]]:
+    """The predeclared axis check (``DONOR_EXCLUSION_AXIS_RULE``) along one analysis's first component.
+
+    Parameters
+    ----------
+    scores:
+        ``latent_scores.csv`` of the variant analysis, indexed by ``donor_id``.
+    variables:
+        The variant donors × ``_diagnostic_variables`` of the variant export
+        (``stage`` and the technical variables among them).
+    sources:
+        Variable → source; the technical variables are those whose source is
+        in ``POSITIVE_CONTROL_TECHNICAL_SOURCES`` (E3's).
+    cohort, cell_type:
+        Written in the row; the role comes from ``POSITIVE_CONTROL_CELL_TYPES``
+        (the control's outcome is the expectation, any other descriptive).
+    component:
+        The component read (``pls_0``).
+
+    Returns
+    -------
+    (pandas.DataFrame, list[str])
+        One row (``DONOR_EXCLUSION_AXIS_COLUMNS``): the stage Spearman, the
+        technical variable with the largest |Spearman| (ties by name) and
+        ``holds`` (stage strictly larger); and findings for technical
+        variables with an undefined correlation (left out of the comparison).
+        No p-value is computed.
+    """
+    donors = list(variables.index)
+    missing = sorted(set(donors) - set(scores.index))
+    if missing:
+        raise ValueError(f"axis_check: latent_scores.csv has no row for donor(s) {missing}")
+    s = scores.loc[donors, component].to_numpy(dtype=float)
+    stage_rho = spearman(s, variables["stage"].to_numpy(dtype=float))[0]
+    if not np.isfinite(stage_rho):
+        raise ValueError(f"axis_check: the Spearman correlation of {component} with stage is undefined for {cohort}")
+    technical = [v for v in variables.columns if sources.get(v) in POSITIVE_CONTROL_TECHNICAL_SOURCES]
+    if not technical:
+        raise ValueError(f"axis_check: no technical variable ({POSITIVE_CONTROL_TECHNICAL_SOURCES}) for {cohort}")
+    rhos = {v: spearman(s, variables[v].to_numpy(dtype=float))[0] for v in technical}
+    undefined = sorted(v for v, r in rhos.items() if not np.isfinite(r))
+    findings = []
+    if undefined:
+        findings.append(f"{cohort}: axis check technical variable(s) with an undefined Spearman correlation are not compared: {undefined}")
+    finite = sorted((v for v in technical if np.isfinite(rhos[v])), key=lambda v: (-abs(rhos[v]), v))
+    top = finite[0]
+    role = next((r for r, ct in POSITIVE_CONTROL_CELL_TYPES.items() if ct == cell_type), None)
+    a, b = abs(stage_rho), abs(rhos[top])
+    row = {
+        "cohort": cohort,
+        "cell_type": cell_type,
+        "role": role if role is not None else "none",
+        "reading": "expectation" if role == "control" else "descriptive",
+        "component": component,
+        "n_donors": len(donors),
+        "stage_spearman": stage_rho,
+        "stage_abs_spearman": a,
+        "technical_variable": top,
+        "technical_source": sources[top],
+        "technical_spearman": rhos[top],
+        "technical_abs_spearman": b,
+        "n_technical": len(finite),
+        "holds": bool(a > b),
+    }
+    return pd.DataFrame([row], columns=list(DONOR_EXCLUSION_AXIS_COLUMNS)), findings
+
+
+def _cells_text(cells: dict) -> str:
+    """``Female/stage 0=11;…`` in the cells' order."""
+    return ";".join(f"{name}={n}" for name, n in cells.items())
+
+
+def _exclusion_row(
+    record: dict, *, variant: str, cohort: str, directory: str, n_donors: int, cells: dict, k: int, excluded: list[str],
+) -> dict:
+    """``_variant_row`` with the donors, cells, ``k`` and the excluded donors after the cohort."""
+    base = _variant_row(record, variant=variant, cohort=cohort, directory=directory)
+    row = {
+        "variant": base.pop("variant"),
+        "cohort": base.pop("cohort"),
+        "n_donors": int(n_donors),
+        "cells": _cells_text(cells),
+        "k": int(k),
+        "n_excluded": len(excluded),
+        "excluded_donors": ";".join(excluded),
+    }
+    row.update(base)
+    return row
+
+
+def _read_donor_flags(pseudobulk_dir: Path, cell_type: str, *, hint_flag: str) -> dict:
+    """Read and check ``donor_flags.csv`` and its manifest (cell type, coding, repeated donors)."""
+    pb = Path(pseudobulk_dir)
+    table_path = pb / DONOR_FLAG_OUTPUTS["table"]
+    manifest_path = pb / DONOR_FLAG_OUTPUTS["manifest"]
+    hint = (
+        f"run `sead-sexdiff donor-flags{hint_flag} --omic both` on the cluster and sync {pb}/ "
+        f"(scripts/sync_pseudobulk.sh{hint_flag}) to produce it; nothing was written"
+    )
+    for p in (table_path, manifest_path):
+        if not p.exists():
+            raise FileNotFoundError(f"{p} is missing; {hint}")
+    manifest = json.loads(manifest_path.read_text())
+    findings = check_manifest_cell_type(manifest, manifest_path, cell_type)
+    table = pd.read_csv(table_path, dtype=str, keep_default_na=False)
+    if "donor_id" not in table.columns:
+        raise ValueError(f"{table_path} lacks a donor_id column; {hint}")
+    repeated = sorted(table.loc[table["donor_id"].duplicated(), "donor_id"].unique())
+    if repeated:
+        raise ValueError(f"{table_path}: repeated donor_id(s) {repeated}; {hint}")
+    flags = {}
+    for spec in DONOR_EXCLUSION_VARIANTS.values():
+        col = spec["flag"]
+        if col in flags:
+            continue
+        if col not in table.columns:
+            raise ValueError(f"{table_path} lacks column {col!r}; {hint}")
+        coded = table[col].map({"True": True, "False": False})
+        bad = table.loc[coded.isna(), "donor_id"].tolist()
+        if bad:
+            raise ValueError(f"{table_path}: {col!r} is neither True nor False for donor(s) {bad}; {hint}")
+        flags[col] = pd.Series(coded.to_numpy(dtype=bool), index=table["donor_id"].to_numpy(), name=col)
+    files = {p.name: {"path": str(p), "sha256": _sha256_file(p)} for p in (table_path, manifest_path)}
+    return {"table": table, "flags": flags, "manifest": manifest, "files": files, "findings": findings}
+
+
+def render_exclusion_sensitivity(
+    rows: list[dict],
+    flags: pd.DataFrame,
+    axis: pd.DataFrame,
+    *,
+    variant: str,
+    cohort: str,
+    cell_type: str,
+    description: str,
+    seed: int = ANALYSIS_SEED,
+    permutations: int = ANALYSIS_PERMUTATIONS,
+    alpha: float = ANALYSIS_ALPHA,
+    findings: list[str] | None = None,
+) -> str:
+    """Render ``exclusion_sensitivity.md`` from the comparison rows, the flag check and the axis check.
+
+    Parameters
+    ----------
+    rows:
+        ``_exclusion_row`` dicts: the primary row first, the variant row second.
+    flags:
+        ``flag_check`` output for the cohort.
+    axis:
+        ``axis_check`` output for the cohort (one row).
+    variant, cohort, cell_type, description:
+        Named in the title and the header.
+    seed, permutations, alpha:
+        Named in the text; a statistic is rejected when ``p <= alpha``.
+    findings:
+        The comparison's findings, listed at the end.
+
+    Returns
+    -------
+    str
+        Markdown: a header with the variant and the reading rules, the flagged
+        donors per cell, the flag check, one table per statistic, a run table
+        (donors, ``k``, cells, rank, CV AUROC, runtime, directory), the axis
+        check and the findings. Every number comes from the three tables; the
+        runtimes are the one thing here that is not in a CSV.
+    """
+    ref, var = rows[0], rows[1]
+    lines = [
+        f"# Donor-exclusion sensitivity: {cell_type}, {cohort}, {variant}",
+        "",
+        f"The `{ref['variant']}` row is the primary analysis (CV-selected rank {ref['rank']}, {ref['n_donors']} donors), "
+        f"read from its `result.json` and never rerun; it stays the primary result. The `{variant}` row reruns the whole "
+        f"export and the primary analysis on {description}: {var['n_excluded']} cohort donor(s) excluded, the cohort "
+        f"thresholds unchanged and k recomputed from the remaining cells by the export's rule (k = {ref['k']} → "
+        f"{var['k']}). The variant is a sensitivity analysis, never a revised primary: the excluded donors carry the most "
+        "severe pathology, so the exclusion truncates the late epoch along with the quality tail, and the flag was made "
+        "from QC metrics, so the variant conditions on quality by donor selection. A rejection status that differs "
+        "between the rows is cohort dependence, not a result of the variant; a CV-selected rank that differs is "
+        "reported beside `angle`, not read as better or worse; `angle` and `shape` non-rejections are uninformative and "
+        f"a `delta` rejection is a difference, not specifically of size, in both rows. {permutations} RRPP permutations "
+        f"with seed {seed} in both rows; α = {alpha} (rejected when p ≤ α). MOTCO's operating characteristics were "
+        "measured on neither cohort.",
+        "",
+        "## Flagged donors per cell",
+        "",
+        "| cell | flagged | unflagged |",
+        "|---|---:|---:|",
+    ]
+    cells = flags[flags["source"] == _DONOR_EXCLUSION_CELL_SOURCE]
+    for _, r in cells.iterrows():
+        lines.append(f"| {r['variable']} | {int(r['n_flagged'])} | {int(r['n_unflagged'])} |")
+    lines.append(f"| all | {int(cells['n_flagged'].sum())} | {int(cells['n_unflagged'].sum())} |")
+    lines += [
+        "",
+        "## Flag check",
+        "",
+        "Written before the variant export ran. The rank-biserial AUC is P(flagged > unflagged) + ½ P(=) over the cohort "
+        f"donors (`auc_all`) and within stage {DONOR_EXCLUSION_FLAG_CHECK_STAGE} (`auc_stage2`); 0.5 means no "
+        "separation. Among the unflagged donors, each variable's Spearman correlation with stage and with the primary "
+        f"`{DONOR_EXCLUSION_COMPONENT}`. Descriptive, no p-value; the variant runs whatever it says.",
+        "",
+        "| variable | source | n flagged | n unflagged | AUC all | AUC stage 2 | ρ stage (unflagged) | ρ pls_0 (unflagged) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for _, r in flags[flags["source"] != _DONOR_EXCLUSION_CELL_SOURCE].iterrows():
+        lines.append(
+            f"| `{r['variable']}` | {r['source']} | {int(r['n_flagged'])} | {int(r['n_unflagged'])} | "
+            f"{_fmt_nan(r['auc_all'], '.3f')} | {_fmt_nan(r['auc_stage2'], '.3f')} | "
+            f"{_fmt_nan(r['spearman_unflagged_stage'], '.3f')} | {_fmt_nan(r['spearman_unflagged_pls0'], '.3f')} |"
+        )
+    for s in ANALYSIS_STATISTICS:
+        lines += [
+            "",
+            f"## {s}" + (" (degrees)" if s == "angle" else ""),
+            "",
+            "| analysis | donors | rank | observed | p (RRPP) | rejected | null mean | null sd | null q95 |",
+            "|---|---:|---:|---:|---:|:---:|---:|---:|---:|",
+        ]
+        for r in rows:
+            rejected = r[f"{s}_rejected"]
+            lines.append(
+                f"| {r['variant']} | {r['n_donors']} | {r['rank']} | {_fmt(r[s])} | {_fmt(r[f'{s}_p'], '.4g')} | "
+                f"{'n/a' if rejected is None else ('yes' if rejected else 'no')} | {_fmt(r[f'{s}_null_mean'])} | "
+                f"{_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
+            )
+    lines += [
+        "",
+        "## Runs",
+        "",
+        "| analysis | donors | excluded | k | cells | selection | rank | cv_mean_auroc | runtime (s) | directory |",
+        "|---|---:|---:|---:|---|---|---:|---:|---:|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['variant']} | {r['n_donors']} | {r['n_excluded']} | {r['k']} | {r['cells'].replace(';', '; ')} | "
+            f"{r['component_selection']} | {r['rank']} | {_fmt(r['cv_mean_auroc'], '.4f')} | "
+            f"{_fmt(r['runtime_seconds'], '.1f')} | `{r['dir']}` |"
+        )
+    if var["excluded_donors"]:
+        lines += ["", "Excluded donors: " + ", ".join(f"`{d}`" for d in var["excluded_donors"].split(";")) + "."]
+    a = axis.iloc[0]
+    lines += [
+        "",
+        "## Axis check",
+        "",
+        f"Predeclared rule (`DONOR_EXCLUSION_AXIS_RULE`): {DONOR_EXCLUSION_AXIS_RULE}. A comparison, not a test; no "
+        "p-value.",
+        "",
+        "| cell type | role | reading | component | donors | ρ stage | largest technical | source | ρ technical | "
+        "technical compared | holds |",
+        "|---|---|---|---|---:|---:|---|---|---:|---:|:---:|",
+        f"| {a['cell_type']} | {a['role']} | {a['reading']} | `{a['component']}` | {int(a['n_donors'])} | "
+        f"{_fmt(a['stage_spearman'], '.4f')} | `{a['technical_variable']}` | {a['technical_source']} | "
+        f"{_fmt(a['technical_spearman'], '.4f')} | {int(a['n_technical'])} | {'yes' if a['holds'] else 'no'} |",
+        "",
+        "## Reading",
+        "",
+        f"Predeclared (`DONOR_EXCLUSION_READING`): {DONOR_EXCLUSION_READING}.",
+        "",
+        "## Findings",
+        "",
+    ]
+    lines += [f"- {msg}" for msg in (findings or [])] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def run_exclusion_sensitivity(
+    variant: str = "all",
+    cohort: str = "all",
+    *,
+    cell_type: str = DEFAULT_CELL_TYPE,
+    pseudobulk_dir: str | Path | None = None,
+    input_dir: str | Path | None = None,
+    analysis_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
+    data_root: str | Path | None = None,
+    n_jobs: int = 1,
+    force: bool = False,
+) -> dict:
+    """Rerun the export and the primary analysis without the flagged cohort donors, beside the primary.
+
+    Parameters
+    ----------
+    variant:
+        A key of ``DONOR_EXCLUSION_VARIANTS`` or ``"all"``.
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    cell_type:
+        A registered cell type (``CELL_TYPES``, default ``astrocyte``): the
+        default directories below, and the cell type every manifest read must
+        record (``check_manifest_cell_type``; a manifest without the key reads
+        as ``astrocyte`` with a finding). The registry and every setting are
+        the same for every cell type.
+    pseudobulk_dir:
+        The export's inputs plus ``donor_technical.csv``, ``donor_flags.csv``
+        and their manifests (default ``<root>/pseudobulk``; read, never written).
+    input_dir, analysis_dir:
+        Export and analysis roots (defaults ``<root>/motco_input``,
+        ``<root>/motco_analysis``); ``<dir>/<cohort>/`` is the primary export
+        and analysis, read and checked, never rerun or written.
+    out_dir:
+        Output root (default ``<root>/motco_exclusion_sensitivity``): per
+        variant ``<variant>/flag_check/<cohort>/`` (``flag_check.csv``),
+        ``<variant>/motco_input/<cohort>/`` (the variant export),
+        ``<variant>/motco_analysis/<cohort>/`` (the variant analysis) and
+        ``<variant>/comparison/<cohort>/`` (``exclusion_sensitivity.csv``,
+        ``axis_check.csv``, ``exclusion_sensitivity.md``,
+        ``exclusion_sensitivity_manifest.json``). It may not lie inside an
+        input directory.
+    data_root:
+        Data root holding the gene annotation.
+    n_jobs:
+        Parallel jobs for MOTCO's CV and RRPP; values other than 1 change the
+        permutation draws and are recorded as a finding. The reported results
+        use 1.
+    force:
+        Replace a cohort's four directories under the variant. Without it,
+        ``variant = "all"`` skips every variant × cohort whose comparison
+        directory exists (resumable); a named variant with existing output, or
+        a partial tree, is an error.
+
+    Returns
+    -------
+    dict
+        Variant → cohort → ``{"export", "analysis", "comparison", "rows",
+        "table", "flag_check", "axis_check", "manifest", "findings"}``
+        (skipped pairs absent).
+
+    Raises
+    ------
+    ValueError
+        An unregistered variant or cohort; the primary export or analysis does
+        not match the inputs, constants or settings; the technical table does
+        not match the pseudobulk manifest or lacks a cohort donor; the flag
+        table lacks a cohort donor or a manifest records another cell type; an
+        exclusion would empty a sex × stage cell; ``out_dir`` lies inside an
+        input directory. Nothing is written.
+    FileExistsError
+        Existing output without ``force`` (see above).
+    FileNotFoundError
+        A required input is missing; the message names the file and the
+        command that produces it.
+
+    Notes
+    -----
+    Every check runs for every requested variant and cohort before anything
+    is written. Per cohort: ``flag_check.csv`` (``flag_check``) is written and
+    put in place before the variant export runs; the variant export is one
+    ``_export_cohort`` call with the primary settings on the cohort rows minus
+    the excluded donors (its ``metadata.csv`` and ``covariates.csv`` must
+    equal the primary's minus those rows) with the exclusion recorded as the
+    manifest's ``donor_exclusion`` block; the variant analysis is one
+    ``_analyze_cohort`` call with the primary's parameters; ``axis_check.csv``
+    (``axis_check``) reads the variant's first component and the variant
+    export; the comparison holds the primary row first. Each directory is
+    written as ``<cohort>.tmp`` and renamed when complete, the comparison
+    last; on any error the cohort's directories written by the call are removed.
+    """
+    import shutil
+    from importlib.metadata import PackageNotFoundError, version
+
+    log = "exclusion-sensitivity"
+    cell_type_entry(cell_type)
+    flag = "" if cell_type == DEFAULT_CELL_TYPE else f" --cell-type {cell_type}"
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    analysis_dir = _resolve_dir(analysis_dir, cell_type, "motco_analysis")
+    out_dir = _resolve_dir(out_dir, cell_type, "motco_exclusion_sensitivity")
+    variants = list(DONOR_EXCLUSION_VARIANTS) if variant == "all" else [variant]
+    for v in variants:
+        if v not in DONOR_EXCLUSION_VARIANTS:
+            raise ValueError(
+                f"Unknown donor-exclusion variant {v!r}; the registry DONOR_EXCLUSION_VARIANTS holds "
+                f"{list(DONOR_EXCLUSION_VARIANTS)} (or 'all'). Variants are predeclared constants, never chosen from "
+                "results; nothing was written"
+            )
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+    for name, d in (("--input-dir", input_dir), ("--analysis-dir", analysis_dir), ("--pseudobulk-dir", pb)):
+        if _same_dir(out_dir, d):
+            raise ValueError(
+                f"the output directory {out_dir} lies inside the input directory {d} ({name}); the step never "
+                "writes under its inputs; nothing was written"
+            )
+    skipped: list[tuple[str, str]] = []
+    for v in variants:
+        for c in cohorts:
+            existing = [sub for sub in _DONOR_EXCLUSION_SUBDIRS if (out_dir / v / sub / c).exists()]
+            if not existing or force:
+                continue
+            if variant == "all" and DONOR_EXCLUSION_COMPARISON_DIR in existing:
+                skipped.append((v, c))
+                continue
+            raise FileExistsError(
+                f"{out_dir / v / existing[0] / c} exists; rerun with --force to replace the variant's flag check, "
+                f"export, analysis and comparison of {c}; nothing was written"
+            )
+    todo = {v: [c for c in cohorts if (v, c) not in skipped] for v in variants}
+    for v, c in skipped:
+        print(f"[{log}] {v} {c}: comparison directory {out_dir / v / DONOR_EXCLUSION_COMPARISON_DIR / c} exists; "
+              "skipped (rerun with --force to replace it)")
+    variants = [v for v in variants if todo[v]]
+    if not variants:
+        print(f"[{log}] Nothing to run: every requested variant and cohort is complete under {out_dir}")
+        return {}
+    cohorts = [c for c in cohorts if any(c in todo[v] for v in variants)]
+    pb_manifest = check_export_inputs(pb, cohorts, cell_type=cell_type)
+    pb_findings = check_manifest_cell_type(pb_manifest, pb / "manifest.json", cell_type)
+    for c in cohorts:
+        if not (input_dir / c).is_dir():
+            raise FileNotFoundError(
+                f"{input_dir / c} does not exist; run `sead-sexdiff export{flag}` to produce the primary export"
+            )
+        if not (analysis_dir / c).is_dir():
+            raise FileNotFoundError(
+                f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze{flag}` to produce the primary analysis"
+            )
+        if not (analysis_dir / c / "latent_scores.csv").exists():
+            raise FileNotFoundError(
+                f"{analysis_dir / c / 'latent_scores.csv'} is missing; run `sead-sexdiff analyze{flag}` to produce it"
+            )
+    flag_table = _read_donor_flags(pb, cell_type, hint_flag=flag)
+    motco_version = check_motco_version()
+    from motco.analysis import TrajectoryAnalysisParams
+
+    params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+    print(f"[{log}] MOTCO {motco_version}")
+    print(f"[{log}] Cell type: {cell_type}")
+    print(f"[{log}] Pseudobulk directory: {pb}")
+    print(f"[{log}] Primary export directory: {input_dir}")
+    print(f"[{log}] Primary analysis directory: {analysis_dir}")
+    print(f"[{log}] Flag table: {pb / DONOR_FLAG_OUTPUTS['table']} (sha256 "
+          f"{flag_table['files'][DONOR_FLAG_OUTPUTS['table']]['sha256'][:12]}…)")
+    print(f"[{log}] Output directory: {out_dir}")
+    print(f"[{log}] Variants: {', '.join(variants)} (registry DONOR_EXCLUSION_VARIANTS; the primary analysis stays primary)")
+
+    inputs = _load_export_inputs(pb, data_root, log_prefix=log)
+    annotation = inputs["annotation"]
+    # Check every cohort's primary export, analysis, technical table and flags before writing anything
+    prepared = {}
+    for c in cohorts:
+        sub = _cohort_rows(inputs["table"], inputs["covariates"], c, pb)
+        donors = sub["donor_id"].astype(str).tolist()
+        k, k_cell, cells = smallest_cell(sub)
+        ref_export = _check_export_reference(input_dir / c, pb, annotation, k=k, cells=cells, n_donors=len(sub))
+        loaded = load_analysis_inputs(input_dir / c)
+        cell_type_findings = list(pb_findings)
+        cell_type_findings += check_manifest_cell_type(loaded["export_manifest"], input_dir / c / "manifest.json", cell_type)
+        reference = _check_reference(input_dir / c, analysis_dir / c, loaded["inputs"], motco_version)
+        cell_type_findings += check_manifest_cell_type(
+            reference["manifest"], reference["dir"] / "analysis_manifest.json", cell_type
+        )
+        meas = reference["manifest"].get("measurement", {})
+        used = {
+            "orientation_estimator": params.orientation_estimator,
+            "cv": {
+                "cv1_splits": params.cv1_splits, "cv2_splits": params.cv2_splits, "n_repeats": params.n_repeats,
+                "max_components": params.max_components, "random_state": params.random_state,
+            },
+        }
+        for key, want in used.items():
+            if meas.get(key) != want:
+                raise ValueError(
+                    f"{reference['dir'] / 'analysis_manifest.json'} records {key} = {meas.get(key)!r} but the variant "
+                    f"analysis would use {want!r}; it must use the primary analysis's settings; rerun `sead-sexdiff "
+                    f"analyze{flag}`; nothing was written"
+                )
+        entered = (reference["record"].get("covariates") or {}).get("columns")
+        if entered != list(ANALYSIS_COVARIATES):
+            raise ValueError(
+                f"{reference['dir'] / 'result.json'} lists covariates {entered}, not ANALYSIS_COVARIATES "
+                f"{list(ANALYSIS_COVARIATES)}; nothing was written"
+            )
+        technical = _check_technical_reference(pb, donors=donors)
+        cell_type_findings += check_manifest_cell_type(technical["manifest"], pb / TECHNICAL_OUTPUTS["manifest"], cell_type)
+        cell_type_findings += flag_table["findings"]
+        scores_path = reference["dir"] / "latent_scores.csv"
+        scores = pd.read_csv(scores_path, dtype={"donor_id": str}).set_index("donor_id")
+        if sorted(scores.index) != sorted(donors) or DONOR_EXCLUSION_COMPONENT not in scores.columns:
+            raise ValueError(
+                f"{scores_path} does not hold {DONOR_EXCLUSION_COMPONENT} for exactly the {c} donors of "
+                f"{input_dir / c / 'metadata.csv'}; rerun `sead-sexdiff analyze{flag}`; nothing was written"
+            )
+        meta = loaded["metadata"][["donor_id", "sex", "stage"]].copy()
+        meta["donor_id"] = meta["donor_id"].astype(str)
+        exclusions = {}
+        for v in variants:
+            if c not in todo[v]:
+                continue
+            spec = DONOR_EXCLUSION_VARIANTS[v]
+            flags = flag_table["flags"][spec["flag"]]
+            absent = sorted(set(donors) - set(flags.index))
+            if absent:
+                raise ValueError(
+                    f"{pb / DONOR_FLAG_OUTPUTS['table']} has no {spec['flag']} value for {c} donor(s) {absent}; rerun "
+                    f"`sead-sexdiff donor-flags{flag} --omic both` and sync; nothing was written"
+                )
+            excluded = sorted(d for d in donors if bool(flags.loc[d]) == spec["exclude_when"])
+            sub_v = sub[~sub["donor_id"].astype(str).isin(excluded)].reset_index(drop=True)
+            k_v, k_cell_v, cells_v = smallest_cell(sub_v)
+            empty = [name for name, n in cells_v.items() if n == 0]
+            if empty or set(cells_v) != set(cells):
+                raise ValueError(
+                    f"{v} would leave {c} with empty sex x stage cell(s) {empty or sorted(set(cells) - set(cells_v))}; "
+                    "the variant cannot be analysed; nothing was written"
+                )
+            exclusions[v] = {
+                "excluded": excluded, "sub": sub_v, "k": k_v, "k_cell": k_cell_v, "cells": cells_v,
+                "flagged": flags.loc[donors],
+            }
+        print(
+            f"[{log}] {c}: primary export {ref_export['dir']} ({len(sub)} donors, k = {k} from {k_cell}; pseudobulk, "
+            f"covariates, annotation and thresholds match) and primary analysis {reference['dir']} (CV-selected rank "
+            f"{reference['record']['latent']['selected_lv']}; hashes and settings match); technical table and flags "
+            f"complete for {len(donors)} donors; "
+            + "; ".join(f"{v}: {len(e['excluded'])} excluded, k = {e['k']} from {e['k_cell']}" for v, e in exclusions.items())
+        )
+        prepared[c] = {
+            "sub": sub, "donors": donors, "k": k, "k_cell": k_cell, "cells": cells, "export": ref_export,
+            "analysis": reference, "technical": technical, "scores": scores,
+            "scores_file": {"path": str(scores_path), "sha256": _sha256_file(scores_path)},
+            "meta": meta, "exclusions": exclusions, "cell_type_findings": cell_type_findings,
+        }
+
+    software = _software_versions()
+    software["motco"] = motco_version
+    try:
+        software["scikit-learn"] = version("scikit-learn")
+    except PackageNotFoundError:
+        software["scikit-learn"] = None
+    flag_files = flag_table["files"]
+    flag_sha = flag_files[DONOR_FLAG_OUTPUTS["table"]]["sha256"]
+
+    results: dict[str, dict] = {v: {} for v in variants}
+    for v in variants:
+        spec = DONOR_EXCLUSION_VARIANTS[v]
+        v_root = out_dir / v
+        for c in todo[v]:
+            prep = prepared[c]
+            exc = prep["exclusions"][v]
+            excluded = exc["excluded"]
+            primary_export, primary_analysis = prep["export"], prep["analysis"]
+            finals = {sub: v_root / sub / c for sub in _DONOR_EXCLUSION_SUBDIRS}
+            try:
+                for d in finals.values():  # with force, all four are replaced before the first is rewritten
+                    for t in (d, d.with_name(f"{c}.tmp")):
+                        if t.exists():
+                            shutil.rmtree(t)
+
+                # 1. The flag check, in place before the variant export runs
+                variables, sources = _diagnostic_variables(
+                    primary_export["dir"], prep["technical"]["table"], prep["donors"], prep["meta"], pb
+                )
+                keep = [col for col in variables.columns if sources[col]["source"] in POSITIVE_CONTROL_TECHNICAL_SOURCES]
+                check_vars = variables[keep].copy()
+                check_vars.insert(0, "stage", variables["stage"])
+                check_vars.insert(0, DONOR_EXCLUSION_COMPONENT, prep["scores"].loc[prep["donors"], DONOR_EXCLUSION_COMPONENT])
+                check_sources = {col: sources[col]["source"] for col in keep}
+                check_sources["stage"] = _DONOR_EXCLUSION_STAGE_SOURCE
+                check_sources[DONOR_EXCLUSION_COMPONENT] = _DONOR_EXCLUSION_COMPONENT_SOURCE
+                flags_table = flag_check(check_vars, check_sources, prep["meta"], exc["flagged"], cohort=c)
+                fc_tmp = finals[DONOR_EXCLUSION_FLAG_CHECK_DIR].with_name(f"{c}.tmp")
+                fc_tmp.mkdir(parents=True)
+                flags_table.to_csv(fc_tmp / DONOR_EXCLUSION_FLAG_TABLE, index=False, float_format=_csv_float)
+                os.replace(fc_tmp, finals[DONOR_EXCLUSION_FLAG_CHECK_DIR])
+                flag_check_written_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                cells_flagged = _exclusion_cells(prep["meta"], exc["flagged"].to_numpy(dtype=bool))
+                print(
+                    f"[{log}] {c}: flag check written before the variant export ({finals[DONOR_EXCLUSION_FLAG_CHECK_DIR]}): "
+                    + ", ".join(f"{x['cell']} {x['n_flagged']}/{x['n']}" for x in cells_flagged if x["n_flagged"])
+                    + ("" if excluded else "no cohort donor flagged")
+                )
+
+                # 2. The variant export: the primary pipeline on the cohort minus the excluded donors
+                block = {
+                    "variant": v,
+                    "description": spec["description"],
+                    "flag": spec["flag"],
+                    "exclude_when": spec["exclude_when"],
+                    "flag_table": dict(flag_files[DONOR_FLAG_OUTPUTS["table"]]),
+                    "flag_manifest": dict(flag_files[DONOR_FLAG_OUTPUTS["manifest"]]),
+                    "excluded_donors": list(excluded),
+                    "n_excluded": len(excluded),
+                    "before": {"n_donors": len(prep["sub"]), "cells": prep["cells"], "k": prep["k"], "k_source_cell": prep["k_cell"]},
+                    "after": {"n_donors": len(exc["sub"]), "cells": exc["cells"], "k": exc["k"], "k_source_cell": exc["k_cell"]},
+                    "reference_export_dir": str(primary_export["dir"]),
+                    "note": (
+                        "the cohort thresholds are unchanged and k is recomputed from the remaining sex x stage cells by "
+                        "the export's rule (smallest cell); every other export setting is the primary's"
+                    ),
+                }
+                exp = _export_cohort(
+                    c, exc["sub"], inputs["blocks"], inputs["covariates"], annotation, inputs["pb_info"],
+                    out_dir=v_root / DONOR_EXCLUSION_INPUT_DIR, final_name=c,
+                    excluded_chromosomes=EXPORT_EXCLUDED_CHROMOSOMES, donor_exclusion=block, log_prefix=log,
+                    cell_type=cell_type, input_findings=pb_findings,
+                )
+                for name in ("metadata.csv", "covariates.csv"):
+                    prim = pd.read_csv(primary_export["dir"] / name, dtype=str, keep_default_na=False)
+                    var = pd.read_csv(exp["dir"] / name, dtype=str, keep_default_na=False)
+                    expect = prim[~prim["donor_id"].isin(excluded)].reset_index(drop=True)
+                    if not var.equals(expect):
+                        raise ValueError(
+                            f"{exp['dir'] / name} is not {primary_export['dir'] / name} minus the excluded donors' rows: "
+                            "the pseudobulk inputs are not the ones the primary export was made from"
+                        )
+
+                # 3. The variant analysis with the primary analysis's settings
+                loaded_v = load_analysis_inputs(exp["dir"])
+                ana = _analyze_cohort(
+                    c, exp["dir"], loaded_v, params,
+                    out_dir=v_root / DONOR_EXCLUSION_ANALYSIS_DIR, final_name=c, n_jobs=n_jobs,
+                    findings=[f"donor-exclusion variant {v}: the primary analysis in {primary_analysis['dir']} is primary"],
+                    log_prefix=log, cell_type=cell_type,
+                )
+                var_record, ref_record = ana["record"], primary_analysis["record"]
+                if (var_record.get("covariates") or {}).get("columns") != list(ANALYSIS_COVARIATES) or (
+                        var_record["latent"]["component_selection"] != "cv"):
+                    raise ValueError(f"the {v} analysis of {c} does not record the primary analysis's covariates and CV selection")
+
+                # 4. The axis check on the variant's first component
+                donors_v = exc["sub"]["donor_id"].astype(str).tolist()
+                meta_v = pd.read_csv(exp["dir"] / "metadata.csv", dtype={"donor_id": str, "sex": str, "stage": str})
+                variables_v, sources_v = _diagnostic_variables(exp["dir"], prep["technical"]["table"], donors_v, meta_v, pb)
+                scores_v = pd.read_csv(ana["dir"] / "latent_scores.csv", dtype={"donor_id": str}).set_index("donor_id")
+                axis, axis_findings = axis_check(
+                    scores_v, variables_v, {col: info["source"] for col, info in sources_v.items()},
+                    cohort=c, cell_type=cell_type,
+                )
+                a = axis.iloc[0]
+                print(
+                    f"[{log}] {c}: axis check {'holds' if a['holds'] else 'does not hold'} ({a['reading']}): "
+                    f"|rho| stage {a['stage_abs_spearman']:.4f} vs {a['technical_variable']} {a['technical_abs_spearman']:.4f}"
+                )
+
+                # 5. The comparison
+                rows = [
+                    _exclusion_row(
+                        ref_record, variant=DONOR_EXCLUSION_PRIMARY_LABEL, cohort=c, directory=str(primary_analysis["dir"]),
+                        n_donors=len(prep["sub"]), cells=prep["cells"], k=prep["k"], excluded=[],
+                    ),
+                    _exclusion_row(
+                        var_record, variant=v, cohort=c, directory=f"{DONOR_EXCLUSION_ANALYSIS_DIR}/{c}",
+                        n_donors=len(exc["sub"]), cells=exc["cells"], k=exc["k"], excluded=excluded,
+                    ),
+                ]
+                for r in rows:
+                    print(
+                        f"[{log}] {c}: {r['variant']} ({r['n_donors']} donors, rank {r['rank']}): "
+                        + ", ".join(f"{s} {_fmt(r[s])} (p {_fmt(r[f'{s}_p'], '.4g')})" for s in ANALYSIS_STATISTICS)
+                    )
+                findings: list[str] = []
+                if not excluded:
+                    findings.append(
+                        f"no {c} donor is flagged ({spec['flag']} = {spec['exclude_when']}): the variant export holds the "
+                        "primary export's donors, so the variant rows repeat the primary's up to the rerun"
+                    )
+                if rows[0]["rank"] != rows[1]["rank"]:
+                    findings.append(
+                        f"CV-selected rank differs: {rows[0]['rank']} in the primary analysis, {rows[1]['rank']} in the {v} "
+                        "analysis; reported beside angle, not read as better or worse"
+                    )
+                for s in ANALYSIS_STATISTICS:
+                    ra, rb = rows[0][f"{s}_rejected"], rows[1][f"{s}_rejected"]
+                    if ra is not None and rb is not None and ra != rb:
+                        findings.append(
+                            f"{s}: rejection status in the {v} analysis (p = {_fmt(rows[1][f'{s}_p'], '.4g')}) differs from "
+                            f"the primary analysis (p = {_fmt(rows[0][f'{s}_p'], '.4g')}); cohort dependence of the "
+                            "sensitivity analysis, not a result of the variant; the primary result stays primary"
+                        )
+                findings.append(
+                    f"axis check {'holds' if a['holds'] else 'does not hold'} in {c} ({a['reading']}, role {a['role']}): "
+                    f"|Spearman| of {a['component']} with stage {_fmt(a['stage_abs_spearman'], '.4f')} vs "
+                    f"{_fmt(a['technical_abs_spearman'], '.4f')} with {a['technical_variable']} ({a['technical_source']})"
+                )
+                findings += axis_findings
+                if n_jobs != 1:
+                    findings.append(
+                        f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
+                        "draws, p-values and null summaries differ from an n_jobs = 1 run (statistics, rank, latent "
+                        "scores and loadings do not); the case-study results are reported at n_jobs = 1"
+                    )
+                findings += [f"{v} export: {msg}" for msg in exp["findings"] if msg not in pb_findings]
+
+                comp_tmp = finals[DONOR_EXCLUSION_COMPARISON_DIR].with_name(f"{c}.tmp")
+                comp_tmp.mkdir(parents=True)
+                table = pd.DataFrame(rows).drop(columns=list(_RANK_SENSITIVITY_CSV_EXCLUDED))
+                table.to_csv(comp_tmp / DONOR_EXCLUSION_TABLE, index=False, float_format=_csv_float)
+                axis.to_csv(comp_tmp / DONOR_EXCLUSION_AXIS_TABLE, index=False, float_format=_csv_float)
+                (comp_tmp / DONOR_EXCLUSION_MARKDOWN).write_text(
+                    render_exclusion_sensitivity(
+                        rows, flags_table, axis, variant=v, cohort=c, cell_type=cell_type,
+                        description=spec["description"], seed=ANALYSIS_SEED, permutations=ANALYSIS_PERMUTATIONS,
+                        alpha=ANALYSIS_ALPHA, findings=findings,
+                    )
+                )
+                reference_now = {name: _sha256_file(Path(info["path"])) for name, info in primary_analysis["files"].items()}
+                if reference_now != {name: info["sha256"] for name, info in primary_analysis["files"].items()}:
+                    raise ValueError(f"the primary analysis files under {primary_analysis['dir']} changed during the run")
+                variant_files = {
+                    name: {"path": str(exp["dir"] / name), "sha256": _sha256_file(exp["dir"] / name)}
+                    for name in _ANALYSIS_INPUTS
+                }
+                variant_analysis_files = {
+                    name: {"path": str(ana["dir"] / name), "sha256": _sha256_file(ana["dir"] / name)}
+                    for name in _REFERENCE_FILES
+                }
+                manifest_findings = [*prep["cell_type_findings"], *findings]
+                manifest = {
+                    "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "cell_type": cell_type,
+                    "variant": {
+                        "name": v, "description": spec["description"], "flag": spec["flag"],
+                        "exclude_when": spec["exclude_when"],
+                    },
+                    "cohort": c,
+                    "n_donors": {"primary": len(prep["sub"]), "variant": len(exc["sub"])},
+                    "excluded_donors": list(excluded),
+                    "n_excluded": len(excluded),
+                    "cells": {"primary": prep["cells"], "variant": exc["cells"], "flagged": cells_flagged},
+                    "k": {"primary": prep["k"], "variant": exc["k"], "primary_source_cell": prep["k_cell"],
+                          "variant_source_cell": exc["k_cell"]},
+                    "seed": ANALYSIS_SEED,
+                    "permutations": ANALYSIS_PERMUTATIONS,
+                    "same_seed_note": (
+                        "the same seed and permutation count as the primary analysis; the rows differ in the donors "
+                        "(and so in every export step that depends on them)"
+                    ),
+                    "alpha": ANALYSIS_ALPHA,
+                    "rejection_rule": ANALYSIS_REJECTION_RULE,
+                    "n_jobs": n_jobs,
+                    "n_jobs_note": "RRPP draws depend on n_jobs (one seed stream per worker); rerun with the same n_jobs",
+                    "inputs": {
+                        **inputs["pb_info"],
+                        "annotation": {key: annotation.get(key) for key in ("release", "file", "sha256")},
+                        "technical": {
+                            **prep["technical"]["files"],
+                            "pseudobulk_manifest_sha256": prep["technical"]["pseudobulk_manifest_sha256"],
+                            "note": "checked against manifest.json and TECHNICAL_GENE_SETS, complete for the cohort donors",
+                        },
+                        "flags": {
+                            **flag_files,
+                            "note": "an input of this step only; the flag selects donors and enters no model",
+                        },
+                    },
+                    "primary": {
+                        "export": {
+                            "dir": str(primary_export["dir"]),
+                            "files": primary_export["files"],
+                            "manifest_sha256": primary_export["files"]["manifest.json"]["sha256"],
+                            "k": prep["k"],
+                            "cells": prep["cells"],
+                            "thresholds": primary_export["manifest"].get("thresholds"),
+                        },
+                        "analysis": {
+                            "dir": str(primary_analysis["dir"]),
+                            "files": {**primary_analysis["files"], "latent_scores.csv": prep["scores_file"]},
+                            "component_selection": ref_record["latent"]["component_selection"],
+                            "selected_lv": ref_record["latent"]["selected_lv"],
+                            "cv_mean_auroc": ref_record["latent"].get("cv_mean_auroc"),
+                            "runtime_seconds": ref_record["measurement"]["runtime_seconds"],
+                            "motco": primary_analysis["manifest"]["software"]["motco"],
+                            "seed": primary_analysis["manifest"]["measurement"]["seed"],
+                            "permutations": primary_analysis["manifest"]["measurement"]["permutations"],
+                        },
+                        "note": (
+                            "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
+                            "export file hashes, MOTCO version, seed, permutations, CV selection, orientation and CV "
+                            "settings), never rerun or modified; its files hash identically after the run"
+                        ),
+                    },
+                    "variant_run": {
+                        "export": {
+                            "dir": str(exp["dir"]),
+                            "files": variant_files,
+                            "manifest_sha256": variant_files["manifest.json"]["sha256"],
+                            "thresholds": exp["manifest"]["thresholds"],
+                            "donor_exclusion": exp["manifest"]["donor_exclusion"],
+                            "feature_counts": exp["manifest"]["feature_counts"],
+                            "findings": exp["findings"],
+                        },
+                        "analysis": {
+                            "dir": str(ana["dir"]),
+                            "files": variant_analysis_files,
+                            "covariates": (var_record.get("covariates") or {}).get("columns"),
+                            "component_selection": var_record["latent"]["component_selection"],
+                            "selected_lv": var_record["latent"]["selected_lv"],
+                            "cv_mean_auroc": var_record["latent"].get("cv_mean_auroc"),
+                            "runtime_seconds": var_record["measurement"]["runtime_seconds"],
+                            "findings": ana["findings"],
+                        },
+                    },
+                    "flag_check": {
+                        "dir": str(finals[DONOR_EXCLUSION_FLAG_CHECK_DIR]),
+                        "file": DONOR_EXCLUSION_FLAG_TABLE,
+                        "sha256": _sha256_file(finals[DONOR_EXCLUSION_FLAG_CHECK_DIR] / DONOR_EXCLUSION_FLAG_TABLE),
+                        "written_at": flag_check_written_at,
+                        "written_before_export": True,
+                        "variables": [
+                            {"name": name, "source": check_sources[name]}
+                            for name in flags_table.loc[flags_table["source"] != _DONOR_EXCLUSION_CELL_SOURCE, "variable"]
+                        ],
+                        "statistics": (
+                            "rank-biserial AUC P(flagged > unflagged) + 1/2 P(=) over the cohort donors and within stage "
+                            f"{DONOR_EXCLUSION_FLAG_CHECK_STAGE}; Spearman with stage and with the primary "
+                            f"{DONOR_EXCLUSION_COMPONENT} among the unflagged donors; no p-value"
+                        ),
+                        "note": "descriptive; no value changes a run",
+                    },
+                    "axis_check": {
+                        "rule": DONOR_EXCLUSION_AXIS_RULE,
+                        "file": DONOR_EXCLUSION_AXIS_TABLE,
+                        "sha256": _sha256_file(comp_tmp / DONOR_EXCLUSION_AXIS_TABLE),
+                        "technical_sources": list(POSITIVE_CONTROL_TECHNICAL_SOURCES),
+                        "role": a["role"],
+                        "reading": a["reading"],
+                        "holds": bool(a["holds"]),
+                        "stage_abs_spearman": float(a["stage_abs_spearman"]),
+                        "technical_max": {
+                            "variable": str(a["technical_variable"]), "source": str(a["technical_source"]),
+                            "abs_spearman": float(a["technical_abs_spearman"]),
+                        },
+                        "n_technical": int(a["n_technical"]),
+                    },
+                    "reading": DONOR_EXCLUSION_READING,
+                    "outputs": sorted([
+                        DONOR_EXCLUSION_TABLE, DONOR_EXCLUSION_AXIS_TABLE, DONOR_EXCLUSION_MARKDOWN, DONOR_EXCLUSION_MANIFEST,
+                    ]),
+                    "software": software,
+                    "git": _git_revision(),
+                    "findings": manifest_findings,
+                }
+                (comp_tmp / DONOR_EXCLUSION_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+                os.replace(comp_tmp, finals[DONOR_EXCLUSION_COMPARISON_DIR])
+            except BaseException:
+                for d in finals.values():
+                    for t in (d, d.with_name(f"{c}.tmp")):
+                        if t.exists():
+                            shutil.rmtree(t, ignore_errors=True)
+                raise
+            print(f"[{log}] Wrote {finals[DONOR_EXCLUSION_COMPARISON_DIR]}")
+            for msg in manifest_findings:
+                print(f"[{log}] FINDING: {v} {c}: {msg}")
+            results[v][c] = {
+                "export": exp, "analysis": ana, "comparison": finals[DONOR_EXCLUSION_COMPARISON_DIR], "rows": rows,
+                "table": table, "flag_check": flags_table, "axis_check": axis, "manifest": manifest,
+                "findings": manifest_findings,
+            }
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -12868,6 +14287,9 @@ __all__ = [
     "summarize_cohorts",
     "run_pseudobulk",
     "run_covariates",
+    "DONOR_FLAG_COLUMNS",
+    "read_donor_flags",
+    "run_donor_flags",
     "tmm_factors",
     "log_cpm",
     "preprocess_block",
@@ -12921,4 +14343,11 @@ __all__ = [
     "POSITIVE_CONTROL_BASES",
     "render_positive_control",
     "run_positive_control",
+    "DONOR_EXCLUSION_VARIANTS",
+    "DONOR_EXCLUSION_AXIS_RULE",
+    "rank_biserial_auc",
+    "flag_check",
+    "axis_check",
+    "render_exclusion_sensitivity",
+    "run_exclusion_sensitivity",
 ]

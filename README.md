@@ -285,6 +285,38 @@ Outputs in `results/pseudobulk/` (so `scripts/sync_pseudobulk.sh` carries them t
 
 The step never writes `donor_covariates.csv` or `covariates_manifest.json`, whose hashes the primary export's and analysis's reference checks bind. Its per-donor cache lives in `results/pseudobulk/per_donor_technical/<omic>/<donor>.json` (the summaries and per-supertype counts and means, no per-nucleus arrays); a rerun skips cached donors unless `--force`, so a stopped run resumes, and a cache made with different gene sets, QC columns or `min_genes` is refused. `scripts/sync_pseudobulk.sh` excludes the cache unless `--with-cache`.
 
+### Donor flags
+
+```
+sead-sexdiff donor-flags                          # RNA values, cross-checked against ATAC
+sead-sexdiff donor-flags --cell-type microglia    # the same table, in results/microglia/pseudobulk/
+```
+
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; the flags are donor-level and do not depend on it, it sets the output directory and is recorded), `--omic {rna,both}` (default `both`; `rna` skips the cross-check and the ATAC-only score), `--data-root`, `--out-dir` (default `<root>/pseudobulk`, `results/pseudobulk` for astrocytes).
+
+Reads only `obs` columns of every MTG donor object (no matrices; under a second per object), so it runs on the cluster login node like `covariates`, once per cell type's pseudobulk directory, and `scripts/sync_pseudobulk.sh [--cell-type NAME]` carries the two files to the workstations:
+
+```
+cd /home1/tgonza/sead_sexdiff && git pull && ~/.local/bin/uv sync --locked
+SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data .venv/bin/sead-sexdiff donor-flags --omic both
+SEAD_DATA_ROOT=/home1/tgonza/sead_sexdiff/data .venv/bin/sead-sexdiff donor-flags --cell-type microglia --omic both
+```
+
+| source `obs` column | column of `donor_flags.csv` | coding |
+|---|---|---|
+| `Severely Affected Donor` | `severely_affected` | `Y` → `True`, `N` → `False` (`DONOR_FLAG_VALUES`); any other value stops the run naming the donor |
+| `Cognitive Status` | `cognitive_status` | recorded as read |
+| `Braak` | `braak` | recorded as read |
+| `CERAD score` | `cerad_score` | recorded as read |
+| `Thal` | `thal` | recorded as read |
+| `LATE` | `late` | recorded as read |
+| `Continuous Pseudo-progression Score` | `cps` | recorded as read; in the ATAC release only (`DONOR_FLAG_ATAC_ONLY_COLUMNS`), its absence from the RNA objects is a finding |
+
+- `donor_flags.csv`: one row per non-Reference donor (84 in these releases). Each column must hold one value per donor object, otherwise the run fails naming the file and column; empty or `nan` labels are left empty and listed; nothing is imputed. Donors whose `Overall AD neuropathological Change` is `Reference` (the donor table's rule; the two ATAC-only donors) are left out and listed in the manifest with their labels.
+- RNA values are used. With `--omic both` every column is compared with the ATAC object: a `Severely Affected Donor` (or Reference-status) disagreement stops the run naming the donor and both values, any other disagreement is recorded under `findings` with both values. A flagged count other than the 11 SEA-AD reports (Gabitto et al. 2024; `DONOR_FLAG_EXPECTED_FLAGGED`) is a finding, never corrected.
+- `donor_flags_manifest.json`: `cell_type`, columns and coding, objects read per omic, the flagged and Reference donors, missing labels, the cross-check summary and disagreements, findings, software versions and git revision.
+- The step writes these two files and nothing else: `donor_covariates.csv` and `covariates_manifest.json`, whose hashes every export and analysis manifest records, are never touched. The table is an input of `exclusion-sensitivity` only; the flag enters no model as a covariate or a variable, and the labels and the score are read by nothing.
+
 ### MOTCO input export
 
 ```
@@ -676,6 +708,60 @@ Reading rules, binding for the report (`reports/motco-microglia-positive-control
 - Nothing found in microglia changes any astrocyte output or reading.
 - The restated control on `latent_adjusted` (`reports/motco-microglia-latent-adjustment-<date>.md`) is reported beside the primary-basis control with the reading predeclared before any microglia arm ran: if it holds in `cohort_30`, the measured quality gradient explains the primary control's failure (once the library-quality direction is conditioned out of the basis, the pipeline resolves stage in the cell type with the stronger stage signal), without promoting the arm (MOTCO's `candidate_fails` stands), changing the primary-basis outcome or changing the astrocyte reading; it is the diagnosis a later MOTCO-side validation of the latent adjustment on blocks with a dominant nuisance axis or a later revised-primary proposal would cite. If it does not hold, the latent construction is in question beyond the quality gradient (the composition of the `Micro-PVM_*` bundle, the rank-1 selection and the few microglia ATAC nuclei per donor are the stated candidates) and the diagnosis "technical gradient" is not supported. E3 on the adjusted basis carries the mediator caveat in both directions (the adjustment removes the quality direction and, with it, any stage signal the fractions carry, so the stage |ρ| may rise or fall); a failure for that reason is still a failure and the expectation is not re-tuned. `cohort_50` is descriptive. The report also states and checks, per cell type and cohort, that the `extended_covariates` arm's CV-selected rank and CV AUROC equal the primary's; a difference is a finding about MOTCO's contract, recorded, not resolved.
 
+### Donor-exclusion sensitivity
+
+```
+sead-sexdiff exclusion-sensitivity                          # both cohorts, astrocytes
+sead-sexdiff exclusion-sensitivity --cell-type microglia
+sead-sexdiff exclusion-sensitivity --cohort cohort_30 --force
+```
+
+Options: `--cell-type {astrocyte,microglia}` (default `astrocyte`; sets the default directories below under the cell type's results root; the registry and every setting are the same for every cell type), `--variant {excluding_severely_affected,all}` (default `all`; a name of the registry `DONOR_EXCLUSION_VARIANTS`), `--cohort {cohort_30,cohort_50,all}` (default `all`), `--pseudobulk-dir` (default `<root>/pseudobulk`; the export's inputs plus `donor_technical.csv`, `donor_flags.csv` and their manifests, read and never written), `--input-dir` (default `<root>/motco_input`; read as the primary export, never written), `--analysis-dir` (default `<root>/motco_analysis`; read as the primary analysis, never written), `--out-dir` (default `<root>/motco_exclusion_sensitivity`; may not lie inside an input directory), `--data-root` (holds `<root>/annotation/`), `--n-jobs` (default 1; other values change the RRPP draws and are recorded as a finding; reported results use 1), `--force` (replace a cohort's four directories; without it `--variant all` skips every variant × cohort whose comparison exists, so `all` is resumable, and a named variant with existing output or a partial tree is an error).
+
+SEA-AD flagged 11 of the 42 high-ADNC donors as severely affected (fewer UMIs and genes per nucleus, more mitochondrial RNA, fewer ATAC peaks) and excluded them from every gene-expression test (Gabitto et al. 2024). The quality axis of our primary analyses rises with stage in both cell types, so the step asks whether that gradient sits in those donors. It reruns the whole export and the primary analysis on the cohort donors without them, per cohort and per variant of `DONOR_EXCLUSION_VARIANTS` (a constant, not a flag; now `excluding_severely_affected`, the cohort donors whose `severely_affected` is `True`):
+
+1. **Checks before anything is written**, for every requested variant and cohort: the pseudobulk inputs and the cell type of every manifest read (pseudobulk, export, analysis, technical, flags; another cell type's manifest stops the step naming the file and both cell types, a manifest written before the registry reads as `astrocyte` with a finding); the primary export against the pseudobulk, covariates and annotation hashes, the export constants, `k`, the cells and the donor count (`_check_export_reference`); the primary analysis against the export hashes, MOTCO version, seed, permutations, CV selection, orientation, CV settings and the six covariates (`_check_reference`); the technical table against the pseudobulk manifest, `TECHNICAL_GENE_SETS` and the cohort donors (`_check_technical_reference`); the flag table for a value for every cohort donor (a missing one stops the step naming the donor). A missing flag table stops the step naming it and `donor-flags`; an exclusion that would empty a sex × stage cell stops it.
+2. **Flag check**, written and put in place before the variant export runs (`flag_check/<cohort>/flag_check.csv`): first one row per sex × stage cell with its flagged and unflagged donors (`source = cell`), then one row per variable: the primary `pls_0`, stage, every numeric column of the technical table and the primary export's TMM factors and log10 library sizes (E3's technical sources, `POSITIVE_CONTROL_TECHNICAL_SOURCES`), with the rank-biserial AUC of flagged against unflagged donors, P(flagged > unflagged) + ½ P(=), over the cohort (`auc_all`) and within stage 2 (`auc_stage2`; empty when the values are constant), and among the unflagged donors the variable's Spearman correlation with stage and with the primary `pls_0`. Descriptive, no p-value; the variant runs whatever it says.
+3. **Variant export**: one `_export_cohort` call with every primary setting (chromosomes, abundance threshold, TMM, prior count, N, variance selection, no normalization or residualization) on the cohort rows minus the excluded donors; the cohort thresholds are unchanged and `k` is recomputed from the remaining sex × stage cells by the export's rule. Its manifest gains a `donor_exclusion` block (variant, flag, the flag table's and its manifest's path and sha256, the excluded donors, the donors, cells, `k` and its source cell before and after); without the keyword the primary export's manifest has no such key. Its `metadata.csv` and `covariates.csv` must equal the primary's minus the excluded rows.
+4. **Variant analysis**: one `_analyze_cohort` call with the primary analysis's parameters (six covariates, CV rank selection, net-displacement orientation, 999 RRPP permutations, seed `20261019`), so the rows differ in the donors only.
+5. **Axis check** (`comparison/<cohort>/axis_check.csv`, the predeclared `DONOR_EXCLUSION_AXIS_RULE`): along the variant analysis's `pls_0`, |Spearman| with stage against the largest |Spearman| with a technical variable (the technical table's numeric columns for the variant donors and the variant export's TMM factors and log10 library sizes; ties by name; undefined correlations left out with a finding), `holds` when the first is strictly larger. For the control cell type of `POSITIVE_CONTROL_CELL_TYPES` (microglia) the outcome is the change's expectation (`reading = expectation`), for the reference cell type it is descriptive. A comparison, not a test.
+
+Outputs under `<root>/motco_exclusion_sensitivity/<variant>/` (each directory written as `<cohort>.tmp` and renamed when complete, the flag check first and the comparison last; on an error the cohort's directories written by the call are removed):
+
+| path | content |
+|---|---|
+| `flag_check/<cohort>/flag_check.csv` | `cohort`, `variable`, `source`, `n_flagged`, `n_unflagged`, `auc_all`, `auc_stage2`, `spearman_unflagged_stage`, `spearman_unflagged_pls0` |
+| `motco_input/<cohort>/` | the variant export: the files `export` writes, with `donor_exclusion` in `manifest.json` |
+| `motco_analysis/<cohort>/` | the variant analysis: the files `analyze` writes |
+| `comparison/<cohort>/exclusion_sensitivity.csv` | two rows from the records, `primary` (the primary analysis directory) then the variant (`motco_analysis/<cohort>`): `n_donors`, `cells` (`Female/stage 0=…;…`), `k`, `n_excluded`, `excluded_donors` (`;`-joined), the CV-selected rank and `cv_mean_auroc`, and per statistic the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95; shortest round-trip floats, no runtime column |
+| `comparison/<cohort>/axis_check.csv` | `cohort`, `cell_type`, `role`, `reading`, `component`, `n_donors`, `stage_spearman`, `stage_abs_spearman`, `technical_variable`, `technical_source`, `technical_spearman`, `technical_abs_spearman`, `n_technical`, `holds` |
+| `comparison/<cohort>/exclusion_sensitivity.md` | the flagged donors per cell, the flag check, one table per statistic, a run table, the axis check, the predeclared reading and the findings |
+| `comparison/<cohort>/exclusion_sensitivity_manifest.json` | `cell_type`, the variant, donors, excluded donors, cells and `k` (primary, variant, flagged per cell), seed, permutations, α, `n_jobs`, every input path and sha256 (pseudobulk and covariates manifests, annotation, technical table, flag table), the primary export and analysis (with `latent_scores.csv`), the variant export and analysis, the flag check (file hash, `written_at`, variables and sources), the axis check (rule, outcome, largest technical variable), the reading, software, git revision and findings (cell-type findings; no donor flagged; a CV-selected rank that differs; a rejection status that differs, recorded as cohort dependence; the axis-check outcome; `n_jobs ≠ 1`; the variant export's own findings) |
+
+Two runs on the same inputs, MOTCO release, seed and `n_jobs` give byte-identical variant export CSVs, `flag_check.csv`, `axis_check.csv` and `exclusion_sensitivity.csv`.
+
+The variant is read like a primary directory through the other steps' directory flags (with `--cell-type microglia` and the paths under `results/microglia/` for microglia):
+
+```
+V=results/motco_exclusion_sensitivity/excluding_severely_affected
+sead-sexdiff axis-diagnostics --input-dir $V/motco_input --analysis-dir $V/motco_analysis \
+    --rank-dir $V/motco_rank_sensitivity --out-dir $V/diagnostics   # no sweep on a variant: a finding
+sead-sexdiff stage-de --omic both --input-dir $V/motco_input --analysis-dir $V/motco_analysis \
+    --out-dir $V/stage_de --n-cpus 10
+sead-sexdiff stage-de-limma --omic rna --input-dir $V/motco_input --analysis-dir $V/motco_analysis \
+    --deseq2-dir $V/stage_de --out-dir $V/stage_de_limma
+```
+
+`--rank-dir` must point at a directory that does not exist (the primary sweep's analyses were made from the primary export and fail the hash check). `stage-de` (and `stage-de-limma` through the same preparation) removes the export manifest's recorded `donor_exclusion` donors from the donor table's cohort before the donor-agreement check, so the variant's donors must equal the donor table's cohort minus exactly those donors (otherwise the step stops naming both files and the donors), and both step manifests record the block; without the block nothing changes. DESeq2 runs on both omics because `stage-de-limma` requires a DESeq2 run complete for both; the reading is the RNA counts, and the ATAC DESeq2 tables are recorded only.
+
+Reading rules, binding for the report (`reports/motco-donor-exclusion-sensitivity-<date>.md`, both cell types):
+
+- The variant is a sensitivity analysis, never a revised primary; the primary analyses, the primary cohorts and the primary-basis positive control stay as they are, whatever the variant shows.
+- The flag check and the axis check are read together (`DONOR_EXCLUSION_READING`, predeclared): if the flagged donors carry the quality tail (high AUC for the mitochondrial fraction and the primary `pls_0`) and the axis check holds in microglia, the quality gradient sits in the donors SEA-AD excluded, and excluding them is a donor-selection route to the same end as the latent adjustment; if the axis check fails although the flagged donors carry the tail, the gradient extends beyond them; if they do not carry the tail, the flag is not the gradient's carrier and the variant is an ordinary cohort sensitivity.
+- A rejection status that differs between the variant and the primary is cohort dependence, not a result of the variant; a CV-selected rank that differs is reported beside `angle`; `angle` and `shape` non-rejections stay uninformative and a `delta` rejection is a difference, not specifically of size.
+- The variant's exported RNA stage counts (DESeq2 `factor_additive` union, limma `stage_joint`) beside the primary's say how much of the stage signal survives the exclusion; the concordance cells apply to the variant analysis as to the primary. The cross-cell-type comparisons (variant CV AUROC, microglia against astrocytes; each cell type's variant counts against its primary counts) are compared, not tested.
+- Limitations carried: the excluded donors carry the most severe pathology, so the exclusion truncates the late epoch along with the quality tail and a stage effect concentrated in them is removed with them; the flag was made from QC metrics, so the variant conditions on quality by donor selection; the stage-2 cells are smaller, so the variant has less power; MOTCO's operating characteristics were measured on neither cohort; the flag's sex split bears on the sex × stage comparison.
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.
@@ -851,6 +937,19 @@ STAGE_DE_LIMMA_JOINT_TESTS["factor_interaction"]  # ('interaction_joint', ('male
 results = run_stage_de_limma("cohort_30", debug_dir="scratch/limma_debug")
 results["cohort_30"]["comparison"]   # method_comparison.csv
 results["cohort_30"]["concordance"]  # {'rna': {'deseq2': {...}, 'limma': {...}, 'delta_rejected': ..., 'methods_agree': ...}}
+```
+
+- The donor flags and the donor-exclusion sensitivity analysis (the primary export and analysis are read, never rerun):
+
+```python
+from sead_sexdiff.data import DONOR_EXCLUSION_VARIANTS, run_donor_flags, run_exclusion_sensitivity
+
+run_donor_flags(omic="both")  # on the cluster login node: donor_flags.csv beside the covariates
+DONOR_EXCLUSION_VARIANTS["excluding_severely_affected"]["flag"]  # 'severely_affected'
+results = run_exclusion_sensitivity("excluding_severely_affected", "cohort_30", cell_type="microglia", force=True)
+results["excluding_severely_affected"]["cohort_30"]["table"]       # primary row, then the variant
+results["excluding_severely_affected"]["cohort_30"]["flag_check"]  # written before the variant export
+results["excluding_severely_affected"]["cohort_30"]["axis_check"]  # the predeclared axis check
 ```
 
 - Subset a single donor `.h5ad` by subclass and free the original object:

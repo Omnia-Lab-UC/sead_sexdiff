@@ -212,11 +212,72 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    (`positive_control.csv`, `positive_control.md`,
    `positive_control_manifest.json`), or `positive_control/<basis>/<cohort>/`
    on a non-primary basis.
+14. `donor-flags` – from the raw donor objects' `obs` only (cluster login
+   node, under a second per object, modelled on `covariates`): SEA-AD's
+   `Severely Affected Donor` coded as `severely_affected` (`DONOR_FLAG_VALUES`:
+   `Y` → true, `N` → false, anything else an error naming the donor) and,
+   recorded as read and used by nothing, `Cognitive Status`, `Braak`,
+   `CERAD score`, `Thal`, `LATE` (`DONOR_FLAG_COLUMNS`) and the `Continuous
+   Pseudo-progression Score` where the objects hold it
+   (`DONOR_FLAG_ATAC_ONLY_COLUMNS`: the ATAC release only; its absence from
+   the RNA objects is a finding). RNA values are used; with `--omic both`
+   every column is cross-checked against ATAC (a flag or Reference-status
+   disagreement is an error, any other a finding with both values). Reference
+   donors (ADNC `Reference`, as the donor table) are left out and listed.
+   Writes `<root>/pseudobulk/donor_flags.csv` and `donor_flags_manifest.json`
+   (`DONOR_FLAG_OUTPUTS`) and nothing else, never `donor_covariates.csv` or
+   `covariates_manifest.json`; a flagged count other than
+   `DONOR_FLAG_EXPECTED_FLAGGED` (11, SEA-AD's) is a finding, not corrected.
+   The table is an input of `exclusion-sensitivity` and of nothing else.
+15. `exclusion-sensitivity` – from `<root>/pseudobulk/` (the export's inputs,
+   `donor_technical.csv`, `donor_flags.csv` and their manifests), the
+   annotation, `<root>/motco_input/` and `<root>/motco_analysis/` only, per
+   cell type (`--cell-type`), per variant of the registry
+   `DONOR_EXCLUSION_VARIANTS` (`excluding_severely_affected`: the cohort
+   donors whose `severely_affected` is true) and per cohort: the flag check
+   (`flag_check.csv`, written and put in place before the variant export:
+   the flagged donors per sex × stage cell; for the primary `pls_0`, stage,
+   the technical table's numeric columns and the primary export's TMM
+   factors and log10 library sizes, the rank-biserial AUC of flagged against
+   unflagged donors over the cohort and within stage 2, and among the
+   unflagged donors the Spearman with stage and with `pls_0`; no p-value,
+   never a gate); the export rerun on the cohort donors minus the excluded
+   ones (`_export_cohort` with the primary settings and `donor_exclusion=`,
+   the manifest's `donor_exclusion` block: variant, flag, flag-table and
+   manifest sha256, excluded donors, cells and `k` before and after; cohort
+   thresholds unchanged, `k` recomputed by the export's rule; `metadata.csv`
+   and `covariates.csv` checked equal to the primary's minus the excluded
+   rows); the analysis rerun unchanged (`_analyze_cohort` with the `analyze`
+   parameters); the predeclared axis check (`axis_check.csv`,
+   `DONOR_EXCLUSION_AXIS_RULE`: along the variant's `pls_0`, |Spearman| with
+   stage strictly above the largest with a technical variable of
+   `POSITIVE_CONTROL_TECHNICAL_SOURCES`, from the variant export; the control
+   cell type's value is the expectation, the reference's descriptive). The
+   primary export and analysis are read and checked (`_check_export_reference`,
+   `_check_reference`, orientation and CV settings, the six covariates), the
+   technical table by `_check_technical_reference`, the flag table for its
+   cell type and a value for every cohort donor; an exclusion that would
+   empty a sex × stage cell stops the step; nothing is rerun or modified.
+   Writes `<root>/motco_exclusion_sensitivity/<variant>/` (`flag_check/<cohort>/`,
+   `motco_input/<cohort>/` and `motco_analysis/<cohort>/` mirroring the
+   primary layout so `axis-diagnostics`, `stage-de` and `stage-de-limma` read
+   the variant through their directory flags, and `comparison/<cohort>/` with
+   `exclusion_sensitivity.csv`, `axis_check.csv`, `exclusion_sensitivity.md`,
+   `exclusion_sensitivity_manifest.json`, written last); each directory as
+   `<cohort>.tmp` renamed when complete, the cohort's directories removed on
+   an error; `--variant all` skips complete variant × cohort pairs without
+   `--force` (resumable). On a variant, `stage-de` and `stage-de-limma`
+   (`_stage_de_prepare`) remove the export manifest's recorded
+   `donor_exclusion` donors from the donor table's cohort before the
+   donor-agreement check (they must be cohort donors and the rest must equal
+   the export's donors) and record the block in their manifests; without the
+   block nothing changes.
 
-Cell types: steps 2–12 except the rank and preprocessing sensitivity steps
-(the nine commands `pseudobulk`, `covariates`, `technical-covariates`,
-`export`, `analyze`, `axis-diagnostics`, `latent-sensitivity`, `stage-de`,
-`stage-de-limma`) take `--cell-type`, a name
+Cell types: steps 2–12 except the rank and preprocessing sensitivity steps,
+and steps 14–15 (the eleven commands `pseudobulk`, `covariates`,
+`technical-covariates`, `export`, `analyze`, `axis-diagnostics`,
+`latent-sensitivity`, `stage-de`, `stage-de-limma`, `donor-flags`,
+`exclusion-sensitivity`) take `--cell-type`, a name
 of the registry `CELL_TYPES` (default `astrocyte`, results root `results/`;
 `microglia`, results root `results/microglia/`). It sets the population (one
 selection path) and every default directory (`cell_type_dirs`: `<root>/pseudobulk/`,
@@ -242,7 +303,8 @@ when behavior or defaults change.
   MOTCO export, analysis, the rank / preprocessing / latent-adjustment
   sensitivity analyses, the axis diagnostics, the pseudobulk stage DE
   (DESeq2, and limma-voom through the R script below), the cell-type
-  registry and the positive control.
+  registry, the positive control, the donor flags and the donor-exclusion
+  sensitivity analysis.
 - `src/sead_sexdiff/stage_de_limma.R` – the R side of `stage-de-limma`
   (TMM, voomWithQualityWeights, lmFit, eBayes, the R-side checks and the
   exact-F diagnostic); packaged beside `data.py` and run with `Rscript` on
@@ -273,7 +335,7 @@ when behavior or defaults change.
   packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R`, `check_stage_de_deseq2.R` (DESeq2) and `stage_de_limma.R` (limma, edgeR; `stage-de-limma` needs `Rscript` on `PATH`, so it runs inside the shell or through `nix develop -c`); its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|donor-flags|exclusion-sensitivity|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
   `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -348,7 +410,8 @@ when behavior or defaults change.
   PVM-only supertype; results root `results/microglia/`; labels and cells
   from the metadata-only spike). The rule `results/` for the default,
   `results/<name>/` otherwise, is asserted at import (the cluster scripts
-  rely on it); `CELL_TYPE_SUBDIRS` (incl. `motco_latent_sensitivity`) and
+  rely on it); `CELL_TYPE_SUBDIRS` (incl. `motco_latent_sensitivity`,
+  `motco_exclusion_sensitivity`) and
   `cell_type_dirs` give the default directories. The microglia reuse of the astrocyte `COHORT_THRESHOLDS`,
   `ADNC_STAGES` and per-cohort `k`, and of every export, analysis and
   stage-DE setting, is a decision of the change. `POSITIVE_CONTROL_CELL_TYPES`
@@ -666,6 +729,51 @@ when behavior or defaults change.
   (simulations under DESeq2's own model, rebuilt; realized FDR of the
   additive tables 0.054 / 0.038 against DESeq2's 0.078 / 0.081) is not a
   gate on real data.
+- Donor-flag constants (flag and ask before changing any of them):
+  `DONOR_FLAG_COLUMNS` (the flag and the five staging labels, coded names),
+  `DONOR_FLAG_ATAC_ONLY_COLUMNS` (the pseudo-progression score, read where
+  present, its absence a finding), `DONOR_FLAG_SOURCE` with
+  `DONOR_FLAG_VALUES` (`Y` / `N`; any other value an error, never worked
+  around: the proposal is amended first), `DONOR_FLAG_REFERENCE_LABEL`
+  (ADNC `Reference`, the donor table's rule), `DONOR_FLAG_EXPECTED_FLAGGED`
+  (11, a finding when different), `DONOR_FLAG_OUTPUTS`, the labels and the
+  score recorded and read by nothing (CPS-based staging is a later
+  proposal), and the rule that the table stays apart from
+  `donor_covariates.csv` / `covariates_manifest.json` and is an input of
+  `exclusion-sensitivity` only: never a covariate, a diagnostic variable or
+  a filter of any other step.
+- Donor-exclusion constants (flag and ask before changing any of them):
+  `DONOR_EXCLUSION_VARIANTS` (a registry keyed by variant name with a
+  `description`, the flag column and `exclude_when`; now only
+  `excluding_severely_affected`, SEA-AD's own handling of expression tests;
+  never a flag, never chosen from results, entries added by a change
+  proposal only), the cohort thresholds kept with `k` recomputed by the
+  export's rule (never a change to `COHORT_THRESHOLDS`, `ADNC_STAGES` or
+  `PREREGISTERED_COHORTS`), the flag check (`DONOR_EXCLUSION_CHECK_VARIABLES`,
+  `DONOR_EXCLUSION_COMPONENT` `pls_0`, `DONOR_EXCLUSION_FLAG_CHECK_STAGE` `2`;
+  rank-biserial AUC and Spearman, no p-value, written before any run, never a
+  gate), `DONOR_EXCLUSION_AXIS_RULE` (E3's technical sources, strict `>`,
+  the control cell type's value the expectation), `DONOR_EXCLUSION_READING`
+  (predeclared in the proposal before any run), the output names
+  (`DONOR_EXCLUSION_*`), the stage DE on a variant (`stage-de --omic both`,
+  so the limma step's DESeq2 binding holds, and `stage-de-limma --omic rna`;
+  the RNA counts are the reading, the ATAC DESeq2 tables are recorded only),
+  `n_jobs = 1` for reported results, and the rule that the primary analyses,
+  the primary cohorts and the positive control's outcome are unchanged by
+  anything found here. Reading rules for the report (both cell types): the
+  variant is sensitivity only, never a revised primary; a rejection status
+  that differs from the primary's is cohort dependence, not a result of the
+  variant; a CV-selected rank that differs is reported beside `angle`; the
+  non-rejection rules hold in the variant; the cross-cell-type comparisons
+  (variant CV AUROC microglia against astrocytes; each cell type's variant
+  exported RNA stage counts against its primary counts) are compared, not
+  tested. Carried limitations: the excluded donors carry the most severe
+  pathology, so the exclusion truncates the late epoch with the quality tail
+  and a stage effect concentrated in them goes with them; the flag was made
+  from QC metrics, so the variant conditions on quality by donor selection;
+  the stage-2 cells are smaller (less power); MOTCO's operating
+  characteristics were measured on neither cohort; the flag's sex split
+  bears on the sex × stage comparison.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
@@ -684,7 +792,8 @@ when behavior or defaults change.
   login node (nohup), then `scripts/pseudobulk.sbatch` runs
   `pseudobulk --omic both` as one sequential job; resubmitting resumes.
   `covariates --omic both` reads metadata only and runs directly on the login
-  node. `technical-covariates --omic both` needs the raw objects and
+  node, as does `donor-flags --omic both` (once per cell type's pseudobulk
+  directory, `--cell-type <name>`; then `scripts/sync_pseudobulk.sh`). `technical-covariates --omic both` needs the raw objects and
   `results/pseudobulk/` (incl. the per-donor cache): `scripts/technical.sbatch`
   after the pseudobulk job, or nohup on the login node; resubmitting resumes.
 - Another cell type: both sbatch scripts read `CELL_TYPE` (default
