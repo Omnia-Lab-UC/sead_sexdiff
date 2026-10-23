@@ -184,6 +184,39 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `method_comparison.csv`, `stage_de_limma.md`, `stage_de_limma_manifest.json`).
    It reads sex and stage, so its outputs feed no export, analysis or
    sensitivity command.
+13. `positive-control` – from the generated files of both cell types only
+   (control `results/microglia/`, reference `results/`), per cohort: the
+   predeclared `POSITIVE_CONTROL_EXPECTATIONS` E1 (exported RNA stage counts
+   at FDR 0.05, control > reference within each stage-DE method: DESeq2
+   `factor_additive` union, limma `stage_joint`; holds only under both, under
+   one only `method_dependent`, not holding), E2 (primary `cv_mean_auroc`,
+   control > reference) and E3 (control's primary `pls_0`: |Spearman| with
+   stage > the largest with a technical variable of
+   `POSITIVE_CONTROL_TECHNICAL_SOURCES`, from `axis_correlations.csv`); the
+   control holds when all three hold in `POSITIVE_CONTROL_PRIMARY_COHORT`.
+   Reads counts, the CV AUROC and raw Spearman correlations only (no p-value,
+   rejection status or trajectory statistic; nothing tested). Every manifest
+   read must record its root's cell type (`POSITIVE_CONTROL_CELL_TYPES`) and
+   the chain must hold (both stage-DE steps and the diagnostic made from the
+   analysis read for E2, the limma step from the DESeq2 summary read for E1).
+   Writes `results/microglia/positive_control/<cohort>/`
+   (`positive_control.csv`, `positive_control.md`,
+   `positive_control_manifest.json`).
+
+Cell types: steps 2–12 except the sensitivity steps (the eight commands
+`pseudobulk`, `covariates`, `technical-covariates`, `export`, `analyze`,
+`axis-diagnostics`, `stage-de`, `stage-de-limma`) take `--cell-type`, a name
+of the registry `CELL_TYPES` (default `astrocyte`, results root `results/`;
+`microglia`, results root `results/microglia/`). It sets the population (one
+selection path) and every default directory (`cell_type_dirs`: `<root>/pseudobulk/`,
+`<root>/motco_input/`, …); explicit directory flags win. Every manifest of
+these steps records `cell_type` and every reader refuses another cell type's
+manifest (`check_manifest_cell_type`, naming the file and both cell types,
+nothing written); a manifest written before the registry has no key and
+reads as `astrocyte` with a finding. The per-donor caches record it too; the
+cell type stays out of the stage-DE fit-record fingerprints. The sensitivity
+steps (`rank-sensitivity`, `preprocessing-sensitivity`, `latent-sensitivity`)
+have no flag and run on astrocytes only.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -195,8 +228,9 @@ when behavior or defaults change.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
   pseudobulk, differential expression, covariates, technical covariates,
   MOTCO export, analysis, the rank / preprocessing / latent-adjustment
-  sensitivity analyses, the axis diagnostics and the pseudobulk stage DE
-  (DESeq2, and limma-voom through the R script below).
+  sensitivity analyses, the axis diagnostics, the pseudobulk stage DE
+  (DESeq2, and limma-voom through the R script below), the cell-type
+  registry and the positive control.
 - `src/sead_sexdiff/stage_de_limma.R` – the R side of `stage-de-limma`
   (TMM, voomWithQualityWeights, lmFit, eBayes, the R-side checks and the
   exact-F diagnostic); packaged beside `data.py` and run with `Rscript` on
@@ -205,9 +239,10 @@ when behavior or defaults change.
   record, so editing it makes the existing records stale.
 - `src/sead_sexdiff/DEG.R` – exploratory R script (MAST mixed model); not wired
   into the CLI.
-- `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs),
-  `sync_pseudobulk.sh` (rsync of `results/pseudobulk/` to a workstation,
-  per-donor caches excluded), `check_tmm_edger.R`
+- `scripts/` – `pseudobulk.sbatch` and `technical.sbatch` (cluster jobs;
+  `CELL_TYPE`, default `astrocyte`, passed as `--cell-type`),
+  `sync_pseudobulk.sh` (rsync of a cell type's pseudobulk directory to a
+  workstation, `--cell-type`, per-donor caches excluded), `check_tmm_edger.R`
   (one-off edgeR cross-check of the export's TMM / log2-CPM),
   `check_cyclic_loess_limma.R` (limma cross-check of the variants' cyclic
   loess on `_export_cohort` debug files) and `check_stage_de_deseq2.R` (R
@@ -226,7 +261,7 @@ when behavior or defaults change.
   packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R`, `check_stage_de_deseq2.R` (DESeq2) and `stage_de_limma.R` (limma, edgeR; `stage-de-limma` needs `Rscript` on `PATH`, so it runs inside the shell or through `nix develop -c`); its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
   `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
   `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
@@ -260,26 +295,67 @@ when behavior or defaults change.
 - QC defaults: `min_genes=200` per cell, `min_cells=3` per gene.
 - MTG pseudobulk scientific choices (constants in `data.py`; flag and ask
   before changing any of them):
-  - `TAXONOMY`: per-release label mapping keyed by the release date in the
-    file name. Every `Subclass` value and every astrocyte `Supertype` must be
-    listed, otherwise the run fails. RNA calls microglia `Immune`, ATAC
+  - `TAXONOMY`: per-release `Subclass` inventory (and omic) keyed by the
+    release date in the file name; every `Subclass` value must be listed,
+    otherwise the run fails. The population comes from `CELL_TYPES` (below),
+    joined by `taxonomy_for(path, cell_type)`; every `Supertype` of the
+    population's subclass must be a population or a recorded non-population
+    label, otherwise the run fails. RNA calls microglia `Immune`, ATAC
     `Microglia-PVM`; astrocytes are `Astrocyte` in both. Spike notes:
-    `openspec/changes/mtg-astrocyte-donor-pseudobulks/spike.md`.
+    `openspec/changes/archive/2026-10-16-mtg-astrocyte-donor-pseudobulks/spike.md`,
+    `openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md`.
   - `MATRIX_SOURCE`, `RNA_MIN_GENES` (RNA nuclei ≥ 200 genes; ATAC no extra QC).
   - `Reference` ADNC donors excluded; `ADNC_STAGES` (`Not AD`+`Low` → `0`,
     `Intermediate` → `1`, `High` → `2`).
-  - `COHORT_THRESHOLDS` (≥ 30 / ≥ 50 astrocyte nuclei in both omics) and
-    `PREREGISTERED_COHORTS` (≥ 30: n = 80, F 11/10/28, M 9/10/12; ≥ 50:
-    n = 74). Deviations go to `manifest.json` `findings`, never silently.
+  - `COHORT_THRESHOLDS` (≥ 30 / ≥ 50 nuclei of the cell type in both omics)
+    and `PREREGISTERED_COHORTS`, per cell type from `CELL_TYPES` (astrocyte
+    ≥ 30: n = 80, F 11/10/28, M 9/10/12; ≥ 50: n = 74; microglia, the
+    metadata-only spike's counts: ≥ 30: n = 76, F 11/10/24, M 9/11/11; ≥ 50:
+    n = 63, F 8/10/18, M 8/10/9). Deviations go to `manifest.json`
+    `findings`, never silently.
 - Covariate coding (`COVARIATE_COLUMNS`, `COVARIATE_CROSS_CHECK`): RNA values
   are used; `N+` ages are capped and flagged; non-numeric values stay missing
   and are listed; nothing is imputed.
 - The nucleus selection of the MTG steps is one code path,
-  `select_astrocyte_nuclei` (taxonomy mapping, `Reference` excluded,
-  `RNA_MIN_GENES` on the `UMIs` layer; ATAC `read_counts=False` reads `obs`
-  only): `pseudobulk_donor` sums what it returns and `technical_donor`
-  summarizes the same nuclei. Changing it changes both steps; the pseudobulk
-  outputs must then be re-checked against the per-donor cache.
+  `select_nuclei(..., cell_type=...)` (`select_astrocyte_nuclei` is its
+  astrocyte wrapper; the cell type's subclass, then its population
+  supertypes, `Reference` excluded, `RNA_MIN_GENES` on the `UMIs` layer; ATAC
+  `read_counts=False` reads `obs` only): `pseudobulk_donor` sums what it
+  returns and `technical_donor` summarizes the same nuclei. Changing it
+  changes both steps; the pseudobulk outputs must then be re-checked against
+  the per-donor cache. The selection's `n_astro` key (population nuclei
+  before QC) keeps its name so existing caches stay readable.
+- Cell-type registry and positive-control constants (flag and ask before
+  changing any of them): `CELL_TYPES` (a registry keyed by canonical name,
+  entries added by a change proposal only; the name is a flag, the mapping
+  is not): `astrocyte` (the default, `DEFAULT_CELL_TYPE`; `Astrocyte`,
+  `Astro_1`…`Astro_6-SEAAD` in both releases; results root `results/`, so no
+  astrocyte path moves) and `microglia` (RNA `Immune`, ATAC `Microglia-PVM`,
+  the six `Micro-PVM_*` supertypes of both releases with identity mapping,
+  `Lymphocyte` and `Monocyte` recorded as non-population; no release has a
+  PVM-only supertype; results root `results/microglia/`; labels and cells
+  from the metadata-only spike). The rule `results/` for the default,
+  `results/<name>/` otherwise, is asserted at import (the cluster scripts
+  rely on it); `CELL_TYPE_SUBDIRS` and `cell_type_dirs` give the default
+  directories. The microglia reuse of the astrocyte `COHORT_THRESHOLDS`,
+  `ADNC_STAGES` and per-cohort `k`, and of every export, analysis and
+  stage-DE setting, is a decision of the change. `POSITIVE_CONTROL_CELL_TYPES`
+  (control `microglia`, reference `astrocyte`), `POSITIVE_CONTROL_EXPECTATIONS`
+  (E1–E3, written before any microglia run, never changed from results; E1
+  on the exported RNA set and under both stage-DE methods, a method
+  disagreement `method_dependent`, not holding),
+  `POSITIVE_CONTROL_TECHNICAL_SOURCES` (E3's technical variables: the
+  technical table and the export's TMM / library sizes, not the six analysis
+  covariates or `male`), `POSITIVE_CONTROL_PRIMARY_COHORT` (`cohort_30`; the
+  control holds when E1–E3 all hold there), strict `>` (ties do not hold),
+  and the output names (`POSITIVE_CONTROL_*`). Reading rules for the report:
+  the control is about the stage signal, not the sex × stage hypothesis; if
+  it holds the astrocyte null is not a pipeline failure, if not the latent
+  construction is in question for any cell type; the microglia trajectory
+  result is a second case-study result under the existing binding rules
+  (with both stage-DE concordance cells), with MOTCO's operating
+  characteristics measured on neither cell type's blocks; nothing found in
+  microglia changes any astrocyte output or reading.
 - Technical-covariate constants (flag and ask before changing any of them):
   `TECHNICAL_GENE_SETS` (ribosomal `^RP[LS]\d+[A-Z]?$` / `^RPLP[0-2]$` /
   `RPSA`, so pseudogenes and kinases are excluded; the 13 `MT-` genes; `HBB`,
@@ -577,8 +653,16 @@ when behavior or defaults change.
   node. `technical-covariates --omic both` needs the raw objects and
   `results/pseudobulk/` (incl. the per-donor cache): `scripts/technical.sbatch`
   after the pseudobulk job, or nohup on the login node; resubmitting resumes.
-- Workstations pull only `results/pseudobulk/` with
-  `scripts/sync_pseudobulk.sh`; never copy raw donor objects around.
+- Another cell type: both sbatch scripts read `CELL_TYPE` (default
+  `astrocyte`) and pass `--cell-type`; their `#SBATCH` log paths are the
+  astrocyte ones, so submit with `--export=ALL,CELL_TYPE=<name>` and
+  `--output` / `--error` under `results/<name>/pseudobulk/logs/` (create it
+  first). The scripts derive the pseudobulk directory from the rule
+  `results/` for astrocyte, `results/<name>/` otherwise, which `data.py`
+  asserts for every `CELL_TYPES` entry at import.
+- Workstations pull only a cell type's pseudobulk directory with
+  `scripts/sync_pseudobulk.sh [--cell-type <name>]`; never copy raw donor
+  objects around.
 
 ## Code conventions
 

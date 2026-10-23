@@ -7,7 +7,7 @@ Runs the covariate-adjusted comparison of female and male astrocyte trajectories
 ## Requirements
 
 ### Requirement: Inputs are the exported MOTCO blocks only
-For each requested cohort the analysis SHALL read `rna.csv`, `atac.csv`, `metadata.csv`, `covariates.csv` and `manifest.json` from `results/motco_input/<cohort>/` and nothing else. It SHALL stop with an error naming the file when one is missing, when the donor columns of the four tables differ, or when the export manifest's donor count or block feature counts disagree with the tables.
+For each requested cohort the analysis SHALL read `rna.csv`, `atac.csv`, `metadata.csv`, `covariates.csv` and `manifest.json` from the cell type's export root (default `results/motco_input/<cohort>/` for `astrocyte`, `results/microglia/motco_input/<cohort>/` for `microglia`) and nothing else. It SHALL stop with an error naming the file when one is missing, when the donor columns of the four tables differ, when the export manifest's donor count or block feature counts disagree with the tables, or when the export manifest's cell type differs from the requested one (naming both). The analysis manifest SHALL record the cell type.
 
 #### Scenario: Export not yet run
 - **WHEN** `results/motco_input/cohort_50/` does not exist
@@ -16,6 +16,14 @@ For each requested cohort the analysis SHALL read `rna.csv`, `atac.csv`, `metada
 #### Scenario: Tables disagree
 - **WHEN** `covariates.csv` lists a donor that `metadata.csv` does not
 - **THEN** the analysis stops with an error naming both files
+
+#### Scenario: Cell-type mismatch
+- **WHEN** `analyze --cell-type microglia --input-dir results/motco_input` is run against the astrocyte export
+- **THEN** the analysis stops with an error naming `astrocyte` and `microglia`, and writes nothing
+
+#### Scenario: Microglia defaults
+- **WHEN** `analyze --cell-type microglia` runs without directory flags
+- **THEN** it reads `results/microglia/motco_input/<cohort>/` and writes `results/microglia/motco_analysis/<cohort>/` with the primary analysis's settings, and nothing under `results/motco_analysis/` changes
 
 ### Requirement: Fixed, recorded covariate set
 The analysis SHALL enter exactly these covariates, additively and in this order: `age_at_death`, `pmi`, `rin`, `years_education`, `log10_n_rna`, `log10_n_atac`, where `log10_n_rna` and `log10_n_atac` are the base-10 logarithms of `n_rna` and `n_atac`. `education_level` and `age_capped` SHALL NOT enter the model. The missing-covariate policy SHALL be `error`, and no value SHALL be imputed.

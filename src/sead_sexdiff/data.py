@@ -1011,31 +1011,93 @@ def differential_expression(
 ADNC_COLUMN = "Overall AD neuropathological Change"
 
 _ASTRO_SUPERTYPES = ["Astro_1", "Astro_2", "Astro_3", "Astro_4", "Astro_5", "Astro_6-SEAAD"]
+# Microglia / PVM supertypes, the same labels in both releases (the Micro-PVM_*
+# labels bundle microglia and perivascular macrophages); the immune subclass
+# also holds lymphocytes and monocytes, which are not selected. Labels and the
+# decision: openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md.
+_MICRO_SUPERTYPES = [
+    "Micro-PVM_1", "Micro-PVM_2", "Micro-PVM_2_1-SEAAD", "Micro-PVM_2_3-SEAAD", "Micro-PVM_3-SEAAD", "Micro-PVM_4-SEAAD",
+]
+_IMMUNE_OTHER_SUPERTYPES = ["Lymphocyte", "Monocyte"]
 _SHARED_SUBCLASSES = [
     "L2/3 IT", "L4 IT", "L5 IT", "L6 IT", "L6 IT Car3", "L5 ET", "L5/6 NP", "L6 CT",
     "L6b", "Lamp5", "Lamp5 Lhx6", "Pax6", "Sncg", "Vip", "Sst", "Sst Chodl", "Pvalb",
     "Chandelier", "OPC", "Oligodendrocyte", "Endothelial",
 ]
 
-# Taxonomy mapping per release, keyed by the date in the file name
-# (``..._final-nuclei.<date>.h5ad``). Labels confirmed by the spike in
-# ``openspec/changes/mtg-astrocyte-donor-pseudobulks/spike.md``. Every
-# ``Subclass`` value of a donor object must be listed (astrocyte or other) and
-# every astrocyte ``Supertype`` must be mapped, otherwise the run fails.
+# Release-wide taxonomy, keyed by the date in the file name
+# (``..._final-nuclei.<date>.h5ad``): the omic and the complete ``Subclass``
+# inventory of the release (labels confirmed by the spikes in
+# ``openspec/changes/archive/2026-10-16-mtg-astrocyte-donor-pseudobulks/spike.md``
+# and ``openspec/changes/archive/2026-10-22-mtg-microglia-positive-control/spike.md``).
+# Every ``Subclass`` value of a donor object must be listed, otherwise the run
+# fails. The population a step selects comes from ``CELL_TYPES`` and is
+# joined to this inventory by :func:`taxonomy_for`.
 TAXONOMY: dict[str, dict] = {
     "2026-06-22": {
         "omic": "rna",
-        "astrocyte_subclass": ["Astrocyte"],
-        "other_subclasses": _SHARED_SUBCLASSES + ["Immune", "VLMC & Perivascular"],
-        "supertypes": {s: s for s in _ASTRO_SUPERTYPES},
+        "subclasses": ["Astrocyte"] + _SHARED_SUBCLASSES + ["Immune", "VLMC & Perivascular"],
     },
     "2024-12-06": {
         "omic": "atac",
-        "astrocyte_subclass": ["Astrocyte"],
-        "other_subclasses": _SHARED_SUBCLASSES + ["Microglia-PVM", "VLMC"],
-        "supertypes": {s: s for s in _ASTRO_SUPERTYPES},
+        "subclasses": ["Astrocyte"] + _SHARED_SUBCLASSES + ["Microglia-PVM", "VLMC"],
     },
 }
+
+# Cell-type registry: canonical name → the population of each release
+# (``subclass``: the ``Subclass`` label(s); ``supertypes``: raw → canonical
+# ``Supertype`` labels of the population; ``other_supertypes``: the
+# subclass's recorded non-population supertypes, which are not selected, so
+# any other label is an error), the results root (default directories of
+# every MTG step, :func:`cell_type_dirs`) and the preregistered cohort cells.
+# The name is a flag (``--cell-type``), the mapping is not; entries are added
+# by a change proposal only. ``astrocyte`` is the default and its root is
+# ``results/``, so no astrocyte path moves.
+DEFAULT_CELL_TYPE = "astrocyte"
+CELL_TYPES: dict[str, dict] = {
+    "astrocyte": {
+        "description": "astrocytes: Subclass 'Astrocyte' in both releases, supertypes Astro_1 to Astro_6-SEAAD",
+        "results_root": "results",
+        "releases": {
+            "2026-06-22": {"subclass": ["Astrocyte"], "supertypes": {s: s for s in _ASTRO_SUPERTYPES}, "other_supertypes": []},
+            "2024-12-06": {"subclass": ["Astrocyte"], "supertypes": {s: s for s in _ASTRO_SUPERTYPES}, "other_supertypes": []},
+        },
+        "preregistered_cohorts": {
+            "cohort_30": {"n": 80, "Female": [11, 10, 28], "Male": [9, 10, 12]},
+            "cohort_50": {"n": 74},
+        },
+    },
+    "microglia": {
+        "description": "microglia / PVM: RNA Subclass 'Immune', ATAC Subclass 'Microglia-PVM', restricted to the "
+                       "Micro-PVM_* supertypes (lymphocytes and monocytes not selected)",
+        "results_root": "results/microglia",
+        "releases": {
+            "2026-06-22": {
+                "subclass": ["Immune"],
+                "supertypes": {s: s for s in _MICRO_SUPERTYPES},
+                "other_supertypes": list(_IMMUNE_OTHER_SUPERTYPES),
+            },
+            "2024-12-06": {
+                "subclass": ["Microglia-PVM"],
+                "supertypes": {s: s for s in _MICRO_SUPERTYPES},
+                "other_supertypes": list(_IMMUNE_OTHER_SUPERTYPES),
+            },
+        },
+        # The metadata-only spike's cells (spike.md), written before any microglia pseudobulk
+        "preregistered_cohorts": {
+            "cohort_30": {"n": 76, "Female": [11, 10, 24], "Male": [9, 11, 11]},
+            "cohort_50": {"n": 63, "Female": [8, 10, 18], "Male": [8, 10, 9]},
+        },
+    },
+}
+# The cluster scripts (scripts/*.sbatch, scripts/sync_pseudobulk.sh) derive a
+# cell type's pseudobulk directory from this rule without importing Python
+for _name, _entry in CELL_TYPES.items():
+    if _entry["results_root"] != ("results" if _name == DEFAULT_CELL_TYPE else f"results/{_name}"):
+        raise AssertionError(f"CELL_TYPES[{_name!r}]['results_root'] breaks the results/<name> rule of the cluster scripts")
+del _name, _entry
+# Preregistered cohort cells per cell type (from the registry)
+PREREGISTERED_COHORTS: dict[str, dict] = {name: entry["preregistered_cohorts"] for name, entry in CELL_TYPES.items()}
 
 # Raw count matrix per omic (h5ad element path)
 MATRIX_SOURCE: dict[str, str] = {"rna": "layers/UMIs", "atac": "X"}
@@ -1043,11 +1105,66 @@ RNA_MIN_GENES = 200
 ADNC_STAGES: dict[str, str] = {"Not AD": "0", "Low": "0", "Intermediate": "1", "High": "2"}
 COHORT_THRESHOLDS: dict[str, int] = {"cohort_30": 30, "cohort_50": 50}
 EXPECTED_DONORS: dict[str, int] = {"rna": 84, "atac": 86}
-PREREGISTERED_COHORTS: dict[str, dict] = {
-    "cohort_30": {"n": 80, "Female": [11, 10, 28], "Male": [9, 10, 12]},
-    "cohort_50": {"n": 74},
-}
 STAGES = ["0", "1", "2"]
+# Default output directories under a cell type's results root
+CELL_TYPE_SUBDIRS: dict[str, str] = {
+    "pseudobulk": "pseudobulk",
+    "motco_input": "motco_input",
+    "motco_analysis": "motco_analysis",
+    "motco_rank_sensitivity": "motco_rank_sensitivity",
+    "motco_diagnostics": "motco_diagnostics",
+    "stage_de": "stage_de",
+    "stage_de_limma": "stage_de_limma",
+    "positive_control": "positive_control",
+}
+
+
+def cell_type_entry(cell_type: str) -> dict:
+    """Return the registry entry of a cell type; raise listing the registered names otherwise."""
+    if cell_type not in CELL_TYPES:
+        raise ValueError(f"Unknown cell type {cell_type!r}; registered cell types: {list(CELL_TYPES)}")
+    return CELL_TYPES[cell_type]
+
+
+def cell_type_dirs(cell_type: str = DEFAULT_CELL_TYPE) -> dict[str, Path]:
+    """Default directories of the MTG steps for a cell type (``<results root>/<subdir>``).
+
+    For ``astrocyte`` the root is ``results`` and the directories are the
+    ones every step used before the registry existed.
+    """
+    root = Path(cell_type_entry(cell_type)["results_root"])
+    return {key: root / sub for key, sub in CELL_TYPE_SUBDIRS.items()}
+
+
+def _resolve_dir(value: str | Path | None, cell_type: str, key: str) -> Path:
+    """An explicit directory, or the cell type's default for ``key``."""
+    return Path(value) if value is not None else cell_type_dirs(cell_type)[key]
+
+
+def check_manifest_cell_type(manifest: dict, path: str | Path, cell_type: str) -> list[str]:
+    """Check the cell type a manifest records against the requested one; return findings.
+
+    A manifest written before the registry existed has no ``cell_type`` key;
+    it is read as ``DEFAULT_CELL_TYPE`` (astrocyte) and that is returned as a
+    finding.
+
+    Raises
+    ------
+    ValueError
+        The recorded cell type differs from ``cell_type``; the message names
+        the file and both cell types.
+    """
+    cell_type_entry(cell_type)
+    recorded = manifest.get("cell_type")
+    if (DEFAULT_CELL_TYPE if recorded is None else recorded) != cell_type:
+        what = f"cell type {recorded!r}" if recorded is not None else f"no cell_type (read as {DEFAULT_CELL_TYPE!r})"
+        raise ValueError(
+            f"{path} records {what} but {cell_type!r} was requested; outputs of one cell type are never read as "
+            "another's; nothing was written"
+        )
+    if recorded is None:
+        return [f"{path} records no cell_type (written before the cell-type registry); read as {DEFAULT_CELL_TYPE!r}"]
+    return []
 
 _RELEASE_RE = re.compile(r"_final-nuclei\.(\d{4}-\d{2}-\d{2})\.h5ad$")
 
@@ -1065,18 +1182,56 @@ def donor_id_of(path: str | Path) -> str:
     return Path(path).name.split("_SEAAD_")[0]
 
 
-def taxonomy_for(path: str | Path) -> dict:
-    """Return the taxonomy mapping of the release a donor object belongs to."""
-    release = release_of(path)
+def release_taxonomy(release: str, cell_type: str = DEFAULT_CELL_TYPE) -> dict:
+    """The taxonomy mapping of one release for a registered cell type.
+
+    Returns
+    -------
+    dict
+        ``omic``, ``cell_type``, ``subclass`` (the population's ``Subclass``
+        label(s)), ``other_subclasses`` (the rest of the release inventory,
+        in inventory order), ``supertypes`` (raw → canonical population
+        labels) and ``other_supertypes`` (the subclass's recorded
+        non-population labels). For ``astrocyte`` the labels are those of the
+        mapping used before the registry existed.
+    """
+    entry = cell_type_entry(cell_type)
     if release not in TAXONOMY:
-        raise ValueError(f"{Path(path).name}: no taxonomy mapping for release {release}")
-    return TAXONOMY[release]
+        raise ValueError(f"no taxonomy mapping for release {release}")
+    population = entry["releases"].get(release)
+    if population is None:
+        raise ValueError(f"cell type {cell_type!r} has no mapping for release {release} in CELL_TYPES")
+    inventory = TAXONOMY[release]["subclasses"]
+    unknown = [s for s in population["subclass"] if s not in inventory]
+    if unknown:
+        raise ValueError(f"CELL_TYPES[{cell_type!r}] names Subclass label(s) {unknown} absent from TAXONOMY[{release!r}]")
+    return {
+        "omic": TAXONOMY[release]["omic"],
+        "cell_type": cell_type,
+        "subclass": list(population["subclass"]),
+        "other_subclasses": [s for s in inventory if s not in population["subclass"]],
+        "supertypes": dict(population["supertypes"]),
+        "other_supertypes": list(population["other_supertypes"]),
+    }
+
+
+def taxonomy_for(path: str | Path, cell_type: str = DEFAULT_CELL_TYPE) -> dict:
+    """Return the taxonomy mapping of the release a donor object belongs to (:func:`release_taxonomy`)."""
+    release = release_of(path)
+    try:
+        return release_taxonomy(release, cell_type)
+    except ValueError as err:
+        raise ValueError(f"{Path(path).name}: {err}") from None
 
 
 def validate_taxonomy(
-    path: str | Path, subclasses: Iterable[str], astro_supertypes: Iterable[str]
+    path: str | Path,
+    subclasses: Iterable[str],
+    population_supertypes: Iterable[str],
+    *,
+    cell_type: str = DEFAULT_CELL_TYPE,
 ) -> None:
-    """Fail on any ``Subclass`` or astrocyte ``Supertype`` label absent from the mapping.
+    """Fail on any ``Subclass`` label, or ``Supertype`` label of the population's subclass, absent from the mapping.
 
     Parameters
     ----------
@@ -1084,19 +1239,23 @@ def validate_taxonomy(
         Donor object, used for the release and the error message.
     subclasses:
         All ``Subclass`` values of the object.
-    astro_supertypes:
-        ``Supertype`` values of the astrocyte nuclei.
+    population_supertypes:
+        ``Supertype`` values of the nuclei in the population's subclass; each
+        must be a population label or a recorded non-population label.
+    cell_type:
+        Registered cell type (default ``astrocyte``).
     """
-    tax = taxonomy_for(path)
-    known = set(tax["astrocyte_subclass"]) | set(tax["other_subclasses"])
+    tax = taxonomy_for(path, cell_type)
+    known = set(tax["subclass"]) | set(tax["other_subclasses"])
     for label in sorted(set(map(str, subclasses)) - known):
         raise ValueError(
             f"{Path(path).name}: Subclass label {label!r} is not in the taxonomy "
             f"mapping for release {release_of(path)}"
         )
-    for label in sorted(set(map(str, astro_supertypes)) - set(tax["supertypes"])):
+    known = set(tax["supertypes"]) | set(tax["other_supertypes"])
+    for label in sorted(set(map(str, population_supertypes)) - known):
         raise ValueError(
-            f"{Path(path).name}: astrocyte Supertype label {label!r} is not in the "
+            f"{Path(path).name}: {cell_type} Supertype label {label!r} is not in the "
             f"taxonomy mapping for release {release_of(path)}"
         )
 
@@ -1163,21 +1322,24 @@ def _features_hash(names: Iterable[str]) -> str:
     return hashlib.sha256("\n".join(map(str, names)).encode()).hexdigest()
 
 
-def select_astrocyte_nuclei(
+def select_nuclei(
     f,
     path: str | Path,
     omic: str,
     *,
+    cell_type: str = DEFAULT_CELL_TYPE,
     min_genes: int = RNA_MIN_GENES,
     reference_features: np.ndarray | None = None,
     read_counts: bool = True,
 ) -> dict:
-    """Select the astrocyte nuclei of one open donor object and read their raw counts.
+    """Select the nuclei of a registered cell type in one open donor object and read their raw counts.
 
     The one nucleus-selection code path of the MTG steps: ``pseudobulk_donor``
     sums what it returns and ``technical_donor`` summarizes the same nuclei,
     so "the same nuclei as the pseudobulk" is a property of the code, not a
-    claim.
+    claim. Nuclei are those whose ``Subclass`` is the population's subclass
+    label and whose ``Supertype`` is one of its population labels
+    (``CELL_TYPES``; every astrocyte supertype for ``astrocyte``).
 
     Parameters
     ----------
@@ -1187,8 +1349,10 @@ def select_astrocyte_nuclei(
         Its path (release, taxonomy mapping and error messages).
     omic:
         ``"rna"`` (counts in ``layers/UMIs``) or ``"atac"`` (counts in ``X``).
+    cell_type:
+        Registered cell type (default ``astrocyte``).
     min_genes:
-        RNA only: astrocyte nuclei with fewer detected genes are dropped.
+        RNA only: selected nuclei with fewer detected genes are dropped.
         ATAC applies no nucleus QC.
     reference_features:
         Ordered feature names the object must match. ``None`` skips the check.
@@ -1200,13 +1364,15 @@ def select_astrocyte_nuclei(
     Returns
     -------
     dict
-        ``donor_id``, ``omic``, ``release``, ``sex``, ``adnc``, ``excluded``
-        (``True`` for ``Reference`` donors), ``n_astro`` (astrocyte nuclei
-        before QC), ``var`` (feature annotations), ``rows`` (``obs`` positions
-        of the selected nuclei, after QC), ``supertypes`` (their raw
-        ``Supertype`` labels) and ``counts`` (their raw counts, nuclei ×
-        features int64 CSR; ``None`` when not read). For an excluded donor
-        ``rows`` and ``supertypes`` are empty and ``counts`` is ``None``.
+        ``donor_id``, ``omic``, ``release``, ``cell_type``, ``sex``, ``adnc``,
+        ``excluded`` (``True`` for ``Reference`` donors), ``n_astro`` (nuclei
+        of the population before QC; the name predates the registry and is
+        kept so existing per-donor caches stay readable), ``var`` (feature
+        annotations), ``rows`` (``obs`` positions of the selected nuclei,
+        after QC), ``supertypes`` (their raw ``Supertype`` labels) and
+        ``counts`` (their raw counts, nuclei × features int64 CSR; ``None``
+        when not read). For an excluded donor ``rows`` and ``supertypes`` are
+        empty and ``counts`` is ``None``.
 
     Notes
     -----
@@ -1218,7 +1384,7 @@ def select_astrocyte_nuclei(
     path = Path(path)
     if omic not in MATRIX_SOURCE:
         raise ValueError(f"Unknown omic {omic!r}")
-    tax = taxonomy_for(path)
+    tax = taxonomy_for(path, cell_type)
     if tax["omic"] != omic:
         raise ValueError(f"{path.name}: release {release_of(path)} is {tax['omic']}, not {omic}")
     if not read_counts and omic == "rna":
@@ -1233,9 +1399,12 @@ def select_astrocyte_nuclei(
     adnc = _single_value(obs[ADNC_COLUMN], path, ADNC_COLUMN)
 
     subclass = obs["Subclass"].astype(str).to_numpy()
-    rows = np.flatnonzero(np.isin(subclass, tax["astrocyte_subclass"]))
-    supertype_raw = obs["Supertype"].astype(str).to_numpy()[rows]
-    validate_taxonomy(path, subclass, supertype_raw)
+    in_subclass = np.flatnonzero(np.isin(subclass, tax["subclass"]))
+    supertype_all = obs["Supertype"].astype(str).to_numpy()[in_subclass]
+    validate_taxonomy(path, subclass, supertype_all, cell_type=cell_type)
+    population = np.isin(supertype_all, list(tax["supertypes"]))
+    rows = in_subclass[population]
+    supertype_raw = supertype_all[population]
 
     var = read_elem(f["var"])
     if reference_features is not None:
@@ -1245,6 +1414,7 @@ def select_astrocyte_nuclei(
         "donor_id": donor,
         "omic": omic,
         "release": release_of(path),
+        "cell_type": cell_type,
         "sex": sex,
         "adnc": adnc,
         "excluded": adnc == "Reference",
@@ -1274,14 +1444,20 @@ def select_astrocyte_nuclei(
     return selection
 
 
+def select_astrocyte_nuclei(f, path: str | Path, omic: str, **kwargs) -> dict:
+    """:func:`select_nuclei` for ``cell_type="astrocyte"`` (the name the MTG steps used before the registry)."""
+    return select_nuclei(f, path, omic, cell_type="astrocyte", **kwargs)
+
+
 def pseudobulk_donor(
     path: str | Path,
     omic: str,
     *,
+    cell_type: str = DEFAULT_CELL_TYPE,
     min_genes: int = RNA_MIN_GENES,
     reference_features: np.ndarray | None = None,
 ) -> dict:
-    """Sum raw counts over the astrocyte nuclei of one donor object.
+    """Sum raw counts over the nuclei of a registered cell type in one donor object.
 
     Parameters
     ----------
@@ -1289,8 +1465,10 @@ def pseudobulk_donor(
         Donor ``.h5ad`` object (one donor per file).
     omic:
         ``"rna"`` (sums ``layers/UMIs``) or ``"atac"`` (sums ``X``).
+    cell_type:
+        Registered cell type (default ``astrocyte``).
     min_genes:
-        RNA only: astrocyte nuclei with fewer detected genes are dropped
+        RNA only: selected nuclei with fewer detected genes are dropped
         before summing. ATAC applies no nucleus QC.
     reference_features:
         Ordered feature names every donor of the omic must match. ``None``
@@ -1299,18 +1477,19 @@ def pseudobulk_donor(
     Returns
     -------
     dict
-        ``donor_id``, ``omic``, ``release``, ``sex``, ``adnc``, ``excluded``
-        (``True`` for ``Reference`` donors), ``n_astro`` (before QC),
-        ``n_nuclei`` (summed), ``supertype_counts`` (canonical → count, all
-        mapped supertypes), ``row`` (1 × features int64 CSR, ``None`` when
-        excluded) and ``var`` (feature annotations).
+        ``donor_id``, ``omic``, ``release``, ``cell_type``, ``sex``, ``adnc``,
+        ``excluded`` (``True`` for ``Reference`` donors), ``n_astro``
+        (population nuclei before QC), ``n_nuclei`` (summed),
+        ``supertype_counts`` (canonical → count, all mapped supertypes),
+        ``row`` (1 × features int64 CSR, ``None`` when excluded) and ``var``
+        (feature annotations).
 
     Notes
     -----
-    The nuclei are selected by :func:`select_astrocyte_nuclei`, the code path
-    shared with the technical-covariates step; this function only sums them.
-    Only ``obs`` columns, ``var`` and the astrocyte rows of the count matrix
-    are read, so the normalized RNA ``X`` is never loaded.
+    The nuclei are selected by :func:`select_nuclei`, the code path shared
+    with the technical-covariates step; this function only sums them. Only
+    ``obs`` columns, ``var`` and the selected rows of the count matrix are
+    read, so the normalized RNA ``X`` is never loaded.
     """
     import h5py
     import scipy.sparse as sp
@@ -1318,19 +1497,20 @@ def pseudobulk_donor(
     path = Path(path)
     if omic not in MATRIX_SOURCE:
         raise ValueError(f"Unknown omic {omic!r}")
-    tax = taxonomy_for(path)
+    tax = taxonomy_for(path, cell_type)
     if tax["omic"] != omic:
         raise ValueError(f"{path.name}: release {release_of(path)} is {tax['omic']}, not {omic}")
 
     with h5py.File(path, "r") as f:
-        sel = select_astrocyte_nuclei(
-            f, path, omic, min_genes=min_genes, reference_features=reference_features
+        sel = select_nuclei(
+            f, path, omic, cell_type=cell_type, min_genes=min_genes, reference_features=reference_features
         )
 
     record = {
         "donor_id": sel["donor_id"],
         "omic": omic,
         "release": sel["release"],
+        "cell_type": cell_type,
         "sex": sel["sex"],
         "adnc": sel["adnc"],
         "excluded": sel["excluded"],
@@ -1368,6 +1548,7 @@ def _save_cache(path: Path, record: dict, features_hash: str, source_key: str) -
         donor_id=record["donor_id"],
         omic=record["omic"],
         release=record["release"],
+        cell_type=record["cell_type"],
         sex=record["sex"],
         adnc=record["adnc"],
         excluded=record["excluded"],
@@ -1389,6 +1570,8 @@ def _load_cache(path: Path) -> dict:
             "donor_id", "omic", "release", "sex", "adnc", "excluded", "n_astro",
             "n_nuclei", "features_hash", "source_key", "n_features",
         )}
+        # Caches written before the cell-type registry hold astrocytes
+        rec["cell_type"] = z["cell_type"].item() if "cell_type" in z.files else DEFAULT_CELL_TYPE
         rec["supertype_counts"] = {
             str(s): int(n) for s, n in zip(z["supertypes"], z["supertype_counts"])
         }
@@ -1510,10 +1693,13 @@ def summarize_cohorts(table: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return pd.DataFrame(rows), info
 
 
-def compare_preregistered(info: dict) -> list[str]:
-    """List deviations of the observed cohorts from the preregistered counts."""
+def compare_preregistered(info: dict, cell_type: str = DEFAULT_CELL_TYPE) -> list[str]:
+    """List deviations of the observed cohorts from the cell type's preregistered counts."""
+    cell_type_entry(cell_type)
     findings = []
-    for cohort, expected in PREREGISTERED_COHORTS.items():
+    if not PREREGISTERED_COHORTS[cell_type]:
+        findings.append(f"no preregistered cohort cells for cell type {cell_type!r} in CELL_TYPES")
+    for cohort, expected in PREREGISTERED_COHORTS[cell_type].items():
         obs = info.get(cohort, {})
         if obs.get("n") != expected["n"]:
             findings.append(f"{cohort}: n = {obs.get('n')}, preregistered {expected['n']}")
@@ -1581,23 +1767,28 @@ def _select_donors(
 def run_pseudobulk(
     *,
     omic: str = "both",
+    cell_type: str = DEFAULT_CELL_TYPE,
     data_root: str | Path | None = None,
-    out_dir: str | Path = "results/pseudobulk",
+    out_dir: str | Path | None = None,
     limit: int | None = None,
     donors: list[str] | None = None,
     force: bool = False,
 ) -> dict:
-    """Build donor-level astrocyte pseudobulks, the donor table and the manifest.
+    """Build donor-level pseudobulks of a registered cell type, the donor table and the manifest.
 
     Parameters
     ----------
     omic:
         ``"rna"``, ``"atac"`` or ``"both"``.
+    cell_type:
+        Registered cell type (``CELL_TYPES``; default ``astrocyte``): the
+        nuclei summed and the default output directory.
     data_root:
         Data root (resolved with :func:`resolve_data_root`). Donor objects
         are read from ``<root>/<MTG_PREFIXES[omic]>``.
     out_dir:
-        Output directory (default ``results/pseudobulk``).
+        Output directory (default ``<results root>/pseudobulk`` of the cell
+        type: ``results/pseudobulk`` for ``astrocyte``).
     limit:
         Process only the first ``limit`` donors (sorted, present in every
         requested omic). Marks the run partial.
@@ -1615,15 +1806,18 @@ def run_pseudobulk(
     -----
     Donor objects are read one at a time and each result is cached under
     ``<out_dir>/per_donor/<omic>/<donor>.npz``; a rerun skips cached donors.
-    Outputs: ``rna_counts.h5ad``, ``atac_counts.h5ad`` (donors × features,
-    int64 CSR), ``donor_table.csv``, ``supertype_composition.csv``,
+    A cached donor of another cell type is an error. Outputs:
+    ``rna_counts.h5ad``, ``atac_counts.h5ad`` (donors × features, int64 CSR),
+    ``donor_table.csv``, ``supertype_composition.csv``,
     ``cohort_summary.csv`` and ``manifest.json``.
     """
     import scipy.sparse as sp
 
+    cell_type_entry(cell_type)
     root = resolve_data_root(data_root)
-    out_dir = Path(out_dir)
+    out_dir = _resolve_dir(out_dir, cell_type, "pseudobulk")
     omics = ["rna", "atac"] if omic == "both" else [omic]
+    print(f"[pseudobulk] Cell type: {cell_type}")
     print(f"[pseudobulk] Data root: {root.resolve()}")
     print(f"[pseudobulk] Output directory: {out_dir}")
 
@@ -1655,10 +1849,15 @@ def run_pseudobulk(
             tag = f"[pseudobulk] {o} {i}/{n} {donor}:"
             if cache.exists() and not force:
                 rec = _load_cache(cache)
+                if rec["cell_type"] != cell_type:
+                    raise ValueError(
+                        f"{cache} holds cell type {rec['cell_type']!r} but {cell_type!r} was requested; use the cell "
+                        "type's own output directory"
+                    )
                 print(f"{tag} cached ({rec['n_nuclei']} nuclei)")
             else:
                 raw = pseudobulk_donor(
-                    path, o,
+                    path, o, cell_type=cell_type,
                     reference_features=None if ref_var is None else ref_var.index.to_numpy(),
                 )
                 if raw["donor_id"] != donor:
@@ -1673,7 +1872,7 @@ def run_pseudobulk(
                 if rec["excluded"]:
                     print(f"{tag} excluded (ADNC Reference)")
                 else:
-                    print(f"{tag} {rec['n_astro']} astrocytes, {rec['n_nuclei']} summed")
+                    print(f"{tag} {rec['n_astro']} {cell_type} nuclei, {rec['n_nuclei']} summed")
                 del raw
                 gc.collect()
             records[o].append(rec)
@@ -1695,7 +1894,7 @@ def run_pseudobulk(
     table, excluded = build_donor_table(meta)
     warnings = check_sex_labels(table, strict=not partial)
     summary, cohort_info = summarize_cohorts(table)
-    findings = compare_preregistered(cohort_info) if not partial else []
+    findings = compare_preregistered(cohort_info, cell_type) if not partial else []
 
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
@@ -1751,6 +1950,7 @@ def run_pseudobulk(
 
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
         "partial": partial,
         "selection": {"omics": omics, "limit": limit, "donors": donors, "force": force},
         "git": _git_revision(),
@@ -1768,9 +1968,9 @@ def run_pseudobulk(
             }
             for o in omics
         },
-        "taxonomy": TAXONOMY,
+        "taxonomy": {r: release_taxonomy(r, cell_type) for r in TAXONOMY},
         "qc": {
-            "rna": {"min_genes": RNA_MIN_GENES, "applied_to": "astrocyte nuclei before summing"},
+            "rna": {"min_genes": RNA_MIN_GENES, "applied_to": f"{cell_type} nuclei before summing"},
             "atac": {"min_genes": None, "note": "release final-nuclei QC only"},
             "nuclei_removed_by_qc": {
                 o: int(sum(r["n_astro"] - r["n_nuclei"] for r in records[o] if not r["excluded"]))
@@ -1783,7 +1983,7 @@ def run_pseudobulk(
         "n_excluded_donors": len(excluded),
         "cohort_thresholds": COHORT_THRESHOLDS,
         "cohorts": cohort_info,
-        "preregistered_cohorts": PREREGISTERED_COHORTS,
+        "preregistered_cohorts": PREREGISTERED_COHORTS[cell_type],
         "findings": findings,
         "warnings": warnings,
         "outputs": {k: v.name for k, v in outputs.items()},
@@ -1979,8 +2179,9 @@ def cross_check_covariates(rna_raw: pd.DataFrame, atac_raw: pd.DataFrame) -> lis
 def run_covariates(
     *,
     omic: str = "both",
+    cell_type: str = DEFAULT_CELL_TYPE,
     data_root: str | Path | None = None,
-    out_dir: str | Path = "results/pseudobulk",
+    out_dir: str | Path | None = None,
 ) -> dict:
     """Write the donor covariate table and its manifest.
 
@@ -1989,10 +2190,15 @@ def run_covariates(
     omic:
         ``"both"`` (RNA values, cross-checked against ATAC) or ``"rna"``
         (no cross-check).
+    cell_type:
+        Registered cell type (default ``astrocyte``). The covariates are
+        donor-level and do not depend on it; it sets the default output
+        directory (beside the cell type's pseudobulk) and is recorded.
     data_root:
         Data root (resolved with :func:`resolve_data_root`).
     out_dir:
-        Output directory (default ``results/pseudobulk``).
+        Output directory (default the cell type's pseudobulk directory,
+        ``results/pseudobulk`` for ``astrocyte``).
 
     Returns
     -------
@@ -2006,9 +2212,11 @@ def run_covariates(
     """
     if omic not in ("rna", "both"):
         raise ValueError(f"omic must be 'rna' or 'both', not {omic!r}")
+    cell_type_entry(cell_type)
     root = resolve_data_root(data_root)
-    out_dir = Path(out_dir)
+    out_dir = _resolve_dir(out_dir, cell_type, "pseudobulk")
     omics = ["rna", "atac"] if omic == "both" else ["rna"]
+    print(f"[covariates] Cell type: {cell_type} (output directory only; the covariates are donor-level)")
     print(f"[covariates] Data root: {root.resolve()}")
     print(f"[covariates] Output directory: {out_dir}")
 
@@ -2055,6 +2263,7 @@ def run_covariates(
     table.to_csv(outputs["covariates"], index=False)
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
         "partial": bool(warnings) or len(omics) < 2,
         "git": _git_revision(),
         "software": _software_versions(),
@@ -2275,11 +2484,12 @@ def technical_donor(
     path: str | Path,
     omic: str,
     *,
+    cell_type: str = DEFAULT_CELL_TYPE,
     gene_sets: dict[str, list[str]] | None = None,
     min_genes: int = RNA_MIN_GENES,
     reference_features: np.ndarray | None = None,
 ) -> dict:
-    """Technical quality summaries of the astrocyte nuclei of one donor object.
+    """Technical quality summaries of the nuclei of a registered cell type in one donor object.
 
     Parameters
     ----------
@@ -2291,15 +2501,16 @@ def technical_donor(
         RNA: set name → gene names (``match_gene_sets`` on the pseudobulk's
         feature set). ``None`` matches ``TECHNICAL_GENE_SETS`` on this
         object's ``var``.
-    min_genes, reference_features:
-        Passed to :func:`select_astrocyte_nuclei`, so the nuclei are exactly
-        the pseudobulk's.
+    cell_type, min_genes, reference_features:
+        Passed to :func:`select_nuclei`, so the nuclei are exactly the
+        pseudobulk's of the same cell type.
 
     Returns
     -------
     dict
         JSON-serializable. Header (``donor_id``, ``omic``, ``release``,
-        ``sex``, ``adnc``, ``excluded``, ``n_astro``, ``n_nuclei``,
+        ``cell_type``, ``sex``, ``adnc``, ``excluded``, ``n_astro``
+        (population nuclei before QC), ``n_nuclei``,
         ``columns``: source column → output name); for a non-excluded donor
         ``supertype_counts``, ``qc`` (output name → ``mean``, ``sd``, ``n``,
         ``n_missing``; ATAC adds ``n_unique`` and ``constant``), and for RNA
@@ -2319,7 +2530,7 @@ def technical_donor(
     over sum of total UMIs, the quantity ``rna_counts.h5ad`` gives), and
     ``supertype_share`` is :func:`supertype_share`. QC columns are summarized
     the same way (nucleus-weighted), so library-level metrics of a donor
-    spanning several libraries become astrocyte-weighted means. ATAC reads
+    spanning several libraries become nucleus-weighted means. ATAC reads
     ``obs`` only; nothing reads the normalized RNA ``X``.
     """
     import h5py
@@ -2329,16 +2540,17 @@ def technical_donor(
         raise ValueError(f"Unknown omic {omic!r}")
     columns = list(TECHNICAL_OBS_COLUMNS[omic])
     with h5py.File(path, "r") as f:
-        sel = select_astrocyte_nuclei(
-            f, path, omic, min_genes=min_genes, reference_features=reference_features,
+        sel = select_nuclei(
+            f, path, omic, cell_type=cell_type, min_genes=min_genes, reference_features=reference_features,
             read_counts=omic == "rna",
         )
         qc = _read_obs_columns(f, columns, path)
-    tax = taxonomy_for(path)
+    tax = taxonomy_for(path, cell_type)
     record = {
         "donor_id": sel["donor_id"],
         "omic": omic,
         "release": sel["release"],
+        "cell_type": cell_type,
         "sex": sel["sex"],
         "adnc": sel["adnc"],
         "excluded": bool(sel["excluded"]),
@@ -2425,7 +2637,8 @@ def _json_number(x) -> float | int | None:
 
 
 def _cross_check_technical(
-    donor: str, rec: dict, pb_fractions: dict, table: pd.DataFrame, pb_dir: Path
+    donor: str, rec: dict, pb_fractions: dict, table: pd.DataFrame, pb_dir: Path,
+    cell_type: str = DEFAULT_CELL_TYPE,
 ) -> dict:
     """Check one RNA technical record against the pseudobulk outputs (design D4).
 
@@ -2468,18 +2681,24 @@ def _cross_check_technical(
     out["pseudobulk_cache"] = str(cache) if cache.exists() else None
     out["pseudobulk_cache_n_nuclei"] = None
     if cache.exists():
-        n_cache = int(_load_cache(cache)["n_nuclei"])
+        cached = _load_cache(cache)
+        if cached["cell_type"] != cell_type:
+            raise ValueError(
+                f"{donor}: the pseudobulk cache {cache} holds cell type {cached['cell_type']!r} but {cell_type!r} "
+                "was requested"
+            )
+        n_cache = int(cached["n_nuclei"])
         out["pseudobulk_cache_n_nuclei"] = n_cache
         if n_cache != rec["n_nuclei"]:
             raise ValueError(
-                f"{donor}: {rec['n_nuclei']} astrocyte nuclei selected but the pseudobulk cache {cache} "
+                f"{donor}: {rec['n_nuclei']} {cell_type} nuclei selected but the pseudobulk cache {cache} "
                 f"records n_nuclei = {n_cache}"
             )
     hit = table.loc[table["donor_id"] == donor, "n_rna"]
     out["donor_table_n_rna"] = int(hit.iloc[0]) if len(hit) else None
     if len(hit) and int(hit.iloc[0]) != rec["n_nuclei"]:
         raise ValueError(
-            f"{donor}: {rec['n_nuclei']} astrocyte nuclei selected but {pb_dir / 'donor_table.csv'} "
+            f"{donor}: {rec['n_nuclei']} {cell_type} nuclei selected but {pb_dir / 'donor_table.csv'} "
             f"records n_rna = {int(hit.iloc[0])}"
         )
     return out
@@ -2488,26 +2707,31 @@ def _cross_check_technical(
 def run_technical_covariates(
     omic: str = "both",
     *,
+    cell_type: str = DEFAULT_CELL_TYPE,
     data_root: str | Path | None = None,
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    out_dir: str | Path = "results/pseudobulk",
+    pseudobulk_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     force: bool = False,
 ) -> dict:
-    """Write the donor technical table of the astrocyte nuclei and its manifest.
+    """Write the donor technical table of a registered cell type's nuclei and its manifest.
 
     Parameters
     ----------
     omic:
         ``"both"`` (RNA objects plus the ATAC library metrics) or ``"rna"``.
+    cell_type:
+        Registered cell type (default ``astrocyte``); the pseudobulk manifest
+        must record the same one.
     data_root:
         Data root (resolved with :func:`resolve_data_root`) holding the MTG
         donor objects.
     pseudobulk_dir:
         Output directory of ``pseudobulk`` (``rna_counts.h5ad``,
         ``donor_table.csv``, ``manifest.json`` are read; the per-donor cache
-        is read when present).
+        is read when present). Default: the cell type's pseudobulk directory.
     out_dir:
-        Output directory (default ``results/pseudobulk``).
+        Output directory (default the cell type's pseudobulk directory,
+        ``results/pseudobulk`` for ``astrocyte``).
     force:
         Recompute donors already in the per-donor cache.
 
@@ -2524,13 +2748,14 @@ def run_technical_covariates(
         names the ``pseudobulk`` command).
     ValueError
         A cross-check fails (``_cross_check_technical``), a cached record was
-        made with different gene sets, QC columns or ``min_genes``, or a
-        donor object's ``Donor ID`` differs from its file name.
+        made with different gene sets, QC columns, ``min_genes`` or cell type,
+        the pseudobulk manifest records another cell type, or a donor
+        object's ``Donor ID`` differs from its file name.
 
     Notes
     -----
-    Per RNA donor object the astrocyte nuclei are selected by
-    :func:`select_astrocyte_nuclei` (the pseudobulk's code path), summarized
+    Per RNA donor object the cell type's nuclei are selected by
+    :func:`select_nuclei` (the pseudobulk's code path), summarized
     by :func:`technical_donor` and cached under
     ``<out_dir>/per_donor_technical/rna/<donor>.json``; a rerun skips cached
     donors. Every donor's UMI-weighted set fractions are compared with the
@@ -2548,9 +2773,10 @@ def run_technical_covariates(
     log = "technical-covariates"
     if omic not in ("rna", "both"):
         raise ValueError(f"omic must be 'rna' or 'both', not {omic!r}")
+    cell_type_entry(cell_type)
     root = resolve_data_root(data_root)
-    pb = Path(pseudobulk_dir)
-    out_dir = Path(out_dir)
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    out_dir = _resolve_dir(out_dir, cell_type, "pseudobulk")
     omics = ["rna", "atac"] if omic == "both" else ["rna"]
     for name in ("rna_counts.h5ad", "donor_table.csv", "manifest.json"):
         if not (pb / name).exists():
@@ -2559,11 +2785,13 @@ def run_technical_covariates(
             )
     cov_files = {name: pb / name for name in ("donor_covariates.csv", "covariates_manifest.json")}
     cov_before = {name: _sha256_file(p) if p.exists() else None for name, p in cov_files.items()}
+    pb_manifest = json.loads((pb / "manifest.json").read_text())
+    cell_type_findings = check_manifest_cell_type(pb_manifest, pb / "manifest.json", cell_type)
+    print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Data root: {root.resolve()}")
     print(f"[{log}] Pseudobulk directory: {pb}")
     print(f"[{log}] Output directory: {out_dir}")
 
-    pb_manifest = json.loads((pb / "manifest.json").read_text())
     table = pd.read_csv(pb / "donor_table.csv", dtype={"donor_id": str, "stage": str, "sex": str})
     counts = ad.read_h5ad(pb / "rna_counts.h5ad")
     rna_names = counts.var_names.astype(str).to_numpy()
@@ -2615,11 +2843,18 @@ def run_technical_covariates(
                         f"{cache}: cached record was made with different gene sets, QC columns or min_genes; "
                         "rerun with --force"
                     )
+                # Records written before the cell-type registry hold astrocytes
+                cached_type = rec.get("cell_type", DEFAULT_CELL_TYPE)
+                if cached_type != cell_type:
+                    raise ValueError(
+                        f"{cache} holds cell type {cached_type!r} but {cell_type!r} was requested; use the cell "
+                        "type's own output directory"
+                    )
                 n_cached[o] += 1
                 print(f"{tag} cached ({rec['n_nuclei']} nuclei)")
             else:
                 rec = technical_donor(
-                    path, o,
+                    path, o, cell_type=cell_type,
                     gene_sets=matched if o == "rna" else None,
                     reference_features=rna_names if o == "rna" else None,
                 )
@@ -2636,12 +2871,12 @@ def run_technical_covariates(
                     print(f"{tag} excluded (ADNC Reference)")
                 elif o == "rna":
                     frac = ", ".join(f"{s} {g['pseudobulk']:.4g}" for s, g in rec["gene_sets"].items())
-                    print(f"{tag} {rec['n_astro']} astrocytes, {rec['n_nuclei']} nuclei, {rec['n_libraries']} libraries; {frac}")
+                    print(f"{tag} {rec['n_astro']} {cell_type} nuclei, {rec['n_nuclei']} selected, {rec['n_libraries']} libraries; {frac}")
                 else:
                     print(f"{tag} {rec['n_nuclei']} nuclei")
             records[o][donor] = rec
             if o == "rna":
-                cross[donor] = _cross_check_technical(donor, rec, pb_fractions, table, pb)
+                cross[donor] = _cross_check_technical(donor, rec, pb_fractions, table, pb, cell_type)
     for d in pb_donors:
         if d not in records["rna"]:
             raise ValueError(
@@ -2720,7 +2955,7 @@ def run_technical_covariates(
         for s in TECHNICAL_GENE_SETS
     }
 
-    findings: list[str] = []
+    findings: list[str] = list(cell_type_findings)
     warnings: list[str] = []
     for o in omics:
         if len(available[o]) != EXPECTED_DONORS[o]:
@@ -2753,6 +2988,7 @@ def run_technical_covariates(
 
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
         "partial": partial,
         "selection": {"omics": omics, "force": force},
         "git": _git_revision(),
@@ -2771,11 +3007,12 @@ def run_technical_covariates(
             for name in cov_files
         },
         "nucleus_selection": {
-            "function": "select_astrocyte_nuclei (shared with pseudobulk_donor)",
+            "function": "select_nuclei (shared with pseudobulk_donor)",
+            "cell_type": cell_type,
             "rna": {"matrix": MATRIX_SOURCE["rna"], "min_genes": RNA_MIN_GENES},
             "atac": {"matrix": None, "note": "obs columns only; the ATAC count matrix is not read"},
             "reference_excluded": True,
-            "taxonomy": TAXONOMY,
+            "taxonomy": {r: release_taxonomy(r, cell_type) for r in TAXONOMY},
         },
         "gene_sets": {
             name: {"patterns": list(TECHNICAL_GENE_SETS[name]), "n_genes": len(genes), "genes": genes}
@@ -2795,9 +3032,9 @@ def run_technical_covariates(
                 f"sum of squares, over the supertypes present; defined when at least two supertypes hold >= "
                 f"{TECHNICAL_MIN_SUPERTYPE_NUCLEI} nuclei each, otherwise empty"
             ),
-            "<qc>_mean, <qc>_sd": "nucleus-weighted mean and sample SD of the obs column over the selected nuclei (library-level columns become astrocyte-weighted means)",
+            "<qc>_mean, <qc>_sd": f"nucleus-weighted mean and sample SD of the obs column over the selected nuclei (library-level columns become {cell_type}-weighted means)",
             "n_libraries_rna": f"distinct values of obs['{TECHNICAL_LIBRARY_COLUMN}'] among the selected nuclei",
-            "atac <qc>_mean": "nucleus-weighted mean over the selected ATAC astrocyte nuclei; 'constant' per donor and column in 'atac_constancy'",
+            "atac <qc>_mean": f"nucleus-weighted mean over the selected ATAC {cell_type} nuclei; 'constant' per donor and column in 'atac_constancy'",
             "between_donor_share": (
                 "share of the pooled per-nucleus variance between donors, over the table's donors: "
                 "sum_d n_d (mean_d - grand)^2 / (that + sum_d (n_d - ddof) sd_d^2)"
@@ -3665,7 +3902,9 @@ _EXPORT_INPUTS = {
 }
 
 
-def check_export_inputs(pseudobulk_dir: str | Path, cohorts: Iterable[str]) -> dict:
+def check_export_inputs(
+    pseudobulk_dir: str | Path, cohorts: Iterable[str], *, cell_type: str = DEFAULT_CELL_TYPE
+) -> dict:
     """Validate the pseudobulk directory before exporting; return its manifest.
 
     Raises
@@ -3673,7 +3912,9 @@ def check_export_inputs(pseudobulk_dir: str | Path, cohorts: Iterable[str]) -> d
     FileNotFoundError
         A required file is missing (naming the command that produces it).
     ValueError
-        The pseudobulk run is partial, or a cohort is unknown or not analysable.
+        The pseudobulk run is partial, its manifest records another cell
+        type than ``cell_type`` (:func:`check_manifest_cell_type`), or a
+        cohort is unknown or not analysable.
     """
     pb = Path(pseudobulk_dir)
     for name, command in _EXPORT_INPUTS.items():
@@ -3682,6 +3923,7 @@ def check_export_inputs(pseudobulk_dir: str | Path, cohorts: Iterable[str]) -> d
                 f"{pb / name} is missing; run `sead-sexdiff {command}` (and sync) to produce it"
             )
     manifest = json.loads((pb / "manifest.json").read_text())
+    check_manifest_cell_type(manifest, pb / "manifest.json", cell_type)
     if manifest.get("partial", True):
         raise ValueError(f"{pb / 'manifest.json'}: the pseudobulk run is partial; export needs a full run")
     for cohort in cohorts:
@@ -3960,6 +4202,8 @@ def _export_cohort(
     variant: dict | None = None,
     debug_dir: Path | None = None,
     log_prefix: str = "export",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    input_findings: Iterable[str] = (),
 ) -> dict:
     """Preprocess one cohort and write its complete MOTCO input directory.
 
@@ -4028,6 +4272,12 @@ def _export_cohort(
         normalized omic (``_write_debug``).
     log_prefix:
         Prefix of the progress lines, ``[export]`` by default.
+    cell_type:
+        The cell type of the pseudobulk (checked by the caller), recorded as
+        the manifest's ``cell_type``.
+    input_findings:
+        Findings from the caller's input checks (such as a pseudobulk
+        manifest without a ``cell_type``), listed first.
 
     Returns
     -------
@@ -4047,7 +4297,7 @@ def _export_cohort(
     donors = sub["donor_id"].to_numpy()
     k, k_cell, cells = smallest_cell(sub)
     print(f"[{log_prefix}] {cohort}: {len(donors)} donors, k = {k} (smallest cell {k_cell})")
-    findings = []
+    findings = list(input_findings)
     n_unmapped = annotation.get("n_rna_unmapped", 0)
     if n_unmapped:
         findings.append(
@@ -4192,7 +4442,7 @@ def _export_cohort(
             "derivation": {
                 "log10_lib_<omic>": "log10 of the donor's counts over the features kept at step 2 of this export "
                                     "(the step-3 library size, tmm.<omic>.<donor>.lib_size_filter)",
-                "<set>_pseudobulk": "donor_technical.csv: the UMI-weighted pseudobulk fraction of the gene set over the donor's astrocyte nuclei",
+                "<set>_pseudobulk": f"donor_technical.csv: the UMI-weighted pseudobulk fraction of the gene set over the donor's {cell_type} nuclei",
             },
             "position": (
                 "after log2-CPM (step 5) and the trend normalization, before the selection step (step 6)"
@@ -4209,6 +4459,7 @@ def _export_cohort(
         }
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
         "cohort": cohort,
         "n_donors": int(len(donors)),
         "blocks": {
@@ -4291,8 +4542,9 @@ def _export_cohort(
 
 def run_export(
     *,
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    out_dir: str | Path = "results/motco_input",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    pseudobulk_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     cohort: str = "all",
     data_root: str | Path | None = None,
     force: bool = False,
@@ -4302,10 +4554,15 @@ def run_export(
 
     Parameters
     ----------
+    cell_type:
+        Registered cell type (default ``astrocyte``): the default
+        directories, and the cell type the pseudobulk manifest must record.
     pseudobulk_dir:
-        Output directory of ``pseudobulk`` and ``covariates``.
+        Output directory of ``pseudobulk`` and ``covariates`` (default the
+        cell type's, ``results/pseudobulk`` for ``astrocyte``).
     out_dir:
-        Export root; each cohort goes to ``<out_dir>/<cohort>/``.
+        Export root; each cohort goes to ``<out_dir>/<cohort>/`` (default
+        the cell type's ``motco_input``).
     cohort:
         ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
     data_root:
@@ -4331,16 +4588,19 @@ def run_export(
     with ``run_preprocessing_sensitivity``, which calls it with one setting
     changed).
     """
-    pb = Path(pseudobulk_dir)
-    out_dir = Path(out_dir)
+    cell_type_entry(cell_type)
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    out_dir = _resolve_dir(out_dir, cell_type, "motco_input")
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
             raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
-    check_export_inputs(pb, cohorts)
+    pb_manifest = check_export_inputs(pb, cohorts, cell_type=cell_type)
+    input_findings = check_manifest_cell_type(pb_manifest, pb / "manifest.json", cell_type)
     for c in cohorts:
         if (out_dir / c).exists() and not force:
             raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+    print(f"[export] Cell type: {cell_type}")
     print(f"[export] Pseudobulk directory: {pb}")
     print(f"[export] Output directory: {out_dir}")
 
@@ -4352,6 +4612,7 @@ def run_export(
             c, sub, inputs["blocks"], inputs["covariates"], inputs["annotation"], inputs["pb_info"],
             out_dir=out_dir, final_name=c, excluded_chromosomes=EXPORT_EXCLUDED_CHROMOSOMES,
             debug_dir=None if debug_dir is None else Path(debug_dir),
+            cell_type=cell_type, input_findings=input_findings,
         )
         results[c] = {"steps": res["manifest"]["feature_counts"], **res}
 
@@ -4781,6 +5042,7 @@ def _analyze_cohort(
     covariates: Iterable[str] = ANALYSIS_COVARIATES,
     covariate_sources: dict[str, str] | None = None,
     extra_inputs: dict | None = None,
+    cell_type: str | None = None,
 ) -> dict:
     """Run MOTCO on one loaded cohort and write a complete analysis directory.
 
@@ -4834,6 +5096,10 @@ def _analyze_cohort(
         technical table), merged into the manifest's ``inputs`` block next to
         ``files``, which stays the five export files so ``axis-diagnostics``
         can check the directory against the export.
+    cell_type:
+        Recorded as the manifest's ``cell_type`` (checked against the export
+        manifest by the caller). ``None`` records the export manifest's,
+        ``astrocyte`` when it has none.
 
     Returns
     -------
@@ -4850,6 +5116,8 @@ def _analyze_cohort(
     covariates = tuple(covariates)
     blocks = loaded["blocks"]
     export_manifest = loaded["export_manifest"]
+    if cell_type is None:
+        cell_type = export_manifest.get("cell_type", DEFAULT_CELL_TYPE)
     final = out_dir / final_name
     published = Path(published_dir) if published_dir is not None else final
     absent = [c for c in covariates if c not in loaded["metadata"].columns]
@@ -4922,6 +5190,7 @@ def _analyze_cohort(
         software["scikit-learn"] = None
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
         "cohort": cohort,
         "n_donors": int(len(metadata)),
         "inputs": {
@@ -5022,8 +5291,9 @@ def _analyze_cohort(
 def run_analysis(
     cohort: str = "all",
     *,
-    input_dir: str | Path = "results/motco_input",
-    out_dir: str | Path = "results/motco_analysis",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    input_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     n_jobs: int = 1,
     force: bool = False,
 ) -> dict:
@@ -5033,10 +5303,15 @@ def run_analysis(
     ----------
     cohort:
         ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    cell_type:
+        Registered cell type (default ``astrocyte``): the default
+        directories, and the cell type every export manifest must record.
     input_dir:
-        Export root; each cohort is read from ``<input_dir>/<cohort>/``.
+        Export root; each cohort is read from ``<input_dir>/<cohort>/``
+        (default the cell type's ``motco_input``).
     out_dir:
-        Analysis root; each cohort goes to ``<out_dir>/<cohort>/``.
+        Analysis root; each cohort goes to ``<out_dir>/<cohort>/`` (default
+        the cell type's ``motco_analysis``).
     n_jobs:
         Parallel jobs for MOTCO's CV and RRPP (``-1`` = all CPUs). MOTCO 0.8.0
         seeds one RRPP stream per worker, so values other than 1 change the
@@ -5065,8 +5340,9 @@ def run_analysis(
     motco_version = check_motco_version()
     from motco.analysis import TrajectoryAnalysisParams
 
-    input_dir = Path(input_dir)
-    out_dir = Path(out_dir)
+    cell_type_entry(cell_type)
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    out_dir = _resolve_dir(out_dir, cell_type, "motco_analysis")
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
@@ -5078,15 +5354,25 @@ def run_analysis(
         if not (input_dir / c).is_dir():
             raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce it")
     print(f"[analyze] MOTCO {motco_version}")
+    print(f"[analyze] Cell type: {cell_type}")
     print(f"[analyze] Input directory: {input_dir}")
     print(f"[analyze] Output directory: {out_dir}")
 
+    # Every cohort's export is read and its cell type checked before anything is written
+    loaded_by_cohort = {}
+    for c in cohorts:
+        loaded = load_analysis_inputs(input_dir / c)
+        findings = check_manifest_cell_type(loaded["export_manifest"], input_dir / c / "manifest.json", cell_type)
+        loaded_by_cohort[c] = (loaded, findings)
     results = {}
     for c in cohorts:
         cohort_dir = input_dir / c
-        loaded = load_analysis_inputs(cohort_dir)
+        loaded, findings = loaded_by_cohort.pop(c)
         params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
-        results[c] = _analyze_cohort(c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs)
+        results[c] = _analyze_cohort(
+            c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs, findings=findings,
+            cell_type=cell_type,
+        )
     return results
 
 
@@ -7711,19 +7997,26 @@ def _analysis_sort_key(label: str) -> tuple[int, int]:
 def run_axis_diagnostics(
     cohort: str = "all",
     *,
-    input_dir: str | Path = "results/motco_input",
-    analysis_dir: str | Path = "results/motco_analysis",
-    rank_dir: str | Path = "results/motco_rank_sensitivity",
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    out_dir: str | Path = "results/motco_diagnostics",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    input_dir: str | Path | None = None,
+    analysis_dir: str | Path | None = None,
+    rank_dir: str | Path | None = None,
+    pseudobulk_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     force: bool = False,
 ) -> dict:
     """Measure what the MOTCO latent axes and block axes correlate with, per cohort.
+
+    Every directory defaults to the cell type's (``cell_type_dirs``), which
+    for ``astrocyte`` are the ``results/`` directories.
 
     Parameters
     ----------
     cohort:
         ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    cell_type:
+        Registered cell type (default ``astrocyte``); every export manifest
+        read must record it.
     input_dir:
         Export root; ``<input_dir>/<cohort>/`` is read (blocks, features,
         metadata, covariates, manifest).
@@ -7768,8 +8061,12 @@ def run_axis_diagnostics(
     import shutil
 
     log = "axis-diagnostics"
-    input_dir, analysis_dir, rank_dir = Path(input_dir), Path(analysis_dir), Path(rank_dir)
-    pb, out_dir = Path(pseudobulk_dir), Path(out_dir)
+    cell_type_entry(cell_type)
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    analysis_dir = _resolve_dir(analysis_dir, cell_type, "motco_analysis")
+    rank_dir = _resolve_dir(rank_dir, cell_type, "motco_rank_sensitivity")
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    out_dir = _resolve_dir(out_dir, cell_type, "motco_diagnostics")
     cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
     for c in cohorts:
         if c not in EXPORT_COHORTS:
@@ -7791,6 +8088,7 @@ def run_axis_diagnostics(
                 raise FileNotFoundError(f"{input_dir / c / name} is missing; run `sead-sexdiff export` to produce it")
         if not (analysis_dir / c).is_dir():
             raise FileNotFoundError(f"{analysis_dir / c} does not exist; run `sead-sexdiff analyze` to produce it")
+    print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Export directory: {input_dir}")
     print(f"[{log}] Analysis directory: {analysis_dir}")
     print(f"[{log}] Rank-sensitivity directory: {rank_dir}")
@@ -7805,8 +8103,10 @@ def run_axis_diagnostics(
     prepared = {}
     for c in cohorts:
         export_dir = input_dir / c
+        rank_findings = check_manifest_cell_type(
+            json.loads((export_dir / "manifest.json").read_text()), export_dir / "manifest.json", cell_type
+        )
         analyses = [(DIAGNOSTIC_PRIMARY_LABEL, _check_analysis_inputs(export_dir, analysis_dir / c))]
-        rank_findings = []
         if (rank_dir / c).is_dir():
             rank_dirs = sorted(p for p in (rank_dir / c).glob("rank_*") if p.is_dir())
             for p in rank_dirs:
@@ -7971,6 +8271,7 @@ def run_axis_diagnostics(
         }
         manifest = {
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cell_type": cell_type,
             "cohort": c,
             "n_donors": int(len(donors)),
             "threshold": DIAGNOSTIC_CORRELATION_THRESHOLD,
@@ -9438,13 +9739,17 @@ def _stage_de_prepare(
     omics: list[str],
     motco_version: str,
     log: str,
+    cell_type: str = DEFAULT_CELL_TYPE,
 ) -> dict:
     """Every check of one cohort before anything is written; the loaded counts, designs and references.
+
+    The export manifest must record ``cell_type`` (:func:`check_manifest_cell_type`).
 
     Returns
     -------
     dict
         ``paths``, ``hashes`` (group → name → sha256 of every input file),
+        ``cell_type_findings``,
         ``loaded`` (``load_analysis_inputs``), ``reference`` (``_check_reference``),
         ``delta_rejected``, ``donors``, ``cells``, ``k``, ``features`` (omic →
         ``features_<omic>.csv``), ``feature_sets`` (omic → abundance / exported
@@ -9471,6 +9776,7 @@ def _stage_de_prepare(
         raise ValueError(f"{pb / 'manifest.json'}: cohort {c} is missing or not analysable")
 
     loaded = load_analysis_inputs(ex_dir)
+    cell_type_findings = check_manifest_cell_type(loaded["export_manifest"], ex_dir / "manifest.json", cell_type)
     hashes["export"].update({name: info["sha256"] for name, info in loaded["inputs"].items()})
     meta = loaded["metadata"]
     # The designs first, so a missing covariate is reported by donor and column
@@ -9595,7 +9901,8 @@ def _stage_de_prepare(
     if delta_rejected is None:
         raise ValueError(f"{an_dir / 'result.json'} has no delta p-value; rerun `sead-sexdiff analyze`")
     return {
-        "paths": paths, "hashes": hashes, "loaded": loaded, "reference": reference, "delta_rejected": delta_rejected,
+        "paths": paths, "hashes": hashes, "cell_type_findings": cell_type_findings, "loaded": loaded,
+        "reference": reference, "delta_rejected": delta_rejected,
         "donors": donors, "cells": cells, "k": k, "features": features, "feature_sets": feature_sets,
         "designs": designs, "design_checks": design_checks, "counts": counts, "exported": exported,
         "reproduction": reproduction,
@@ -9894,10 +10201,11 @@ def run_stage_de(
     cohort: str = "all",
     *,
     omic: str = "both",
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    input_dir: str | Path = "results/motco_input",
-    analysis_dir: str | Path = "results/motco_analysis",
-    out_dir: str | Path = "results/stage_de",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    pseudobulk_dir: str | Path | None = None,
+    input_dir: str | Path | None = None,
+    analysis_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     n_cpus: int = 1,
     force: bool = False,
     debug_dir: str | Path | None = None,
@@ -9912,6 +10220,11 @@ def run_stage_de(
         ``"rna"``, ``"atac"`` or ``"both"``: the omics fitted in this run.
         The summary covers every omic whose fits are complete under the
         cohort directory (an omic fitted earlier from the same inputs is kept).
+    cell_type:
+        Registered cell type (default ``astrocyte``): the default directories
+        (``cell_type_dirs``), and the cell type every export manifest read
+        must record. It is recorded in the manifest, not in the fit records'
+        fingerprints (their input hashes already differ between cell types).
     pseudobulk_dir:
         Directory holding ``rna_counts.h5ad``, ``atac_counts.h5ad``,
         ``donor_table.csv`` and ``manifest.json`` (read, never written).
@@ -9985,7 +10298,11 @@ def run_stage_de(
             raise ValueError(f"Unknown omic {o!r}; expected one of {_STAGE_DE_OMICS} or 'both'")
     if not isinstance(n_cpus, int) or n_cpus < 1:
         raise ValueError(f"n_cpus must be a positive integer, not {n_cpus!r}")
-    pb, input_dir, analysis_dir, out_dir = Path(pseudobulk_dir), Path(input_dir), Path(analysis_dir), Path(out_dir)
+    cell_type_entry(cell_type)
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    analysis_dir = _resolve_dir(analysis_dir, cell_type, "motco_analysis")
+    out_dir = _resolve_dir(out_dir, cell_type, "stage_de")
     debug = None if debug_dir is None else Path(debug_dir)
     for target_name, target in (("--out-dir", out_dir), ("debug_dir", debug)):
         if target is None:
@@ -9997,6 +10314,7 @@ def run_stage_de(
                     "under its inputs; nothing was written"
                 )
     motco_version = check_motco_version()
+    print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Pseudobulk directory: {pb}")
     print(f"[{log}] Primary export directory: {input_dir}")
     print(f"[{log}] Primary analysis directory: {analysis_dir} (read and checked; it stays primary)")
@@ -10011,7 +10329,7 @@ def run_stage_de(
     for c in cohorts:
         prep = _stage_de_prepare(
             c, pseudobulk_dir=pb, input_dir=input_dir, analysis_dir=analysis_dir, omics=omics,
-            motco_version=motco_version, log=log,
+            motco_version=motco_version, log=log, cell_type=cell_type,
         )
         prep["fingerprints"] = {
             o: {m: _stage_de_fingerprint(prep, c, o, m) for m in STAGE_DE_MODELS} for o in _STAGE_DE_OMICS
@@ -10154,7 +10472,7 @@ def run_stage_de(
             rows += _stage_de_summary_rows(c, o, tables[o], prep["delta_rejected"])
         summary = pd.DataFrame(rows, columns=list(STAGE_DE_SUMMARY_COLUMNS))
         rule = STAGE_DE_CONCORDANCE_RULE
-        concordance, findings = {}, []
+        concordance, findings = {}, list(prep["cell_type_findings"])
         for o in included:
             cell = summary[
                 (summary["omic"] == o) & (summary["model"] == rule["model"])
@@ -10213,6 +10531,7 @@ def run_stage_de(
         ref_record = reference["record"]
         manifest = {
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cell_type": cell_type,
             "cohort": c,
             "n_donors": len(prep["donors"]),
             "cells": prep["cells"],
@@ -10888,10 +11207,14 @@ def _read_stage_de_table(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, dtype={"feature": str}, keep_default_na=False, na_values=[""], float_precision="round_trip")
 
 
-def _stage_de_limma_deseq2_reference(deseq2_dir: Path, cohort: str, prep: dict) -> dict:
+def _stage_de_limma_deseq2_reference(
+    deseq2_dir: Path, cohort: str, prep: dict, *, cell_type: str = DEFAULT_CELL_TYPE
+) -> dict:
     """Read the DESeq2 stage-DE outputs of one cohort and check they belong to the inputs now on disk (design D10).
 
-    Raises a ``FileNotFoundError`` or ``ValueError`` naming the file and the
+    The DESeq2 manifest must record ``cell_type`` (checked first, so a
+    DESeq2 directory of another cell type is named as such). Raises a
+    ``FileNotFoundError`` or ``ValueError`` naming the file and the
     ``stage-de`` command; nothing is written under ``deseq2_dir``.
     """
     d = deseq2_dir / cohort
@@ -10902,6 +11225,7 @@ def _stage_de_limma_deseq2_reference(deseq2_dir: Path, cohort: str, prep: dict) 
             raise FileNotFoundError(f"{p} is missing; run `sead-sexdiff stage-de` (DESeq2) to produce it; nothing was written")
     files = {str(p.relative_to(d)): _sha256_file(p) for p in sorted(d.rglob("*")) if p.is_file()}
     manifest = json.loads(manifest_path.read_text())
+    cell_type_findings = check_manifest_cell_type(manifest, manifest_path, cell_type)
     if not manifest.get("complete") or sorted(manifest.get("omics", [])) != sorted(_STAGE_DE_OMICS):
         raise ValueError(
             f"{manifest_path} is not complete for both omics (complete = {manifest.get('complete')}, omics "
@@ -10975,7 +11299,7 @@ def _stage_de_limma_deseq2_reference(deseq2_dir: Path, cohort: str, prep: dict) 
     return {
         "dir": d, "manifest": manifest, "files": files, "tables": tables, "summary": recomputed, "concordance": cells,
         "manifest_sha256": files[STAGE_DE_MANIFEST], "summary_sha256": files[STAGE_DE_SUMMARY],
-        "software": manifest.get("software", {}),
+        "software": manifest.get("software", {}), "cell_type_findings": cell_type_findings,
     }
 
 
@@ -11312,11 +11636,12 @@ def run_stage_de_limma(
     cohort: str = "all",
     *,
     omic: str = "both",
-    pseudobulk_dir: str | Path = "results/pseudobulk",
-    input_dir: str | Path = "results/motco_input",
-    analysis_dir: str | Path = "results/motco_analysis",
-    deseq2_dir: str | Path = "results/stage_de",
-    out_dir: str | Path = "results/stage_de_limma",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    pseudobulk_dir: str | Path | None = None,
+    input_dir: str | Path | None = None,
+    analysis_dir: str | Path | None = None,
+    deseq2_dir: str | Path | None = None,
+    out_dir: str | Path | None = None,
     force: bool = False,
     debug_dir: str | Path | None = None,
 ) -> dict:
@@ -11396,8 +11721,12 @@ def run_stage_de_limma(
     for o in omics:
         if o not in _STAGE_DE_OMICS:
             raise ValueError(f"Unknown omic {o!r}; expected one of {_STAGE_DE_OMICS} or 'both'")
-    pb, input_dir, analysis_dir = Path(pseudobulk_dir), Path(input_dir), Path(analysis_dir)
-    deseq2_dir, out_dir = Path(deseq2_dir), Path(out_dir)
+    cell_type_entry(cell_type)
+    pb = _resolve_dir(pseudobulk_dir, cell_type, "pseudobulk")
+    input_dir = _resolve_dir(input_dir, cell_type, "motco_input")
+    analysis_dir = _resolve_dir(analysis_dir, cell_type, "motco_analysis")
+    deseq2_dir = _resolve_dir(deseq2_dir, cell_type, "stage_de")
+    out_dir = _resolve_dir(out_dir, cell_type, "stage_de_limma")
     debug = None if debug_dir is None else Path(debug_dir)
     for target_name, target in (("--out-dir", out_dir), ("debug_dir", debug)):
         if target is None:
@@ -11411,6 +11740,7 @@ def run_stage_de_limma(
                 )
     versions = stage_de_limma_versions()
     motco_version = check_motco_version()
+    print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Pseudobulk directory: {pb}")
     print(f"[{log}] Primary export directory: {input_dir}")
     print(f"[{log}] Primary analysis directory: {analysis_dir} (read and checked; it stays primary)")
@@ -11430,9 +11760,9 @@ def run_stage_de_limma(
         for c in cohorts:
             prep = _stage_de_prepare(
                 c, pseudobulk_dir=pb, input_dir=input_dir, analysis_dir=analysis_dir, omics=omics,
-                motco_version=motco_version, log=log,
+                motco_version=motco_version, log=log, cell_type=cell_type,
             )
-            prep["deseq2"] = _stage_de_limma_deseq2_reference(deseq2_dir, c, prep)
+            prep["deseq2"] = _stage_de_limma_deseq2_reference(deseq2_dir, c, prep, cell_type=cell_type)
             print(
                 f"[{log}] {c}: DESeq2 outputs {prep['deseq2']['dir']} match the inputs (hashes, tables, summary, "
                 "concordance cells)"
@@ -11575,7 +11905,7 @@ def run_stage_de_limma(
                 rows += _stage_de_limma_summary_rows(c, o, tables[o], prep["delta_rejected"])
             summary = pd.DataFrame(rows, columns=list(STAGE_DE_LIMMA_SUMMARY_COLUMNS))
             rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
-            concordance, findings = {}, []
+            concordance, findings = {}, list(prep["cell_type_findings"]) + list(prep["deseq2"]["cell_type_findings"])
             for o in included:
                 cell = summary[
                     (summary["omic"] == o) & (summary["model"] == rule["model"])
@@ -11655,6 +11985,7 @@ def run_stage_de_limma(
             any_fit = {o: records[o][next(iter(STAGE_DE_MODELS))]["fit"] for o in included}
             manifest = {
                 "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "cell_type": cell_type,
                 "cohort": c,
                 "n_donors": len(prep["donors"]),
                 "cells": prep["cells"],
@@ -11820,6 +12151,471 @@ def run_stage_de_limma(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Cell-type positive control (microglia against astrocytes)
+# ---------------------------------------------------------------------------
+
+# Roles of the two cell types: the control has a documented ADNC-stage
+# response; the reference is the case-study cell type, whose outputs are read
+# and never rerun.
+POSITIVE_CONTROL_CELL_TYPES: dict[str, str] = {"control": "microglia", "reference": "astrocyte"}
+POSITIVE_CONTROL_PRIMARY_COHORT = "cohort_30"
+# ``source`` values of axis_correlations.csv that are technical variables for
+# E3: the technical table's columns and the export's TMM factors and library
+# sizes (DIAGNOSTIC_VARIABLES' ``technical`` and ``export`` groups). The six
+# analysis covariates (covariates.csv) and ``male`` (metadata.csv) are not.
+POSITIVE_CONTROL_TECHNICAL_SOURCES = ("donor_technical.csv", "manifest.json (export, tmm)")
+# Written before any microglia run (proposal, design D7) and never changed
+# from results. No expectation reads a p-value, a rejection status or a
+# trajectory statistic; the values are compared, not tested.
+POSITIVE_CONTROL_EXPECTATIONS: dict[str, dict] = {
+    "E1": {
+        "name": "stage signal",
+        "statement": (
+            "under each stage-DE method, the number of exported RNA features with a stage effect at FDR "
+            f"{STAGE_DE_ALPHA} is larger for the control than for the reference, compared within the method"
+        ),
+        "methods": {
+            "deseq2": {
+                "command": "stage-de", "subdir": CELL_TYPE_SUBDIRS["stage_de"], "summary": STAGE_DE_SUMMARY,
+                "manifest": STAGE_DE_MANIFEST, "omic": "rna", "model": "factor_additive",
+                "coefficient": STAGE_DE_UNION, "feature_set": "exported", "value": "n_significant",
+            },
+            "limma": {
+                "command": "stage-de-limma", "subdir": CELL_TYPE_SUBDIRS["stage_de_limma"],
+                "summary": STAGE_DE_LIMMA_SUMMARY, "manifest": STAGE_DE_LIMMA_MANIFEST, "omic": "rna",
+                "model": "factor_additive", "coefficient": STAGE_DE_LIMMA_JOINT_TESTS["factor_additive"][0],
+                "feature_set": "exported", "value": "n_significant",
+            },
+        },
+        "comparison": "control > reference, within each method",
+        "rule": (
+            "holds only when it holds under both methods; when it holds under one only it is method_dependent, "
+            "which counts as not holding, and the method under which it held is named"
+        ),
+    },
+    "E2": {
+        "name": "latent separation",
+        "statement": "the control's primary analysis has a larger CV mean AUROC than the reference's",
+        "subdir": CELL_TYPE_SUBDIRS["motco_analysis"],
+        "file": "result.json",
+        "value": "latent.cv_mean_auroc",
+        "comparison": "control > reference",
+    },
+    "E3": {
+        "name": "axis identity",
+        "statement": (
+            "along the first latent component of the control's primary analysis, |Spearman| with stage exceeds "
+            "|Spearman| with every technical variable of the diagnostic's variable set"
+        ),
+        "subdir": CELL_TYPE_SUBDIRS["motco_diagnostics"],
+        "file": DIAGNOSTIC_OUTPUTS["axis"],
+        "analysis": DIAGNOSTIC_PRIMARY_LABEL,
+        "component": "pls_0",
+        "value": "spearman (raw, not partial)",
+        "stage_variable": "stage",
+        "technical_sources": list(POSITIVE_CONTROL_TECHNICAL_SOURCES),
+        "comparison": "|rho(stage)| > max |rho(technical)|, control only",
+    },
+}
+POSITIVE_CONTROL_RULE = (
+    "the control holds when E1, E2 and E3 all hold in the primary cohort (POSITIVE_CONTROL_PRIMARY_COHORT); if it "
+    "holds, the pipeline resolves stage structure on real data and the reference's null is not a pipeline failure; "
+    "if not, the latent construction is in question for any cell type"
+)
+POSITIVE_CONTROL_TABLE = "positive_control.csv"
+POSITIVE_CONTROL_MARKDOWN = "positive_control.md"
+POSITIVE_CONTROL_MANIFEST = "positive_control_manifest.json"
+POSITIVE_CONTROL_COLUMNS = (
+    "cohort", "primary_cohort", "expectation", "method", "quantity", "control", "control_value", "reference",
+    "reference_value", "comparison", "holds", "outcome", "detail",
+)
+
+
+def _positive_control_read(root: Path, cohort: str, role: str, *, diagnostics: bool) -> dict:
+    """Read and check one root's files of one cohort for the positive control (design D7).
+
+    Checks the cell type of every manifest read (``POSITIVE_CONTROL_CELL_TYPES[role]``)
+    and the chain: both stage-DE steps and the diagnostic were made from the
+    analysis read for E2 (``result.json`` sha256), and the limma step from
+    the DESeq2 summary read for E1.
+
+    Returns
+    -------
+    dict
+        ``files`` (label → path and sha256), ``findings``, ``e1`` (method →
+        the summary row's ``n_significant`` and ``n_tested``), ``e2``
+        (``cv_mean_auroc``) and, with ``diagnostics``, ``e3`` (the primary
+        ``pls_0`` rows of ``axis_correlations.csv``).
+    """
+    cell_type = POSITIVE_CONTROL_CELL_TYPES[role]
+    flag = "" if cell_type == DEFAULT_CELL_TYPE else f" --cell-type {cell_type}"
+    files, findings = {}, []
+
+    def need(path: Path, command: str) -> Path:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} is missing ({role} root, cell type {cell_type}); run `sead-sexdiff {command}{flag}` to "
+                "produce it; nothing was written"
+            )
+        files[str(path.relative_to(root))] = {"path": str(path), "sha256": _sha256_file(path)}
+        return path
+
+    def manifest(path: Path, command: str) -> dict:
+        m = json.loads(need(path, command).read_text())
+        findings.extend(check_manifest_cell_type(m, path, cell_type))
+        return m
+
+    an_dir = root / CELL_TYPE_SUBDIRS["motco_analysis"] / cohort
+    result_path = need(an_dir / "result.json", "analyze")
+    an_manifest = manifest(an_dir / "analysis_manifest.json", "analyze")
+    record = json.loads(result_path.read_text())
+    if record.get("latent", {}).get("component_selection") != "cv":
+        raise ValueError(f"{result_path} is not a CV-selected analysis; the positive control reads the primary analysis")
+    result_sha = files[str(result_path.relative_to(root))]["sha256"]
+    auroc = record["latent"].get("cv_mean_auroc")
+    if auroc is None:
+        raise ValueError(f"{result_path} records no latent.cv_mean_auroc")
+    export_sha = an_manifest.get("inputs", {}).get("export_manifest_sha256")
+
+    e1, summaries = {}, {}
+    for method, spec in POSITIVE_CONTROL_EXPECTATIONS["E1"]["methods"].items():
+        d = root / spec["subdir"] / cohort
+        summary_path = need(d / spec["summary"], spec["command"])
+        m = manifest(d / spec["manifest"], spec["command"])
+        if not m.get("complete") or spec["omic"] not in m.get("omics", []):
+            raise ValueError(f"{d / spec['manifest']} is not complete for {spec['omic']}; run `sead-sexdiff {spec['command']}{flag}`")
+        ref_sha = m.get("reference", {}).get("result_sha256")
+        if ref_sha != result_sha:
+            raise ValueError(
+                f"{d / spec['manifest']} was made against an analysis with result.json sha256 {ref_sha}, not "
+                f"{result_path} ({result_sha}); rerun `sead-sexdiff {spec['command']}{flag}`"
+            )
+        if m.get("inputs", {}).get("export_manifest_sha256") != export_sha:
+            raise ValueError(f"{d / spec['manifest']} and {an_dir / 'analysis_manifest.json'} record different export manifests")
+        summary = pd.read_csv(summary_path, dtype={"design_column": str})
+        summaries[method] = files[str(summary_path.relative_to(root))]["sha256"]
+        row = summary[
+            (summary["omic"] == spec["omic"]) & (summary["model"] == spec["model"])
+            & (summary["coefficient"] == spec["coefficient"]) & (summary["feature_set"] == spec["feature_set"])
+        ]
+        if len(row) != 1:
+            raise ValueError(
+                f"{summary_path} has {len(row)} row(s) for {spec['omic']} {spec['model']} {spec['coefficient']} "
+                f"({spec['feature_set']}); expected one"
+            )
+        e1[method] = {"n_significant": int(row[spec["value"]].iloc[0]), "n_tested": int(row["n_tested"].iloc[0])}
+        if method == "limma":
+            recorded = m.get("inputs", {}).get("deseq2", {}).get("summary_sha256")
+            if recorded != summaries["deseq2"]:
+                raise ValueError(
+                    f"{d / spec['manifest']} checked a DESeq2 summary with sha256 {recorded}, not the one read for E1 "
+                    f"({summaries['deseq2']}); rerun `sead-sexdiff stage-de-limma{flag}`"
+                )
+    out = {"files": files, "findings": findings, "e1": e1, "e2": float(auroc)}
+
+    if diagnostics:
+        spec = POSITIVE_CONTROL_EXPECTATIONS["E3"]
+        d = root / spec["subdir"] / cohort
+        axis_path = need(d / spec["file"], "axis-diagnostics")
+        m = manifest(d / DIAGNOSTIC_OUTPUTS["manifest"], "axis-diagnostics")
+        primary = [a for a in m.get("inputs", {}).get("analyses", []) if a.get("label") == spec["analysis"]]
+        if len(primary) != 1 or primary[0].get("files", {}).get("result.json", {}).get("sha256") != result_sha:
+            raise ValueError(
+                f"{d / DIAGNOSTIC_OUTPUTS['manifest']} was not made from {result_path}; rerun "
+                f"`sead-sexdiff axis-diagnostics{flag}`"
+            )
+        if m.get("inputs", {}).get("technical", {}).get("manifest", {}).get("matches_export") is not True:
+            raise ValueError(
+                f"{d / DIAGNOSTIC_OUTPUTS['manifest']}: the technical table was not made from the export's pseudobulk "
+                "(inputs.technical.manifest.matches_export is not true); E3 needs the cell type's own technical table"
+            )
+        axis = pd.read_csv(axis_path, dtype={"variable": str, "source": str, "analysis": str, "component": str})
+        out["e3"] = axis[(axis["analysis"] == spec["analysis"]) & (axis["component"] == spec["component"])].reset_index(drop=True)
+    return out
+
+
+def _positive_control_rows(cohort: str, control: dict, reference: dict) -> tuple[list[dict], dict]:
+    """The rows of ``positive_control.csv`` for one cohort and the outcomes (E1 per method, E1, E2, E3, overall)."""
+    types = POSITIVE_CONTROL_CELL_TYPES
+    primary = cohort == POSITIVE_CONTROL_PRIMARY_COHORT
+    rows, outcomes, findings = [], {}, []
+    base = {"cohort": cohort, "primary_cohort": primary}
+
+    held = {}
+    for method, spec in POSITIVE_CONTROL_EXPECTATIONS["E1"]["methods"].items():
+        a, b = control["e1"][method]["n_significant"], reference["e1"][method]["n_significant"]
+        held[method] = a > b
+        rows.append({
+            **base, "expectation": "E1", "method": method,
+            "quantity": f"exported {spec['omic'].upper()} features at FDR {STAGE_DE_ALPHA}: {spec['model']} {spec['coefficient']}",
+            "control": types["control"], "control_value": a, "reference": types["reference"], "reference_value": b,
+            "comparison": ">", "holds": held[method], "outcome": "holds" if held[method] else "fails",
+            "detail": f"tested {control['e1'][method]['n_tested']} (control), {reference['e1'][method]['n_tested']} (reference)",
+        })
+    if all(held.values()):
+        e1 = "holds"
+        detail = "holds under both methods"
+    elif any(held.values()):
+        e1 = "method_dependent"
+        detail = "held under " + ", ".join(m for m, h in held.items() if h) + " only; counts as not holding"
+    else:
+        e1 = "fails"
+        detail = "holds under neither method"
+    outcomes["E1"] = e1
+    outcomes["E1_methods"] = held
+    rows.append({
+        **base, "expectation": "E1", "method": "both", "quantity": "E1 under both stage-DE methods",
+        "control": "", "control_value": None, "reference": "", "reference_value": None,
+        "comparison": "both hold", "holds": e1 == "holds", "outcome": e1, "detail": detail,
+    })
+
+    a, b = control["e2"], reference["e2"]
+    outcomes["E2"] = "holds" if a > b else "fails"
+    rows.append({
+        **base, "expectation": "E2", "method": "", "quantity": "CV mean AUROC of the primary analysis (latent.cv_mean_auroc)",
+        "control": types["control"], "control_value": a, "reference": types["reference"], "reference_value": b,
+        "comparison": ">", "holds": a > b, "outcome": outcomes["E2"], "detail": "",
+    })
+
+    spec = POSITIVE_CONTROL_EXPECTATIONS["E3"]
+    t = control["e3"]
+    stage = t[t["variable"] == spec["stage_variable"]]
+    if len(stage) != 1 or not np.isfinite(stage["spearman"].iloc[0]):
+        raise ValueError(f"axis_correlations.csv has no single finite {spec['stage_variable']} row for {cohort} {spec['component']}")
+    technical = t[t["source"].isin(spec["technical_sources"])]
+    if technical.empty:
+        raise ValueError(f"axis_correlations.csv has no technical variable row for {cohort} {spec['component']}")
+    finite = technical[np.isfinite(technical["spearman"].to_numpy(dtype=float))]
+    if len(finite) < len(technical):
+        findings.append(
+            f"{cohort}: E3 technical variable(s) with an undefined Spearman correlation are not compared: "
+            f"{sorted(technical.loc[~technical.index.isin(finite.index), 'variable'])}"
+        )
+    abs_rho = finite["spearman"].abs()
+    top = finite.loc[abs_rho.idxmax()]
+    a, b = float(abs(stage["spearman"].iloc[0])), float(abs(top["spearman"]))
+    outcomes["E3"] = "holds" if a > b else "fails"
+    outcomes["E3_technical_max"] = {"variable": str(top["variable"]), "source": str(top["source"]), "abs_spearman": b}
+    rows.append({
+        **base, "expectation": "E3", "method": "",
+        "quantity": f"|Spearman| of {spec['component']} ({spec['analysis']}) with stage vs the largest with a technical variable",
+        "control": spec["stage_variable"], "control_value": a, "reference": str(top["variable"]), "reference_value": b,
+        "comparison": ">", "holds": a > b, "outcome": outcomes["E3"],
+        "detail": f"{len(finite)} technical variables compared ({', '.join(spec['technical_sources'])})",
+    })
+
+    failing = [e for e in ("E1", "E2", "E3") if outcomes[e] != "holds"]
+    overall = not failing
+    outcomes["all_hold"] = overall
+    outcomes["failing"] = failing
+    rows.append({
+        **base, "expectation": "overall", "method": "", "quantity": "E1, E2 and E3 all hold",
+        "control": "", "control_value": None, "reference": "", "reference_value": None, "comparison": "all hold",
+        "holds": overall, "outcome": "holds" if overall else "does_not_hold",
+        "detail": ("the primary cohort: this row is the control's outcome" if primary
+                   else f"not the primary cohort ({POSITIVE_CONTROL_PRIMARY_COHORT}); descriptive")
+                  + ("" if overall else "; not holding: " + ", ".join(failing)),
+    })
+    return rows, {**outcomes, "findings": findings}
+
+
+def render_positive_control(table: pd.DataFrame, manifest: dict) -> str:
+    """Render ``positive_control.md`` from the written table and the manifest."""
+    c = manifest["cohort"]
+    types = manifest["cell_types"]
+    overall = table[table["expectation"] == "overall"].iloc[0]
+    lines = [
+        f"# Positive control: {types['control']} against {types['reference']} ({c})",
+        "",
+        f"Predeclared expectations (POSITIVE_CONTROL_EXPECTATIONS), evaluated from the generated files of both cell "
+        f"types. {POSITIVE_CONTROL_RULE[0].upper() + POSITIVE_CONTROL_RULE[1:]}. No expectation reads a p-value, a "
+        "rejection status or a trajectory statistic; the values are compared, not tested.",
+        "",
+        f"This is a positive control for the stage signal, not for the sex × stage hypothesis: the "
+        f"{types['control']} trajectory result is read under the same binding rules as the {types['reference']} one, "
+        f"and nothing here changes any {types['reference']} output or reading.",
+        "",
+        ("**Primary cohort.** " if manifest["primary_cohort"] else f"**Not the primary cohort** "
+         f"({POSITIVE_CONTROL_PRIMARY_COHORT} is): descriptive. ")
+        + f"Overall: **{overall['outcome'].replace('_', ' ')}**"
+        + ("" if bool(overall["holds"]) else f" ({', '.join(manifest['outcomes']['failing'])} not holding)") + ".",
+        "",
+        "| Expectation | Method | Quantity | Control | Value | Compared with | Value | Holds | Outcome | Detail |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    def cell(v, spec=".6g"):
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            return ""
+        return format(v, spec) if isinstance(v, float) else str(v).replace("|", "\\|")
+
+    for r in table.to_dict("records"):
+        lines.append(
+            f"| {r['expectation']} | {cell(r['method'])} | {cell(r['quantity'])} | {cell(r['control'])} | "
+            f"{cell(r['control_value'])} | {cell(r['reference'])} | {cell(r['reference_value'])} | "
+            f"{'yes' if r['holds'] else 'no'} | {r['outcome']} | {cell(r['detail'])} |"
+        )
+    lines += ["", "## Expectations", ""]
+    for key, spec in POSITIVE_CONTROL_EXPECTATIONS.items():
+        lines.append(f"- **{key} ({spec['name']})**: {spec['statement']}." + (f" {spec['rule'][0].upper() + spec['rule'][1:]}." if "rule" in spec else ""))
+    lines += ["", "## Inputs", ""]
+    for role in ("control", "reference"):
+        info = manifest["inputs"][role]
+        lines.append(f"- {role} ({types[role]}): `{info['root']}`")
+        for rel, f in info["files"].items():
+            lines.append(f"  - `{rel}` sha256 `{f['sha256'][:12]}…`")
+    if manifest["findings"]:
+        lines += ["", "## Findings", ""] + [f"- {msg}" for msg in manifest["findings"]]
+    return "\n".join(lines) + "\n"
+
+
+def run_positive_control(
+    cohort: str = "all",
+    *,
+    control_root: str | Path | None = None,
+    reference_root: str | Path | None = None,
+    out_dir: str | Path | None = None,
+    force: bool = False,
+) -> dict:
+    """Evaluate the predeclared positive-control expectations E1–E3 per cohort (design D7).
+
+    Parameters
+    ----------
+    cohort:
+        ``"cohort_30"``, ``"cohort_50"`` or ``"all"``.
+    control_root:
+        Results root of the control cell type (``POSITIVE_CONTROL_CELL_TYPES["control"]``,
+        default its registry root ``results/microglia``): ``stage_de/``,
+        ``stage_de_limma/``, ``motco_analysis/`` and ``motco_diagnostics/``
+        are read; every manifest must record the control cell type.
+    reference_root:
+        Results root of the reference cell type (default ``results``):
+        ``stage_de/``, ``stage_de_limma/`` and ``motco_analysis/`` are read;
+        every manifest must record the reference cell type (a manifest with
+        no ``cell_type`` reads as astrocyte, with a finding).
+    out_dir:
+        Output root; each cohort goes to ``<out_dir>/<cohort>/`` (default
+        ``<control_root>/positive_control``).
+    force:
+        Replace existing cohort directories.
+
+    Returns
+    -------
+    dict
+        Cohort → ``{"dir", "table", "manifest", "outcomes"}``.
+
+    Raises
+    ------
+    FileNotFoundError
+        A summary, analysis or diagnostic file is missing; the message names
+        it and the command that produces it.
+    ValueError
+        A manifest records another cell type than its root's role, or the
+        chain does not hold (the stage-DE steps or the diagnostic were made
+        from another analysis, the limma step checked another DESeq2
+        summary, the technical table belongs to another pseudobulk).
+
+    Notes
+    -----
+    E1 compares the control's and the reference's exported RNA stage counts
+    within each stage-DE method (DESeq2 ``factor_additive`` union, limma
+    ``stage_joint``) and holds only under both; E2 compares the primary
+    analyses' CV mean AUROC; E3 compares, along the control's first latent
+    component, |Spearman| with stage against the largest |Spearman| with a
+    technical variable (``POSITIVE_CONTROL_TECHNICAL_SOURCES``). The overall
+    outcome holds when all three hold; it is the control's outcome in
+    ``POSITIVE_CONTROL_PRIMARY_COHORT``. Every check of every cohort runs
+    before anything is written; each cohort is written to ``<cohort>.tmp/``
+    and renamed.
+    """
+    import shutil
+
+    log = "positive-control"
+    types = POSITIVE_CONTROL_CELL_TYPES
+    control_root = Path(control_root) if control_root is not None else Path(cell_type_entry(types["control"])["results_root"])
+    reference_root = (
+        Path(reference_root) if reference_root is not None else Path(cell_type_entry(types["reference"])["results_root"])
+    )
+    out_dir = Path(out_dir) if out_dir is not None else control_root / CELL_TYPE_SUBDIRS["positive_control"]
+    cohorts = list(EXPORT_COHORTS) if cohort == "all" else [cohort]
+    for c in cohorts:
+        if c not in EXPORT_COHORTS:
+            raise ValueError(f"Unknown cohort {c!r}; expected one of {EXPORT_COHORTS} or 'all'")
+        if (out_dir / c).exists() and not force:
+            raise FileExistsError(f"{out_dir / c} exists; rerun with --force to replace it")
+    print(f"[{log}] Control ({types['control']}): {control_root}")
+    print(f"[{log}] Reference ({types['reference']}): {reference_root} (read, never rerun)")
+    print(f"[{log}] Output directory: {out_dir}")
+
+    prepared = {}
+    for c in cohorts:
+        control = _positive_control_read(control_root, c, "control", diagnostics=True)
+        reference = _positive_control_read(reference_root, c, "reference", diagnostics=False)
+        rows, outcomes = _positive_control_rows(c, control, reference)
+        prepared[c] = (control, reference, rows, outcomes)
+
+    results = {}
+    for c in cohorts:
+        control, reference, rows, outcomes = prepared[c]
+        # object dtype: counts stay integers and floats keep their shortest round-trip form in the CSV
+        table = pd.DataFrame(rows, columns=list(POSITIVE_CONTROL_COLUMNS), dtype=object)
+        findings = (
+            [f"control: {m}" for m in control["findings"]] + [f"reference: {m}" for m in reference["findings"]]
+            + outcomes.pop("findings")
+        )
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "cell_type": types["control"],
+            "cell_types": dict(types),
+            "cohort": c,
+            "primary_cohort": c == POSITIVE_CONTROL_PRIMARY_COHORT,
+            "expectations": POSITIVE_CONTROL_EXPECTATIONS,
+            "rule": POSITIVE_CONTROL_RULE,
+            "inputs": {
+                "control": {"root": str(control_root), "files": control["files"]},
+                "reference": {"root": str(reference_root), "files": reference["files"]},
+            },
+            "values": {
+                "E1": {m: {"control": control["e1"][m], "reference": reference["e1"][m]} for m in control["e1"]},
+                "E2": {"control": control["e2"], "reference": reference["e2"]},
+                "E3": {
+                    "stage_abs_spearman": float(table.loc[table["expectation"] == "E3", "control_value"].iloc[0]),
+                    "technical_max": outcomes["E3_technical_max"],
+                },
+            },
+            "outcomes": outcomes,
+            "reads": "counts (n_significant), latent.cv_mean_auroc and raw Spearman correlations only; no p-value, "
+                     "rejection status or trajectory statistic",
+            "outputs": [POSITIVE_CONTROL_TABLE, POSITIVE_CONTROL_MARKDOWN, POSITIVE_CONTROL_MANIFEST],
+            "software": _software_versions(),
+            "git": _git_revision(),
+            "findings": findings,
+        }
+        tmp = out_dir / f"{c}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        table.to_csv(tmp / POSITIVE_CONTROL_TABLE, index=False, float_format=_csv_float)
+        (tmp / POSITIVE_CONTROL_MARKDOWN).write_text(render_positive_control(table, manifest))
+        (tmp / POSITIVE_CONTROL_MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+        final = out_dir / c
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(tmp, final)
+        print(f"[{log}] Wrote {final}")
+        for r in rows:
+            print(
+                f"[{log}] {c} {r['expectation']}{' ' + r['method'] if r['method'] else ''}: {r['outcome']}"
+                + (f" ({r['control']} {r['control_value']} vs {r['reference']} {r['reference_value']})"
+                   if r["control_value"] is not None else f" ({r['detail']})")
+            )
+        for msg in findings:
+            print(f"[{log}] FINDING: {c}: {msg}")
+        results[c] = {"dir": final, "table": table, "manifest": manifest, "outcomes": outcomes}
+    return results
+
+
 __all__ = [
     "DEFAULT_BUCKET",
     "download_data",
@@ -11832,6 +12628,13 @@ __all__ = [
     "resolve_data_root",
     "MTG_PREFIXES",
     "TAXONOMY",
+    "DEFAULT_CELL_TYPE",
+    "CELL_TYPES",
+    "PREREGISTERED_COHORTS",
+    "cell_type_dirs",
+    "check_manifest_cell_type",
+    "taxonomy_for",
+    "select_nuclei",
     "select_astrocyte_nuclei",
     "pseudobulk_donor",
     "build_donor_table",
@@ -11886,4 +12689,8 @@ __all__ = [
     "stage_de_limma_fit",
     "render_stage_de_limma",
     "run_stage_de_limma",
+    "POSITIVE_CONTROL_EXPECTATIONS",
+    "POSITIVE_CONTROL_PRIMARY_COHORT",
+    "render_positive_control",
+    "run_positive_control",
 ]

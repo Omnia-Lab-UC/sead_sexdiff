@@ -15,6 +15,10 @@ from .data import (
     DEFAULT_BUCKET,
     DATA_ROOT_ENV,
     MTG_PREFIXES,
+    CELL_TYPES,
+    CELL_TYPE_SUBDIRS,
+    DEFAULT_CELL_TYPE,
+    cell_type_dirs,
     resolve_data_root,
     EXPORT_COHORTS,
     ANALYSIS_STATISTICS,
@@ -28,6 +32,8 @@ from .data import (
     STAGE_DE_ALPHA,
     STAGE_DE_MODELS,
     STAGE_DE_LIMMA_JOINT_TESTS,
+    POSITIVE_CONTROL_CELL_TYPES,
+    POSITIVE_CONTROL_PRIMARY_COHORT,
     run_analysis,
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
@@ -37,6 +43,7 @@ from .data import (
     run_latent_sensitivity,
     run_stage_de,
     run_stage_de_limma,
+    run_positive_control,
     run_export,
     run_pseudobulk,
     write_subset_from_folder,
@@ -78,6 +85,27 @@ def _parse_floats_csv(value: str | None) -> list[float] | None:
             continue
         parts.append(float(token))
     return parts or None
+
+
+def _add_cell_type_argument(parser: argparse.ArgumentParser) -> None:
+    """``--cell-type``: a registered name of ``CELL_TYPES`` (the mapping itself is not an option)."""
+    parser.add_argument(
+        "--cell-type",
+        choices=list(CELL_TYPES),
+        default=DEFAULT_CELL_TYPE,
+        help=(
+            "Registered cell type (CELL_TYPES): the population and the default directories under its results "
+            "root; explicit directory flags take precedence (default: %(default)s)"
+        ),
+    )
+
+
+def _dir_default(key: str) -> str:
+    """Help text of a directory flag that defaults to the cell type's directory."""
+    return (
+        f"(default: <results root of --cell-type>/{CELL_TYPE_SUBDIRS[key]}, "
+        f"{cell_type_dirs(DEFAULT_CELL_TYPE)[key]} for {DEFAULT_CELL_TYPE})"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -247,14 +275,16 @@ def build_parser() -> argparse.ArgumentParser:
     # pseudobulk command: MTG astrocyte donor-level RNA + ATAC pseudobulks
     sub_pb = sub.add_parser(
         "pseudobulk",
-        help="Build donor-level astrocyte pseudobulks from the MTG donor objects",
+        help="Build donor-level pseudobulks of a registered cell type (default astrocyte) from the MTG donor objects",
         description=(
             "Read the MTG RNA and/or ATAC donor objects one at a time, sum raw "
-            "counts over astrocyte nuclei per donor, and write count matrices, "
+            "counts over the nuclei of the cell type (--cell-type, default astrocyte) "
+            "per donor, and write count matrices, "
             "the donor table with cohort flags, supertype composition, a cohort "
             "summary and a run manifest."
         ),
     )
+    _add_cell_type_argument(sub_pb)
     sub_pb.add_argument(
         "--omic",
         choices=["rna", "atac", "both"],
@@ -269,9 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_pb.add_argument(
         "--out-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Output directory (default: %(default)s)",
+        help="Output directory " + _dir_default("pseudobulk"),
     )
     sub_pb.add_argument(
         "--limit",
@@ -304,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
             "covariates_manifest.json. Needs the raw donor objects (cluster)."
         ),
     )
+    _add_cell_type_argument(sub_cov)
     sub_cov.add_argument(
         "--omic",
         choices=["rna", "both"],
@@ -318,18 +349,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_cov.add_argument(
         "--out-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Output directory (default: %(default)s)",
+        help="Output directory " + _dir_default("pseudobulk"),
     )
 
-    # technical-covariates command: donor technical table of the astrocyte nuclei
+    # technical-covariates command: donor technical table of the cell type's nuclei
     sub_tc = sub.add_parser(
         "technical-covariates",
-        help="Write the donor technical table of the astrocyte nuclei (gene-set UMI fractions, nucleus and library QC)",
+        help="Write the donor technical table of the cell type's nuclei (gene-set UMI fractions, nucleus and library QC)",
         description=(
-            "For every MTG RNA donor object, select the astrocyte nuclei exactly as the "
-            "pseudobulk step does (shared code path), read their rows of the raw UMIs layer "
+            "For every MTG RNA donor object, select the nuclei of the cell type (--cell-type, "
+            "default astrocyte) exactly as the pseudobulk step does (shared code path; the "
+            "pseudobulk manifest must record the same cell type), read their rows of the raw UMIs layer "
             "and their obs QC columns (never the normalized X), and write per donor the "
             "nucleus means and SDs and the UMI-weighted pseudobulk fractions of the predeclared "
             "gene sets (ribosomal, mitochondrial, hemoglobin), the within-donor supertype share "
@@ -342,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(per_donor_technical/). Needs the raw donor objects (cluster)."
         ),
     )
+    _add_cell_type_argument(sub_tc)
     sub_tc.add_argument(
         "--omic",
         choices=["rna", "both"],
@@ -356,15 +389,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_tc.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Directory with the pseudobulk outputs, read for the cross-check (default: %(default)s)",
+        help="Directory with the pseudobulk outputs, read for the cross-check " + _dir_default("pseudobulk"),
     )
     sub_tc.add_argument(
         "--out-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Output directory (default: %(default)s)",
+        help="Output directory " + _dir_default("pseudobulk"),
     )
     sub_tc.add_argument(
         "--force",
@@ -385,17 +418,18 @@ def build_parser() -> argparse.ArgumentParser:
             "outputs plus the GENCODE annotation (downloaded once)."
         ),
     )
+    _add_cell_type_argument(sub_ex)
     sub_ex.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Directory with the pseudobulk and covariates outputs (default: %(default)s)",
+        help="Directory with the pseudobulk and covariates outputs " + _dir_default("pseudobulk"),
     )
     sub_ex.add_argument(
         "--out-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root; one subdirectory per cohort (default: %(default)s)",
+        help="Export root; one subdirectory per cohort " + _dir_default("motco_input"),
     )
     sub_ex.add_argument(
         "--cohort",
@@ -424,7 +458,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the covariate-adjusted MOTCO trajectory analysis per cohort",
         description=(
             "Per cohort, from the export outputs only: compare the female and male "
-            "astrocyte trajectories across ADNC stages 0, 1, 2 with MOTCO's "
+            "trajectories of the cell type (--cell-type, default astrocyte; the export "
+            "manifest must record it) across ADNC stages 0, 1, 2 with MOTCO's "
             "analyze_trajectories (RNA + ATAC blocks, net-displacement orientation, "
             "CV-selected rank, 999 RRPP permutations, fixed seed), adjusting for "
             "age_at_death, pmi, rin, years_education, log10_n_rna and log10_n_atac. "
@@ -432,6 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
             "analysis_manifest.json and summary.md."
         ),
     )
+    _add_cell_type_argument(sub_an)
     sub_an.add_argument(
         "--cohort",
         choices=list(EXPORT_COHORTS) + ["all"],
@@ -440,15 +476,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_an.add_argument(
         "--input-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root with one subdirectory per cohort (default: %(default)s)",
+        help="Export root with one subdirectory per cohort " + _dir_default("motco_input"),
     )
     sub_an.add_argument(
         "--out-dir",
-        default=Path("results/motco_analysis"),
+        default=None,
         type=Path,
-        help="Analysis root; one subdirectory per cohort (default: %(default)s)",
+        help="Analysis root; one subdirectory per cohort " + _dir_default("motco_analysis"),
     )
     sub_an.add_argument(
         "--n-jobs",
@@ -635,6 +671,7 @@ def build_parser() -> argparse.ArgumentParser:
             "preprocessing variants are predeclared in a change proposal, never derived from a diagnostic value."
         ),
     )
+    _add_cell_type_argument(sub_ad)
     sub_ad.add_argument(
         "--cohort",
         choices=list(EXPORT_COHORTS) + ["all"],
@@ -643,33 +680,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_ad.add_argument(
         "--input-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root with one subdirectory per cohort (default: %(default)s)",
+        help="Export root with one subdirectory per cohort " + _dir_default("motco_input"),
     )
     sub_ad.add_argument(
         "--analysis-dir",
-        default=Path("results/motco_analysis"),
+        default=None,
         type=Path,
-        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+        help="Analysis root of the analyze step; read as the primary analysis, never written " + _dir_default("motco_analysis"),
     )
     sub_ad.add_argument(
         "--rank-dir",
-        default=Path("results/motco_rank_sensitivity"),
+        default=None,
         type=Path,
-        help="Sweep root of the rank-sensitivity step; its rank_*/ analyses are read when present (default: %(default)s)",
+        help="Sweep root of the rank-sensitivity step; its rank_*/ analyses are read when present " + _dir_default("motco_rank_sensitivity"),
     )
     sub_ad.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
-        help="Directory holding donor_technical.csv from the technical-covariates step (default: %(default)s)",
+        help="Directory holding donor_technical.csv from the technical-covariates step " + _dir_default("pseudobulk"),
     )
     sub_ad.add_argument(
         "--out-dir",
-        default=Path("results/motco_diagnostics"),
+        default=None,
         type=Path,
-        help="Diagnostics root; one subdirectory per cohort (default: %(default)s)",
+        help="Diagnostics root; one subdirectory per cohort " + _dir_default("motco_diagnostics"),
     )
     sub_ad.add_argument(
         "--force",
@@ -771,6 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
             "model."
         ),
     )
+    _add_cell_type_argument(sub_sd)
     sub_sd.add_argument(
         "--cohort",
         choices=list(EXPORT_COHORTS) + ["all"],
@@ -788,30 +826,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_sd.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
         help=(
             "Directory holding rna_counts.h5ad, atac_counts.h5ad, donor_table.csv and manifest.json; read, never "
-            "written (default: %(default)s)"
+            "written " + _dir_default("pseudobulk")
         ),
     )
     sub_sd.add_argument(
         "--input-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+        help="Export root of the export step; read as the primary export, never written " + _dir_default("motco_input"),
     )
     sub_sd.add_argument(
         "--analysis-dir",
-        default=Path("results/motco_analysis"),
+        default=None,
         type=Path,
-        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+        help="Analysis root of the analyze step; read as the primary analysis, never written " + _dir_default("motco_analysis"),
     )
     sub_sd.add_argument(
         "--out-dir",
-        default=Path("results/stage_de"),
+        default=None,
         type=Path,
-        help="Output root; one subdirectory per cohort (default: %(default)s)",
+        help="Output root; one subdirectory per cohort " + _dir_default("stage_de"),
     )
     sub_sd.add_argument(
         "--n-cpus",
@@ -846,6 +884,7 @@ def build_parser() -> argparse.ArgumentParser:
             "method_comparison.csv, stage_de_limma.md, stage_de_limma_manifest.json); resumable per model."
         ),
     )
+    _add_cell_type_argument(sub_sl)
     sub_sl.add_argument(
         "--cohort",
         choices=list(EXPORT_COHORTS) + ["all"],
@@ -863,41 +902,93 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_sl.add_argument(
         "--pseudobulk-dir",
-        default=Path("results/pseudobulk"),
+        default=None,
         type=Path,
         help=(
             "Directory holding rna_counts.h5ad, atac_counts.h5ad, donor_table.csv and manifest.json; read, never "
-            "written (default: %(default)s)"
+            "written " + _dir_default("pseudobulk")
         ),
     )
     sub_sl.add_argument(
         "--input-dir",
-        default=Path("results/motco_input"),
+        default=None,
         type=Path,
-        help="Export root of the export step; read as the primary export, never written (default: %(default)s)",
+        help="Export root of the export step; read as the primary export, never written " + _dir_default("motco_input"),
     )
     sub_sl.add_argument(
         "--analysis-dir",
-        default=Path("results/motco_analysis"),
+        default=None,
         type=Path,
-        help="Analysis root of the analyze step; read as the primary analysis, never written (default: %(default)s)",
+        help="Analysis root of the analyze step; read as the primary analysis, never written " + _dir_default("motco_analysis"),
     )
     sub_sl.add_argument(
         "--deseq2-dir",
-        default=Path("results/stage_de"),
+        default=None,
         type=Path,
-        help="Output root of `stage-de` (DESeq2); read and checked, never written (default: %(default)s)",
+        help="Output root of `stage-de` (DESeq2); read and checked, never written " + _dir_default("stage_de"),
     )
     sub_sl.add_argument(
         "--out-dir",
-        default=Path("results/stage_de_limma"),
+        default=None,
         type=Path,
-        help="Output root; one subdirectory per cohort (default: %(default)s)",
+        help="Output root; one subdirectory per cohort " + _dir_default("stage_de_limma"),
     )
     sub_sl.add_argument(
         "--force",
         action="store_true",
         help="Refit the requested omics even when their fits are complete, replacing them and the cohort's summary",
+    )
+
+    # positive-control command: predeclared expectations of the control cell type against the reference
+    control, reference = POSITIVE_CONTROL_CELL_TYPES["control"], POSITIVE_CONTROL_CELL_TYPES["reference"]
+    sub_pc = sub.add_parser(
+        "positive-control",
+        help=f"Evaluate the predeclared positive-control expectations E1-E3 ({control} against {reference})",
+        description=(
+            f"Per cohort, from the generated files of both cell types only: E1 (stage signal) compares the number "
+            f"of exported RNA features with a stage effect at FDR {STAGE_DE_ALPHA} between {control} and {reference} "
+            "within each stage-DE method (DESeq2 factor_additive union, limma factor_additive stage_joint) and holds "
+            "only under both (under one only: method_dependent, not holding); E2 (latent separation) compares the "
+            "primary analyses' CV mean AUROC; E3 (axis identity) compares, along the first latent component of the "
+            f"{control} primary analysis, |Spearman| with stage against the largest |Spearman| with a technical "
+            "variable (technical table, TMM factors, library sizes) from axis-diagnostics. The control holds when "
+            f"E1, E2 and E3 all hold in {POSITIVE_CONTROL_PRIMARY_COHORT}. No p-value, rejection status or trajectory "
+            "statistic is read; nothing is tested. Every manifest read must record its root's cell type, and the "
+            "stage-DE steps and the diagnostic must have been made from the analysis read for E2. Writes "
+            "<out-dir>/<cohort>/ (positive_control.csv, positive_control.md, positive_control_manifest.json)."
+        ),
+    )
+    sub_pc.add_argument(
+        "--cohort",
+        choices=list(EXPORT_COHORTS) + ["all"],
+        default="all",
+        help="Cohort(s) to evaluate (default: %(default)s)",
+    )
+    sub_pc.add_argument(
+        "--control-root",
+        default=None,
+        type=Path,
+        help=f"Results root of the control cell type, {control} (default: {cell_type_dirs(control)['pseudobulk'].parent})",
+    )
+    sub_pc.add_argument(
+        "--reference-root",
+        default=None,
+        type=Path,
+        help=(
+            f"Results root of the reference cell type, {reference}; read, never rerun "
+            f"(default: {cell_type_dirs(reference)['pseudobulk'].parent})"
+        ),
+    )
+    sub_pc.add_argument(
+        "--out-dir",
+        default=None,
+        type=Path,
+        help="Output root; one subdirectory per cohort (default: <control root>/positive_control)",
+    )
+    sub_pc.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing cohort directories",
     )
     return parser
 
@@ -1010,9 +1101,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pseudobulk":
         donors = _parse_suffixes([args.donors]) if args.donors else None
-        print("[pseudobulk] Building astrocyte donor pseudobulks...")
+        print(f"[pseudobulk] Building {args.cell_type} donor pseudobulks...")
         outputs = run_pseudobulk(
             omic=args.omic,
+            cell_type=args.cell_type,
             data_root=args.data_root,
             out_dir=args.out_dir,
             limit=args.limit,
@@ -1027,16 +1119,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "covariates":
         print("[covariates] Reading donor covariates...")
-        outputs = run_covariates(omic=args.omic, data_root=args.data_root, out_dir=args.out_dir)
+        outputs = run_covariates(
+            omic=args.omic, cell_type=args.cell_type, data_root=args.data_root, out_dir=args.out_dir
+        )
         for name in ("covariates", "manifest"):
             print(f"[covariates] Wrote {outputs[name]}")
         print("[covariates] Done.")
         return 0
 
     if args.command == "technical-covariates":
-        print("[technical-covariates] Summarizing the astrocyte nuclei of every donor object...")
+        print(f"[technical-covariates] Summarizing the {args.cell_type} nuclei of every donor object...")
         outputs = run_technical_covariates(
             args.omic,
+            cell_type=args.cell_type,
             data_root=args.data_root,
             pseudobulk_dir=args.pseudobulk_dir,
             out_dir=args.out_dir,
@@ -1050,6 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "export":
         print("[export] Exporting MOTCO input blocks...")
         run_export(
+            cell_type=args.cell_type,
             pseudobulk_dir=args.pseudobulk_dir,
             out_dir=args.out_dir,
             cohort=args.cohort,
@@ -1065,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[analyze] Running the MOTCO trajectory analysis...")
         results = run_analysis(
             args.cohort,
+            cell_type=args.cell_type,
             input_dir=args.input_dir,
             out_dir=args.out_dir,
             n_jobs=args.n_jobs,
@@ -1144,6 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[axis-diagnostics] Measuring the latent and block axes...")
         results = run_axis_diagnostics(
             args.cohort,
+            cell_type=args.cell_type,
             input_dir=args.input_dir,
             analysis_dir=args.analysis_dir,
             rank_dir=args.rank_dir,
@@ -1196,6 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
         results = run_stage_de(
             args.cohort,
             omic=args.omic,
+            cell_type=args.cell_type,
             pseudobulk_dir=args.pseudobulk_dir,
             input_dir=args.input_dir,
             analysis_dir=args.analysis_dir,
@@ -1224,6 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
         results = run_stage_de_limma(
             args.cohort,
             omic=args.omic,
+            cell_type=args.cell_type,
             pseudobulk_dir=args.pseudobulk_dir,
             input_dir=args.input_dir,
             analysis_dir=args.analysis_dir,
@@ -1248,6 +1348,24 @@ def main(argv: list[str] | None = None) -> int:
                     f"{'yes' if cell['methods_agree'] else 'no'}"
                 )
         print("[stage-de-limma] Done.")
+        return 0
+
+    if args.command == "positive-control":
+        print("[positive-control] Evaluating the predeclared positive-control expectations...")
+        results = run_positive_control(
+            args.cohort,
+            control_root=args.control_root,
+            reference_root=args.reference_root,
+            out_dir=args.out_dir,
+            force=args.force,
+        )
+        for cohort, res in results.items():
+            o = res["outcomes"]
+            print(
+                f"[positive-control] {cohort}{' (primary cohort)' if res['manifest']['primary_cohort'] else ''}: "
+                f"E1 {o['E1']}, E2 {o['E2']}, E3 {o['E3']}; all three hold: {'yes' if o['all_hold'] else 'no'}"
+            )
+        print("[positive-control] Done.")
         return 0
 
     parser.error("Unknown command")
