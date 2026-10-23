@@ -40,6 +40,7 @@ from .data import (
     run_rank_sensitivity,
     run_preprocessing_sensitivity,
     run_covariates,
+    run_donor_flags,
     run_technical_covariates,
     run_axis_diagnostics,
     run_latent_sensitivity,
@@ -350,6 +351,40 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
     )
     sub_cov.add_argument(
+        "--out-dir",
+        default=None,
+        type=Path,
+        help="Output directory " + _dir_default("pseudobulk"),
+    )
+
+    # donor-flags command: SEA-AD's donor flag and staging labels (obs only)
+    sub_df = sub.add_parser(
+        "donor-flags",
+        help="Write SEA-AD's severely-affected flag and staging labels from the MTG donor object metadata",
+        description=(
+            "Read Severely Affected Donor (Y/N, coded as severely_affected), Cognitive Status, Braak, CERAD score, "
+            "Thal and LATE (recorded as read), plus the Continuous Pseudo-progression Score where the objects hold "
+            "it (the ATAC release), from the obs of every MTG donor object (no matrices); cross-check RNA against "
+            "ATAC (a flag disagreement is an error, any other a finding, RNA value used); leave out the Reference "
+            "donors (listed); and write donor_flags.csv plus donor_flags_manifest.json beside, never into, the "
+            "covariate table. The table is an input of exclusion-sensitivity only. Needs the raw donor objects "
+            "(cluster login node; seconds per object)."
+        ),
+    )
+    _add_cell_type_argument(sub_df)
+    sub_df.add_argument(
+        "--omic",
+        choices=["rna", "both"],
+        default="both",
+        help="Read RNA only, or RNA plus the ATAC cross-check and score (default: %(default)s)",
+    )
+    sub_df.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help=f"Local data root holding the MTG donor objects (default: ${DATA_ROOT_ENV}, else data)",
+    )
+    sub_df.add_argument(
         "--out-dir",
         default=None,
         type=Path,
@@ -1146,6 +1181,16 @@ def main(argv: list[str] | None = None) -> int:
         for name in ("covariates", "manifest"):
             print(f"[covariates] Wrote {outputs[name]}")
         print("[covariates] Done.")
+        return 0
+
+    if args.command == "donor-flags":
+        print("[donor-flags] Reading donor flags and staging labels...")
+        outputs = run_donor_flags(
+            omic=args.omic, cell_type=args.cell_type, data_root=args.data_root, out_dir=args.out_dir
+        )
+        for name in ("table", "manifest"):
+            print(f"[donor-flags] Wrote {outputs[name]}")
+        print("[donor-flags] Done.")
         return 0
 
     if args.command == "technical-covariates":

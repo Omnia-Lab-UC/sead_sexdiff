@@ -2303,6 +2303,319 @@ def run_covariates(
 
 
 # ---------------------------------------------------------------------------
+# MTG donor flags (SEA-AD's donor-level flag and staging labels, obs only)
+# ---------------------------------------------------------------------------
+
+# SEA-AD's donor-level obs columns → coded names. ``Severely Affected Donor``
+# (DONOR_FLAG_SOURCE) is coded with DONOR_FLAG_VALUES; the staging labels are
+# recorded as read and used by nothing (a later staging proposal may). The
+# table is written beside, never into, donor_covariates.csv, whose hash every
+# export and analysis manifest records, and it is an input of
+# exclusion-sensitivity only. Flag and ask before changing.
+DONOR_FLAG_COLUMNS: dict[str, str] = {
+    "Severely Affected Donor": "severely_affected",
+    "Cognitive Status": "cognitive_status",
+    "Braak": "braak",
+    "CERAD score": "cerad_score",
+    "Thal": "thal",
+    "LATE": "late",
+}
+# Read where present (the ATAC 2024-12-06 release holds it, the RNA 2026-06-22
+# release does not); an absent column is recorded as a finding, not an error
+DONOR_FLAG_ATAC_ONLY_COLUMNS: dict[str, str] = {"Continuous Pseudo-progression Score": "cps"}
+DONOR_FLAG_SOURCE = "Severely Affected Donor"
+DONOR_FLAG_VALUES: dict[str, bool] = {"Y": True, "N": False}
+DONOR_FLAG_OUTPUTS: dict[str, str] = {"table": "donor_flags.csv", "manifest": "donor_flags_manifest.json"}
+# The number of flagged donors SEA-AD reports (Gabitto et al. 2024: 11 of the
+# 42 high-ADNC donors); a different count is recorded as a finding, never corrected
+DONOR_FLAG_EXPECTED_FLAGGED = 11
+# Reference donors are identified as the donor table identifies them (ADNC
+# ``Reference``, which ADNC_STAGES does not map); they are listed, not tabled
+DONOR_FLAG_REFERENCE_LABEL = "Reference"
+
+
+def read_donor_flags(path: str | Path, omic: str) -> tuple[dict[str, str], list[str]]:
+    """Read the donor-level flag and staging columns of one donor object.
+
+    Parameters
+    ----------
+    path:
+        Donor ``.h5ad`` object.
+    omic:
+        ``"rna"`` or ``"atac"`` (recorded in error messages only; the same
+        columns are read from both).
+
+    Returns
+    -------
+    (dict, list[str])
+        ``Donor ID``, ``ADNC_COLUMN``, each column of ``DONOR_FLAG_COLUMNS`` and
+        each column of ``DONOR_FLAG_ATAC_ONLY_COLUMNS`` the object holds → its
+        single value as a string; and the ``DONOR_FLAG_ATAC_ONLY_COLUMNS`` the
+        object lacks.
+
+    Notes
+    -----
+    Only the listed ``obs`` columns are read; ``X`` and the layers are never
+    opened. A column holding more than one value fails naming the file and
+    the column; a missing column of ``DONOR_FLAG_COLUMNS`` (or ``Donor ID``,
+    ``ADNC_COLUMN``) fails naming the file.
+    """
+    import h5py
+
+    if omic not in MTG_PREFIXES:
+        raise ValueError(f"omic must be one of {list(MTG_PREFIXES)}, not {omic!r}")
+    path = Path(path)
+    required = ["Donor ID", ADNC_COLUMN, *DONOR_FLAG_COLUMNS]
+    with h5py.File(path, "r") as f:
+        present = set(f["obs"].keys())
+        optional = [c for c in DONOR_FLAG_ATAC_ONLY_COLUMNS if c in present]
+        absent = [c for c in DONOR_FLAG_ATAC_ONLY_COLUMNS if c not in present]
+        obs = _read_obs_columns(f, required + optional, path)
+    return {c: _single_value(obs[c], path, c) for c in required + optional}, absent
+
+
+def _flag_label(value: str) -> str | None:
+    """A recorded label as read, with the missing forms (``nan``, empty) as ``None``."""
+    return _code_string(value)
+
+
+def run_donor_flags(
+    *,
+    omic: str = "both",
+    cell_type: str = DEFAULT_CELL_TYPE,
+    data_root: str | Path | None = None,
+    out_dir: str | Path | None = None,
+) -> dict:
+    """Write SEA-AD's donor flag and staging labels (``donor_flags.csv``) and their manifest.
+
+    Parameters
+    ----------
+    omic:
+        ``"both"`` (RNA values, cross-checked against ATAC; the pseudo-progression
+        score from ATAC) or ``"rna"`` (no cross-check; the score is then absent).
+    cell_type:
+        Registered cell type (default ``astrocyte``). The flags are
+        donor-level and do not depend on it; it sets the default output
+        directory (the cell type's pseudobulk directory) and is recorded.
+    data_root:
+        Data root (resolved with :func:`resolve_data_root`).
+    out_dir:
+        Output directory (default the cell type's pseudobulk directory).
+
+    Returns
+    -------
+    dict
+        Paths ``table`` and ``manifest`` plus ``findings``.
+
+    Raises
+    ------
+    ValueError
+        A non-Reference donor's ``Severely Affected Donor`` is not a key of
+        ``DONOR_FLAG_VALUES`` (donor and value named), the flag or the
+        Reference status disagrees between a donor's RNA and ATAC objects
+        (donor and both values named), a column holds more than one value, or
+        the ``Donor ID`` differs from the file name. Nothing is written.
+
+    Notes
+    -----
+    Outputs: ``donor_flags.csv`` (one row per non-Reference donor: ``donor_id``,
+    ``severely_affected``, ``cognitive_status``, ``braak``, ``cerad_score``,
+    ``thal``, ``late``, ``cps``; labels as read, missing values empty) and
+    ``donor_flags_manifest.json``. Only ``obs`` columns are read; no other
+    file in the output directory is written. Reference donors (ADNC
+    ``Reference``) are listed in the manifest with their labels. A label
+    other than the flag that differs between the omics is a finding (both
+    values recorded) and the RNA value is used; a donor with an ATAC object
+    only takes its ATAC values (a finding).
+    """
+    if omic not in ("rna", "both"):
+        raise ValueError(f"omic must be 'rna' or 'both', not {omic!r}")
+    cell_type_entry(cell_type)
+    root = resolve_data_root(data_root)
+    out_dir = _resolve_dir(out_dir, cell_type, "pseudobulk")
+    omics = ["rna", "atac"] if omic == "both" else ["rna"]
+    print(f"[donor-flags] Cell type: {cell_type} (output directory only; the flags are donor-level)")
+    print(f"[donor-flags] Data root: {root.resolve()}")
+    print(f"[donor-flags] Output directory: {out_dir}")
+
+    labels = {**DONOR_FLAG_COLUMNS, **DONOR_FLAG_ATAC_ONLY_COLUMNS}
+    raw: dict[str, dict[str, dict[str, str]]] = {}
+    files: dict[str, list[str]] = {}
+    absent_columns: dict[str, dict[str, int]] = {}
+    for o in omics:
+        folder = root / MTG_PREFIXES[o]
+        paths = sorted(folder.glob("*_final-nuclei.*.h5ad"))
+        if not paths:
+            raise FileNotFoundError(f"No donor objects for {o} in {folder}")
+        raw[o], absent_columns[o] = {}, {}
+        for i, p in enumerate(paths, 1):
+            rec, absent = read_donor_flags(p, o)
+            donor = rec.pop("Donor ID")
+            if donor != donor_id_of(p):
+                raise ValueError(f"{p.name}: obs Donor ID {donor} differs from file name")
+            if donor in raw[o]:
+                raise ValueError(f"{o}: donor {donor} has more than one object under {folder}")
+            raw[o][donor] = rec
+            for col in absent:
+                absent_columns[o][col] = absent_columns[o].get(col, 0) + 1
+            print(f"[donor-flags] {o} {i}/{len(paths)} {donor}")
+        files[o] = [p.relative_to(root).as_posix() for p in paths]
+
+    findings: list[str] = []
+    for o in omics:
+        for col, n in absent_columns[o].items():
+            if n == len(files[o]):
+                findings.append(f"{o}: obs lacks {col!r} in all {n} objects; {labels[col]} is not read from {o}")
+            else:
+                findings.append(f"{o}: obs lacks {col!r} in {n} of {len(files[o])} objects")
+    if "atac" not in omics:
+        findings.append(
+            f"RNA-only run: no ATAC object was read, so no cross-omic check was done and "
+            f"{', '.join(DONOR_FLAG_ATAC_ONLY_COLUMNS.values())} come(s) from the RNA objects only"
+        )
+
+    def is_reference(rec: dict[str, str]) -> bool:
+        return str(rec[ADNC_COLUMN]).strip() == DONOR_FLAG_REFERENCE_LABEL
+
+    rna, atac = raw["rna"], raw.get("atac", {})
+    donors = sorted(set(rna) | set(atac))
+    reference, disagreements, rows = [], [], []
+    for donor in donors:
+        r, a = rna.get(donor), atac.get(donor)
+        if r is not None and a is not None and is_reference(r) != is_reference(a):
+            raise ValueError(
+                f"Donor {donor}: {ADNC_COLUMN} reads {r[ADNC_COLUMN]!r} in the RNA object and {a[ADNC_COLUMN]!r} in "
+                "the ATAC object, so its Reference status differs between omics; nothing was written"
+            )
+        base = r if r is not None else a
+        if is_reference(base):
+            reference.append({
+                "donor_id": donor,
+                "omics": [o for o in omics if donor in raw[o]],
+                "labels": {labels[c]: base.get(c) for c in labels if c in base},
+            })
+            continue
+        for o, rec in (("RNA", r), ("ATAC", a)):
+            if rec is not None and str(rec[DONOR_FLAG_SOURCE]).strip() not in DONOR_FLAG_VALUES:
+                raise ValueError(
+                    f"Donor {donor}: unexpected {DONOR_FLAG_SOURCE!r} value {rec[DONOR_FLAG_SOURCE]!r} in the {o} "
+                    f"object (expected one of {list(DONOR_FLAG_VALUES)}); nothing was written"
+                )
+        if r is not None and a is not None:
+            fr, fa = str(r[DONOR_FLAG_SOURCE]).strip(), str(a[DONOR_FLAG_SOURCE]).strip()
+            if fr != fa:
+                raise ValueError(
+                    f"Donor {donor}: {DONOR_FLAG_SOURCE!r} is {fr!r} in the RNA object and {fa!r} in the ATAC object; "
+                    "the flag must agree between omics; nothing was written"
+                )
+            for col in labels:
+                if col == DONOR_FLAG_SOURCE or col not in r or col not in a:
+                    continue
+                if _flag_label(r[col]) != _flag_label(a[col]):
+                    disagreements.append({"donor_id": donor, "column": col, "rna": r[col], "atac": a[col]})
+        if r is None:
+            findings.append(f"donor {donor} has an ATAC object only; its values are the ATAC ones")
+        row = {"donor_id": donor, "severely_affected": DONOR_FLAG_VALUES[str(base[DONOR_FLAG_SOURCE]).strip()]}
+        for col, name in labels.items():
+            if col == DONOR_FLAG_SOURCE:
+                continue
+            # RNA value first; a column the RNA objects lack (the score) from ATAC
+            source = r if r is not None and col in r else a
+            row[name] = None if source is None or col not in source else _flag_label(source[col])
+        rows.append(row)
+    findings += [
+        f"{d['donor_id']} {d['column']}: RNA {d['rna']!r}, ATAC {d['atac']!r} (RNA value used)" for d in disagreements
+    ]
+    columns = ["donor_id", "severely_affected"] + [n for c, n in labels.items() if c != DONOR_FLAG_SOURCE]
+    table = pd.DataFrame(rows, columns=columns)
+    n_flagged = int(table["severely_affected"].sum())
+    if n_flagged != DONOR_FLAG_EXPECTED_FLAGGED:
+        findings.append(
+            f"{n_flagged} donors are flagged {DONOR_FLAG_SOURCE!r} = Y, not the {DONOR_FLAG_EXPECTED_FLAGGED} SEA-AD "
+            "reports (Gabitto et al. 2024); recorded, not corrected"
+        )
+    missing = [
+        {"donor_id": row["donor_id"], "column": name}
+        for row in rows for name in columns[2:] if row[name] is None
+    ]
+    warnings = [
+        f"{o}: {len(files[o])} donor objects read, expected {EXPECTED_DONORS[o]}"
+        for o in omics if len(files[o]) != EXPECTED_DONORS[o]
+    ]
+    cross_check = (
+        {
+            "done": True,
+            "columns": [c for c in labels if c != DONOR_FLAG_SOURCE],
+            "flag": f"{DONOR_FLAG_SOURCE}: a disagreement is an error",
+            "comparison": "labels compared as read (stripped; nan and empty are missing and agree)",
+            "n_compared": len(set(rna) & set(atac)),
+            "n_disagreements": len(disagreements),
+            "rna_only_donors": sorted(set(rna) - set(atac)),
+            "atac_only_donors": sorted(set(atac) - set(rna)),
+        }
+        if "atac" in omics else {"done": False, "note": "RNA-only run: no cross-omic check was done"}
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {k: out_dir / v for k, v in DONOR_FLAG_OUTPUTS.items()}
+    table.to_csv(outputs["table"], index=False)
+    flagged = table.loc[table["severely_affected"], "donor_id"].tolist()
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cell_type": cell_type,
+        "partial": bool(warnings) or len(omics) < 2,
+        "git": _git_revision(),
+        "software": _software_versions(),
+        "data_root": str(root.resolve()),
+        "value_source": "rna (a column the RNA objects lack from atac)",
+        "columns": {
+            src: {"coded": name, "omics": [o for o in omics if absent_columns[o].get(src, 0) < len(files[o])]}
+            for src, name in labels.items()
+        },
+        "flag": {
+            "column": DONOR_FLAG_SOURCE,
+            "coded": DONOR_FLAG_COLUMNS[DONOR_FLAG_SOURCE],
+            "values": dict(DONOR_FLAG_VALUES),
+            "other_values": "an error naming the donor and the value",
+            "expected_flagged": DONOR_FLAG_EXPECTED_FLAGGED,
+            "expected_source": "Gabitto et al. 2024 (11 of the 42 high-ADNC donors)",
+        },
+        "coding": {
+            "labels": "recorded as read (strings); empty, nan and none are missing and left empty; nothing is imputed",
+            "single_value": "each column must hold exactly one value per donor object",
+            "reference": f"donors whose {ADNC_COLUMN!r} is {DONOR_FLAG_REFERENCE_LABEL!r} are left out and listed",
+        },
+        "use": (
+            "an input of exclusion-sensitivity only; the flag enters no model as a covariate or a variable, and no "
+            "export, analysis or diagnostic step reads this table"
+        ),
+        "objects_read": {o: {"n": len(files[o]), "n_expected": EXPECTED_DONORS[o], "files": files[o]} for o in omics},
+        "n_donors": int(len(table)),
+        "n_flagged": n_flagged,
+        "flagged_donors": flagged,
+        "reference_donors": reference,
+        "n_reference_donors": len(reference),
+        "missing": missing,
+        "cross_check": cross_check,
+        "disagreements": disagreements,
+        "findings": findings,
+        "warnings": warnings,
+        "outputs": {k: v.name for k, v in outputs.items()},
+    }
+    outputs["manifest"].write_text(json.dumps(manifest, indent=2) + "\n")
+
+    print(f"[donor-flags] {len(table)} non-Reference donors, {n_flagged} flagged ({', '.join(flagged) or 'none'}); "
+          f"{len(reference)} Reference donor(s) left out ({', '.join(d['donor_id'] for d in reference) or 'none'})")
+    for msg in findings:
+        print(f"[donor-flags] FINDING: {msg}")
+    for w in warnings:
+        print(f"[donor-flags] WARNING: {w}")
+    if not cross_check["done"]:
+        print(f"[donor-flags] {cross_check['note']}")
+    return {**outputs, "findings": findings}
+
+
+# ---------------------------------------------------------------------------
 # MTG donor technical covariates (astrocyte nuclei of the raw donor objects)
 # ---------------------------------------------------------------------------
 
