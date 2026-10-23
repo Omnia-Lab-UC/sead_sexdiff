@@ -118,9 +118,13 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `block_pcs.csv`, `geometry_shares.csv`, `feature_selection.csv`,
    `diagnostics.md` with flagged rows first, `diagnostics_manifest.json`).
    Its outputs feed no export or analysis command.
-10. `latent-sensitivity` – from `results/motco_input/`, `results/motco_analysis/`
-   and `results/pseudobulk/` (`manifest.json`, `donor_technical.csv`,
-   `technical_manifest.json`) only, per cohort: the two arms of the registry
+10. `latent-sensitivity` – from `<root>/motco_input/`, `<root>/motco_analysis/`
+   and `<root>/pseudobulk/` (`manifest.json`, `donor_technical.csv`,
+   `technical_manifest.json`) only, per cell type (`--cell-type`, the root
+   from `cell_type_dirs`; the registry, the covariate set, the conditioning
+   and every setting the same for every cell type; every manifest read
+   checked by `check_manifest_cell_type`, the arm and comparison manifests
+   recording the cell type) and per cohort: the two arms of the registry
    `LATENT_SENSITIVITY_ARMS` on the unchanged primary export, both with
    `LATENT_SENSITIVITY_COVARIATES` (the six analysis covariates plus the raw
    `ribosomal_pseudobulk` and `mitochondrial_pseudobulk` fractions):
@@ -135,7 +139,7 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    (`mediator_check`: Spearman of each added fraction with stage, all donors
    and per sex, flagged at `DIAGNOSTIC_CORRELATION_THRESHOLD`, no p-value,
    never a gate) is written before the arms. Writes
-   `results/motco_latent_sensitivity/` (`<arm>/motco_analysis/<cohort>/`,
+   `<root>/motco_latent_sensitivity/` (`<arm>/motco_analysis/<cohort>/`,
    mirroring the primary layout with the five export files as
    `inputs.files` so `axis-diagnostics --analysis-dir` can read an arm, and
    `comparison/<cohort>/` with `latent_sensitivity.csv`,
@@ -199,13 +203,20 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    read must record its root's cell type (`POSITIVE_CONTROL_CELL_TYPES`) and
    the chain must hold (both stage-DE steps and the diagnostic made from the
    analysis read for E2, the limma step from the DESeq2 summary read for E1).
-   Writes `results/microglia/positive_control/<cohort>/`
+   `--basis` (`POSITIVE_CONTROL_BASES`: `primary`, the default; or
+   `latent_adjusted`, E2 and E3 read from each cell type's `latent_adjusted`
+   arm of `latent-sensitivity` and the diagnostic made on it, E1 unchanged,
+   the arm chain checked: made from the primary export on disk, compared with
+   the primary analysis on disk, the registered conditioning, the diagnostic
+   made from the arm). Writes `results/microglia/positive_control/<cohort>/`
    (`positive_control.csv`, `positive_control.md`,
-   `positive_control_manifest.json`).
+   `positive_control_manifest.json`), or `positive_control/<basis>/<cohort>/`
+   on a non-primary basis.
 
-Cell types: steps 2–12 except the sensitivity steps (the eight commands
-`pseudobulk`, `covariates`, `technical-covariates`, `export`, `analyze`,
-`axis-diagnostics`, `stage-de`, `stage-de-limma`) take `--cell-type`, a name
+Cell types: steps 2–12 except the rank and preprocessing sensitivity steps
+(the nine commands `pseudobulk`, `covariates`, `technical-covariates`,
+`export`, `analyze`, `axis-diagnostics`, `latent-sensitivity`, `stage-de`,
+`stage-de-limma`) take `--cell-type`, a name
 of the registry `CELL_TYPES` (default `astrocyte`, results root `results/`;
 `microglia`, results root `results/microglia/`). It sets the population (one
 selection path) and every default directory (`cell_type_dirs`: `<root>/pseudobulk/`,
@@ -215,8 +226,9 @@ manifest (`check_manifest_cell_type`, naming the file and both cell types,
 nothing written); a manifest written before the registry has no key and
 reads as `astrocyte` with a finding. The per-donor caches record it too; the
 cell type stays out of the stage-DE fit-record fingerprints. The sensitivity
-steps (`rank-sensitivity`, `preprocessing-sensitivity`, `latent-sensitivity`)
-have no flag and run on astrocytes only.
+steps `rank-sensitivity` and `preprocessing-sensitivity` have no flag and run
+on astrocytes only; `positive-control` reads both cell types by role and
+takes `--basis` instead.
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -336,8 +348,8 @@ when behavior or defaults change.
   PVM-only supertype; results root `results/microglia/`; labels and cells
   from the metadata-only spike). The rule `results/` for the default,
   `results/<name>/` otherwise, is asserted at import (the cluster scripts
-  rely on it); `CELL_TYPE_SUBDIRS` and `cell_type_dirs` give the default
-  directories. The microglia reuse of the astrocyte `COHORT_THRESHOLDS`,
+  rely on it); `CELL_TYPE_SUBDIRS` (incl. `motco_latent_sensitivity`) and
+  `cell_type_dirs` give the default directories. The microglia reuse of the astrocyte `COHORT_THRESHOLDS`,
   `ADNC_STAGES` and per-cohort `k`, and of every export, analysis and
   stage-DE setting, is a decision of the change. `POSITIVE_CONTROL_CELL_TYPES`
   (control `microglia`, reference `astrocyte`), `POSITIVE_CONTROL_EXPECTATIONS`
@@ -348,14 +360,33 @@ when behavior or defaults change.
   technical table and the export's TMM / library sizes, not the six analysis
   covariates or `male`), `POSITIVE_CONTROL_PRIMARY_COHORT` (`cohort_30`; the
   control holds when E1–E3 all hold there), strict `>` (ties do not hold),
-  and the output names (`POSITIVE_CONTROL_*`). Reading rules for the report:
+  the output names (`POSITIVE_CONTROL_*`), and `POSITIVE_CONTROL_BASES` with
+  `POSITIVE_CONTROL_DEFAULT_BASIS` (`primary`, today's inputs, path and
+  bytes; `latent_adjusted`, the only non-primary basis, tied at import to an
+  arm of `LATENT_SENSITIVITY_ARMS` with a latent adjustment: E2 and E3 from
+  the arm and its diagnostic, E1 basis-independent, outputs under
+  `positive_control/latent_adjusted/<cohort>/`; no restated control for
+  `extended_covariates`, whose rank and CV AUROC equal the primary's by
+  MOTCO's contract, stated and checked in the report; the registry entry's
+  `reading` is the predeclared reading of the restated control, written
+  before any microglia arm ran, never changed from results). Reading rules
+  for the report:
   the control is about the stage signal, not the sex × stage hypothesis; if
   it holds the astrocyte null is not a pipeline failure, if not the latent
   construction is in question for any cell type; the microglia trajectory
   result is a second case-study result under the existing binding rules
   (with both stage-DE concordance cells), with MOTCO's operating
   characteristics measured on neither cell type's blocks; nothing found in
-  microglia changes any astrocyte output or reading.
+  microglia changes any astrocyte output or reading. The restated control on
+  `latent_adjusted` is a diagnosis of the primary-basis control, which stays
+  the control's outcome: if it holds in `cohort_30`, the measured quality
+  gradient explains the primary failure, without promoting the arm
+  (`candidate_fails` stands) or changing the primary-basis outcome or the
+  astrocyte reading; if not, the latent construction is in question beyond
+  the quality gradient (composition of the `Micro-PVM_*` bundle, rank-1
+  selection, microglia ATAC depth); E3 on that basis carries the mediator
+  caveat in both directions and a failure for that reason counts;
+  `cohort_50` is descriptive.
 - Technical-covariate constants (flag and ask before changing any of them):
   `TECHNICAL_GENE_SETS` (ribosomal `^RP[LS]\d+[A-Z]?$` / `^RPLP[0-2]$` /
   `RPSA`, so pseudogenes and kinases are excluded; the 13 `MT-` genes; `HBB`,
@@ -529,7 +560,8 @@ when behavior or defaults change.
   order), `LATENT_SENSITIVITY_CONDITIONING` (`stage`, MOTCO's admissible
   conditioning; `group_stage` is never run), `LATENT_SENSITIVITY_ARMS`
   (`extended_covariates`, `latent_adjusted`; a registry, never a flag, never
-  chosen from results), `LATENT_MOTCO_MIN_VERSION` (0.9.0), the mediator
+  chosen from results, the same for every cell type the step runs on),
+  `LATENT_MOTCO_MIN_VERSION` (0.9.0), the mediator
   check (`mediator_check`, the `DIAGNOSTIC_CORRELATION_THRESHOLD` reused,
   not partial on the covariates, written before the arms, never a gate),
   the output names (`LATENT_SENSITIVITY_*`), `n_jobs = 1` for reported
@@ -537,8 +569,10 @@ when behavior or defaults change.
   manifest records `measurement.latent_adjustment` and a `cli_equivalent`
   with `--latent-adjustment` only when the adjustment is set (absent for the
   primary, as MOTCO omits the setting from its record), the technical table
-  under `inputs.technical` and the fractions' source under
-  `covariates.sources`. Reading rules for the report: MOTCO's power
+  under `inputs.technical`, the fractions' source under
+  `covariates.sources` and the cell type; the comparison manifest records
+  the cell type and the cell-type findings of the manifests read. Reading
+  rules for the report (one per cell type the arms run on): MOTCO's power
   comparison (`candidate_fails`) excludes the latent adjustment as a
   replacement, so the arms are sensitivity only; a rejection status that
   differs is covariate-set dependence (primary vs `extended_covariates`) or
