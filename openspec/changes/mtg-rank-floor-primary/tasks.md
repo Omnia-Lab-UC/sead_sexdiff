@@ -44,8 +44,8 @@
 
 ## 7. Cluster
 
-- [ ] 7.1 On the cluster, pull the branch, `uv sync --locked`, and run the move script of 3.2 over the MOTCO-dependent directories present there. Verify that every moved file hashes as before and that the cluster's `pseudobulk/` and `motco_input/` directories are untouched.
-- [ ] 7.2 Copy every re-issued directory of both cell types from `nixos-home` to the cluster with rsync. Verify that every copied file's sha256 equals the workstation's.
+- [x] 7.1 On the cluster, pull the branch, `uv sync --locked`, and run the move script of 3.2 over the MOTCO-dependent directories present there. Verify that every moved file hashes as before and that the cluster's `pseudobulk/` and `motco_input/` directories are untouched.
+- [x] 7.2 Copy every re-issued directory of both cell types from `nixos-home` to the cluster with rsync. Verify that every copied file's sha256 equals the workstation's.
 
 ## Workflow follow-up
 
