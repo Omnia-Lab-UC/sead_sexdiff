@@ -320,10 +320,19 @@ when behavior or defaults change.
   workstation, `--cell-type`, per-donor caches excluded), `check_tmm_edger.R`
   (one-off edgeR cross-check of the export's TMM / log2-CPM),
   `check_cyclic_loess_limma.R` (limma cross-check of the variants' cyclic
-  loess on `_export_cohort` debug files) and `check_stage_de_deseq2.R` (R
+  loess on `_export_cohort` debug files), `check_stage_de_deseq2.R` (R
   DESeq2 cross-check of one `stage-de` fit on `run_stage_de(debug_dir=...)`
-  files).
+  files) and `move_superseded.py` (moves superseded output directories under
+  `results/superseded/<change>/`, hash-checked, standard library only).
 - `data/`, `results/` – gitignored; never commit their contents.
+- `results/superseded/<change>/` – superseded outputs, moved (never
+  deleted) by the change that re-issued them, with their path relative to
+  `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
+  file); never an input of any step or a default directory, not cited as
+  results. Now `mtg-rank-floor-primary/` (the rank-1 outputs of MOTCO
+  0.8.0 / 0.9.0, both cell types) and
+  `mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/` (the former
+  `results/motco_analysis_0.8.0/`).
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
   Their numbers are pasted from generated outputs (`summary.md`, manifests),
   never retyped, and checked against `result.json` before committing.
@@ -345,7 +354,16 @@ when behavior or defaults change.
   older than `ANALYSIS_MOTCO_MIN_VERSION` and `run_latent_sensitivity` one
   older than `LATENT_MOTCO_MIN_VERSION`. A pin move reruns `analyze` (the
   reference checks compare MOTCO versions) after checking the rerun against
-  the kept outputs.
+  the kept outputs. A pin move that changes the measurement re-issues every
+  MOTCO-dependent output (spec `motco-release-migration`): a same-machine
+  gate first (new pin with the previous measurement against the previous pin
+  from the pre-change commit: byte-identical CSVs, equal records, or stop),
+  the superseded directories moved with `scripts/move_superseded.py` on
+  every machine, every MOTCO-dependent step rerun from scratch in dependency
+  order for every cell type, a version-consistency check of every manifest
+  outside `results/superseded/`, the MOTCO-independent outputs hashed before
+  and after, and one re-issue report with the superseded values beside the
+  new ones and its reading written before the reruns.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
 - Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)

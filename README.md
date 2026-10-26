@@ -764,6 +764,27 @@ Reading rules, binding for the report (`reports/motco-donor-exclusion-sensitivit
 - The variant's exported RNA stage counts (DESeq2 `factor_additive` union, limma `stage_joint`) beside the primary's say how much of the stage signal survives the exclusion; the concordance cells apply to the variant analysis as to the primary. The cross-cell-type comparisons (variant CV AUROC, microglia against astrocytes; each cell type's variant counts against its primary counts) are compared, not tested.
 - Limitations carried: the excluded donors carry the most severe pathology, so the exclusion truncates the late epoch along with the quality tail and a stage effect concentrated in them is removed with them; the flag was made from QC metrics, so the variant conditions on quality by donor selection; the stage-2 cells are smaller, so the variant has less power; MOTCO's operating characteristics were measured on neither cohort; the flag's sex split bears on the sex × stage comparison.
 
+### Superseded outputs (`results/superseded/<change>/`)
+
+A MOTCO pin move that changes the measurement re-issues every MOTCO-dependent output, so that no output mixes two releases or rank rules: a same-machine gate first (the new pin with the previous measurement restored against the previous pin from the pre-change commit; byte-identical CSVs, equal records), then the superseded directories are moved, every MOTCO-dependent step is rerun from scratch in dependency order for every cell type it ran on, and a version-consistency check lists any manifest outside `results/superseded/` that records another MOTCO version or an analysis record without the current measurement setting.
+
+Superseded directories are moved, never deleted, to `results/superseded/<change>/` (the change that superseded them), keeping their path relative to `results/`: `results/microglia/motco_analysis/` becomes `results/superseded/<change>/microglia/motco_analysis/`. `scripts/move_superseded.py` (standard library only, so it runs with any `python3`, also on the cluster login node) hashes every file, renames on the same filesystem, re-hashes (a difference stops it) and writes `results/superseded/<change>/MOVED.json` (per move: old and new path, host, time and the sha256 of every file; directories absent on that machine are listed under `absent`). It refuses an existing target. Nothing under `results/superseded/` is an input of any step or a default directory; the superseded outputs are records, not a sensitivity arm, and are not cited as results, but every hash an earlier report cites stays resolvable there. The MOTCO-independent outputs (`pseudobulk/`, `motco_input/`, the donor, covariate, technical and flag tables, the annotation) are never moved.
+
+```
+python3 scripts/move_superseded.py --change mtg-rank-floor-primary \
+    motco_analysis motco_rank_sensitivity motco_diagnostics motco_sensitivity motco_latent_sensitivity \
+    stage_de stage_de_limma motco_exclusion_sensitivity \
+    microglia/motco_analysis microglia/motco_diagnostics microglia/motco_latent_sensitivity \
+    microglia/stage_de microglia/stage_de_limma microglia/motco_exclusion_sensitivity microglia/positive_control
+python3 scripts/move_superseded.py --change mtg-astrocyte-latent-adjustment-sensitivity \
+    motco_analysis_0.8.0=motco_analysis      # old[=new]
+```
+
+Current contents:
+
+- `mtg-rank-floor-primary/`: the MOTCO 0.8.0 / 0.9.0 outputs at rank floor 1 (every primary at CV-selected rank 1) and everything made from them: astrocyte `motco_analysis`, `motco_rank_sensitivity`, `motco_diagnostics`, `motco_sensitivity`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`; microglia under `microglia/` (`motco_analysis`, `motco_diagnostics`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`, `positive_control`). Superseded by the floored primaries (MOTCO 0.10.0, `ANALYSIS_RANK_FLOOR = 2`; `reports/motco-rank-floor-primary-<date>.md`).
+- `mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/`: the MOTCO 0.8.0 astrocyte primary that change kept as `results/motco_analysis_0.8.0/`.
+
 ### New: Subset donor AnnData files and write pseudobulk(s) (CLI)
 
 Use the `subset` command to load each donor `.h5ad` in a folder, filter by subclass, apply rudimentary QC, concatenate, and write outputs to disk.

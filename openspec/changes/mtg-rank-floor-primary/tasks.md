@@ -9,16 +9,16 @@
 
 ## 2. Same-machine gate (nixos-home, Nix shell)
 
-- [ ] 2.1 Create a worktree of the pre-change commit `b1a67a7` in the scratchpad, `uv sync --locked` there (MOTCO 0.9.0), and run `analyze --cohort all` for both cell types on the real exports into scratch directories (design D3 step 1). Verify that the four `analysis_manifest.json` record MOTCO 0.9.0 and the real exports' hashes.
-- [ ] 2.2 From the change branch, run `_analyze_cohort` with `min_components=1` on the same four exports into scratch directories (design D3 step 2). Verify that the four records carry no `min_components` in `params` and MOTCO 0.10.0 under `software`.
-- [ ] 2.3 Compare 2.1 and 2.2 with a scratch script (design D3 step 3). Verify that the four CSVs per cohort are byte-identical and the JSON equal after dropping `runtime_seconds`, `created_at`, `git`, `software.motco`, `cli_equivalent` and `measurement.min_components`. If anything differs, stop the change and report the differing file.
-- [ ] 2.4 Compare 2.2 with the kept primaries `results/motco_analysis/` and `results/microglia/motco_analysis/` (design D3 step 4). Verify that the outcome is recorded for the report: byte-identical expected for microglia (made here); for astrocytes (made on the cluster) the largest absolute differences and whether p-values, ranks and `analysis_metadata.csv` are equal.
+- [x] 2.1 Create a worktree of the pre-change commit `b1a67a7` in the scratchpad, `uv sync --locked` there (MOTCO 0.9.0), and run `analyze --cohort all` for both cell types on the real exports into scratch directories (design D3 step 1). Verify that the four `analysis_manifest.json` record MOTCO 0.9.0 and the real exports' hashes.
+- [x] 2.2 From the change branch, run `_analyze_cohort` with `min_components=1` on the same four exports into scratch directories (design D3 step 2). Verify that the four records carry no `min_components` in `params` and MOTCO 0.10.0 under `software`.
+- [x] 2.3 Compare 2.1 and 2.2 with a scratch script (design D3 step 3). Verify that the four CSVs per cohort are byte-identical and the JSON equal after dropping `runtime_seconds`, `created_at`, `git`, `software.motco`, `cli_equivalent` and `measurement.min_components`. If anything differs, stop the change and report the differing file.
+- [x] 2.4 Compare 2.2 with the kept primaries `results/motco_analysis/` and `results/microglia/motco_analysis/` (design D3 step 4). Verify that the outcome is recorded for the report: byte-identical expected for microglia (made here); for astrocytes (made on the cluster) the largest absolute differences and whether p-values, ranks and `analysis_metadata.csv` are equal.
 
 ## 3. Move the superseded outputs (nixos-home)
 
-- [ ] 3.1 Record the sha256 of every file under both cell types' `pseudobulk/` and `motco_input/` and of `data/annotation/` into the scratchpad. Verify that the listing is complete (file counts per directory).
-- [ ] 3.2 Write and run the move script (design D4): the MOTCO-dependent directories of both cell types to `results/superseded/mtg-rank-floor-primary/` (relative paths kept) and `results/motco_analysis_0.8.0/` to `results/superseded/mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/`, each with `MOVED.json`. Verify that every moved file hashes as before, that no MOTCO-dependent directory is left at its old path, and that the sha256 of each `result.json` cited by the earlier reports is found under `results/superseded/`.
-- [ ] 3.3 Document `results/superseded/<change>/` in README and AGENTS.md (layout, `MOVED.json`, never an input of any step). Verify that the documented paths match the moved tree.
+- [x] 3.1 Record the sha256 of every file under both cell types' `pseudobulk/` and `motco_input/` and of `data/annotation/` into the scratchpad. Verify that the listing is complete (file counts per directory).
+- [x] 3.2 Write and run the move script (design D4): the MOTCO-dependent directories of both cell types to `results/superseded/mtg-rank-floor-primary/` (relative paths kept) and `results/motco_analysis_0.8.0/` to `results/superseded/mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/`, each with `MOVED.json`. Verify that every moved file hashes as before, that no MOTCO-dependent directory is left at its old path, and that the sha256 of each `result.json` cited by the earlier reports is found under `results/superseded/`.
+- [x] 3.3 Document `results/superseded/<change>/` in README and AGENTS.md (layout, `MOVED.json`, never an input of any step). Verify that the documented paths match the moved tree.
 
 ## 4. Re-issue every MOTCO-dependent output (nixos-home, Nix shell, `n_jobs = 1`)
 
