@@ -5007,7 +5007,14 @@ ANALYSIS_SEED = 20261019
 ANALYSIS_ALPHA = 0.05
 # As in MOTCO's covariate Type I check; exact size alpha for (1 + b) / (1 + B) p-values
 ANALYSIS_REJECTION_RULE = "p <= alpha"
-ANALYSIS_MOTCO_MIN_VERSION = "0.8.0"
+# 0.10.0: the first release with the latent-rank floor
+ANALYSIS_MOTCO_MIN_VERSION = "0.10.0"
+# Latent-rank floor of the CV rank selection (MOTCO's `min_components`): its
+# validated default, passed explicitly and checked against it, so a MOTCO that
+# moved its default stops the run instead of changing the primary. The floor
+# defines `angle` and `shape` in at least two dimensions; it does not make them
+# powerful. A constant, never a flag.
+ANALYSIS_RANK_FLOOR = 2
 ANALYSIS_STATISTICS = ("delta", "angle", "shape")
 
 _ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "manifest.json")
@@ -5054,6 +5061,29 @@ def check_motco_version(
             f"({feature}); run `uv sync --locked`"
         )
     return installed
+
+
+def check_motco_rank_floor() -> int:
+    """Return ``ANALYSIS_RANK_FLOOR``; raise if MOTCO's default floor differs.
+
+    Raises
+    ------
+    RuntimeError
+        ``TrajectoryAnalysisParams().min_components`` (MOTCO's default, 1 when
+        MOTCO omits it) is not ``ANALYSIS_RANK_FLOOR``; the message names both
+        values. MOTCO's defaults are not overridden, so a moved default is an
+        error, never a silent change of the primary.
+    """
+    from motco.analysis import TrajectoryAnalysisParams
+
+    default = getattr(TrajectoryAnalysisParams(), "resolved_min_components", 1)
+    if default != ANALYSIS_RANK_FLOOR:
+        raise RuntimeError(
+            f"MOTCO's default rank floor (TrajectoryAnalysisParams().min_components) is {default} but "
+            f"ANALYSIS_RANK_FLOOR is {ANALYSIS_RANK_FLOOR}; the floor is MOTCO's validated default, so a "
+            "change of either is a change proposal, not a run; nothing was written"
+        )
+    return ANALYSIS_RANK_FLOOR
 
 
 def load_analysis_inputs(cohort_dir: str | Path, *, extra_covariates: pd.DataFrame | None = None) -> dict:
@@ -5184,6 +5214,11 @@ def _fmt(value, spec: str = ".6g") -> str:
     return "n/a" if value is None else format(value, spec)
 
 
+def _record_rank_floor(record: dict) -> int:
+    """The latent-rank floor an analysis record was made under (MOTCO omits floor 1 from ``params``)."""
+    return int(record.get("params", {}).get("min_components") or 1)
+
+
 def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA) -> str:
     """Render ``summary.md`` from a MOTCO analysis record (``result.json``).
 
@@ -5200,8 +5235,8 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
     -------
     str
         Markdown: statistics (observed, RRPP p, null mean/sd/q95, CV-selected
-        rank in the ``angle`` row), cell sizes, latent block and covariate block.
-        For a forced-rank record (``latent.component_selection == "forced"``)
+        rank and the rank floor it was selected under in the ``angle`` row),
+        cell sizes, latent block and covariate block. For a forced-rank record (``latent.component_selection == "forced"``)
         the ``angle`` row names the forced rank and says the CV-selected
         analysis is primary, and the latent block says cross-validation was
         skipped; the output for CV records is unchanged. A record with a
@@ -5239,7 +5274,7 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
                 "the CV-selected analysis is primary)"
             )
         elif s == "angle":
-            note = f"degrees; CV-selected rank {latent['selected_lv']}"
+            note = f"degrees; CV-selected rank {latent['selected_lv']} (rank floor {_record_rank_floor(record)})"
             if latent["selected_lv"] == 1:
                 note += " (at rank 1 the angle is 0° or 180° by construction)"
         lines.append(
@@ -5263,7 +5298,8 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         cv_line = (
             f"- CV: cv2_splits {cv.get('cv2_splits')}, cv1_splits {cv.get('cv1_splits')}, n_repeats "
             f"{cv.get('n_repeats')} ({latent.get('cv_repeats_completed')} completed), max_components "
-            f"{cv.get('max_components')}, random_state {cv.get('random_state')}"
+            f"{cv.get('max_components')}, rank floor {_record_rank_floor(record)}, random_state "
+            f"{cv.get('random_state')}"
         )
     lines += [
         "",
@@ -5345,6 +5381,7 @@ def _cli_equivalent(
         argv += [
             "--cv1-splits", str(params.cv1_splits), "--cv2-splits", str(params.cv2_splits),
             "--n-repeats", str(params.n_repeats), "--max-components", str(params.max_components),
+            "--min-components", str(params.resolved_min_components),
             "--cv-random-state", str(params.random_state),
         ]
     argv += ["--out-dir", "OUT_DIR"]
@@ -5393,6 +5430,9 @@ def _analyze_cohort(
     params:
         ``motco.analysis.TrajectoryAnalysisParams``; ``forced_components`` set
         for a forced-rank run, ``None`` for CV rank selection;
+        ``min_components`` the rank floor (``ANALYSIS_RANK_FLOOR`` from every
+        caller; recorded as ``measurement.min_components`` and, for CV runs,
+        ``--min-components`` in ``cli_equivalent``);
         ``covariate_latent_adjustment`` set for a latent-adjusted run (recorded
         as ``measurement.latent_adjustment`` and ``--latent-adjustment`` in
         ``cli_equivalent``; both absent when it is ``None``, as MOTCO leaves
@@ -5433,6 +5473,13 @@ def _analyze_cohort(
     -------
     dict
         ``{"dir": Path, "record": dict, "manifest": dict, "findings": [...]}``.
+
+    Raises
+    ------
+    RuntimeError
+        The installed MOTCO is older than ``ANALYSIS_MOTCO_MIN_VERSION``, or
+        its default rank floor is not ``ANALYSIS_RANK_FLOOR``
+        (``check_motco_rank_floor``); nothing is written.
     """
     import io
     import shutil
@@ -5441,6 +5488,7 @@ def _analyze_cohort(
     from motco.analysis import OmicsBlock, TrajectoryDataset, analyze_trajectories, write_analysis_outputs
 
     motco_version = check_motco_version()
+    check_motco_rank_floor()
     covariates = tuple(covariates)
     blocks = loaded["blocks"]
     export_manifest = loaded["export_manifest"]
@@ -5474,7 +5522,10 @@ def _analyze_cohort(
         covariate_cols=covariates,
         missing_covariates=ANALYSIS_MISSING_COVARIATES,
     )
-    selection = "CV rank selection" if forced is None else f"forced rank {forced}"
+    selection = (
+        f"CV rank selection (rank floor {params.resolved_min_components})" if forced is None
+        else f"forced rank {forced}"
+    )
     if latent is not None:
         selection += f" with the {latent}-conditioned covariate latent adjustment"
     print(f"[{log_prefix}] {cohort}: {selection} + {params.permutations} RRPP permutations (n_jobs {n_jobs})...")
@@ -5577,6 +5628,7 @@ def _analyze_cohort(
         "measurement": {
             "orientation_estimator": params.orientation_estimator,
             "component_selection": record["latent"]["component_selection"],
+            "min_components": params.resolved_min_components,
             "forced_components": params.forced_components,
             **(
                 {"cv": None, "cv_note": "cross-validation skipped: the latent rank was forced"}
@@ -5658,14 +5710,16 @@ def run_analysis(
     Blocks ``rna`` and ``atac`` in identity units, group ``sex``, stage
     ``stage`` in the order 0, 1, 2, covariates ``ANALYSIS_COVARIATES``
     (missing policy ``error``), MOTCO's default net-displacement orientation
-    and double-CV rank, ``ANALYSIS_PERMUTATIONS`` RRPP permutations with
-    ``ANALYSIS_SEED``. The model's metadata table is serialized to
+    and double-CV rank at the rank floor ``ANALYSIS_RANK_FLOOR`` (MOTCO's
+    default, passed explicitly and checked against it before any input is
+    read), ``ANALYSIS_PERMUTATIONS`` RRPP permutations with ``ANALYSIS_SEED``. The model's metadata table is serialized to
     ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
     parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
     run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete
     (``_analyze_cohort``, shared with ``run_rank_sensitivity``).
     """
     motco_version = check_motco_version()
+    rank_floor = check_motco_rank_floor()
     from motco.analysis import TrajectoryAnalysisParams
 
     cell_type_entry(cell_type)
@@ -5681,7 +5735,7 @@ def run_analysis(
     for c in cohorts:
         if not (input_dir / c).is_dir():
             raise FileNotFoundError(f"{input_dir / c} does not exist; run `sead-sexdiff export` to produce it")
-    print(f"[analyze] MOTCO {motco_version}")
+    print(f"[analyze] MOTCO {motco_version} (rank floor {rank_floor})")
     print(f"[analyze] Cell type: {cell_type}")
     print(f"[analyze] Input directory: {input_dir}")
     print(f"[analyze] Output directory: {out_dir}")
@@ -5696,7 +5750,9 @@ def run_analysis(
     for c in cohorts:
         cohort_dir = input_dir / c
         loaded, findings = loaded_by_cohort.pop(c)
-        params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+        params = TrajectoryAnalysisParams(
+            permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR
+        )
         results[c] = _analyze_cohort(
             c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs, findings=findings,
             cell_type=cell_type,
@@ -5764,8 +5820,10 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
         names the ``analyze`` command).
     ValueError
         An export file's sha256, the MOTCO version, the seed, the permutation
-        count or the component selection recorded by the analysis differs from
-        the sweep's; the message names the file or setting.
+        count, the rank floor (``params.min_components`` of ``result.json``,
+        absent meaning 1, against ``ANALYSIS_RANK_FLOOR``) or the component
+        selection recorded by the analysis differs from the sweep's; the
+        message names the file or setting.
     """
     d = Path(analysis_dir)
     hint = "run `sead-sexdiff analyze` to produce it"
@@ -5798,6 +5856,12 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
             raise ValueError(
                 f"{d / 'analysis_manifest.json'} records {key} = {meas.get(key)} but the sweep uses {expected}; {rerun}"
             )
+    floor = _record_rank_floor(record)
+    if floor != ANALYSIS_RANK_FLOOR:
+        raise ValueError(
+            f"{d / 'result.json'} was made at rank floor {floor} (params.min_components; absent means 1) but "
+            f"the reference must be made at ANALYSIS_RANK_FLOOR = {ANALYSIS_RANK_FLOOR}; {rerun}"
+        )
     selection = record.get("latent", {}).get("component_selection")
     if selection != "cv":
         raise ValueError(
@@ -5955,7 +6019,9 @@ def run_rank_sensitivity(
     hashes and settings, feasibility of every rank) runs for every requested
     cohort before anything is written. Each rank is one ``_analyze_cohort``
     call with ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
-    seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k)``, so the only
+    seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
+    min_components=ANALYSIS_RANK_FLOOR)`` (the floor does not act on a forced
+    rank; it keeps ``params`` uniform), so the only
     difference from the ``analyze`` step is the rank; cross-validation does
     not run. A cohort is written under ``<cohort>.tmp/`` (``rank_<kk>/``
     directories, ``rank_sensitivity.csv``, ``rank_sensitivity.md``,
@@ -6030,7 +6096,8 @@ def run_rank_sensitivity(
         for k in ladder:
             name = RANK_SENSITIVITY_DIR_TEMPLATE.format(k)
             params = TrajectoryAnalysisParams(
-                permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k
+                permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
+                min_components=ANALYSIS_RANK_FLOOR,
             )
             runs[k] = _analyze_cohort(
                 c, cohort_dir, loaded, params,
@@ -6076,8 +6143,6 @@ def run_rank_sensitivity(
                     f"(statistics equal: {stats_equal}; p-values equal: {p_equal}); the same data, rank and "
                     "seed should give the same record"
                 )
-        elif ref_rank == 1:
-            findings.append(f"CV-selected rank 1 is not in the ladder {ladder}: {RANK_1_NOTE}")
         else:
             findings.append(
                 f"CV-selected rank {ref_rank} is not in the ladder {ladder}; the reference row stands in for it"
@@ -6110,6 +6175,10 @@ def run_rank_sensitivity(
             "n_donors": int(len(loaded["metadata"])),
             "forced_ranks": list(ladder),
             "rank_1_note": RANK_1_NOTE,
+            "rank_floor": ANALYSIS_RANK_FLOOR,
+            "rank_floor_note": (
+                "the reference was CV-selected at this floor; the floor does not act on a forced rank"
+            ),
             "seed": ANALYSIS_SEED,
             "permutations": ANALYSIS_PERMUTATIONS,
             "same_seed_note": (
@@ -6130,9 +6199,13 @@ def run_rank_sensitivity(
                 "motco": reference["manifest"]["software"]["motco"],
                 "seed": reference["manifest"]["measurement"]["seed"],
                 "permutations": reference["manifest"]["measurement"]["permutations"],
+                "min_components": _record_rank_floor(ref_record),
                 "in_ladder": ref_rank in ladder,
                 "forced_run_at_cv_rank": at_cv_rank,
-                "note": "read and checked (export hashes, MOTCO version, seed, permutations), never rerun or modified",
+                "note": (
+                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor), never rerun "
+                    "or modified"
+                ),
             },
             "ranks": {
                 str(k): {
@@ -7271,10 +7344,11 @@ def run_preprocessing_sensitivity(
     Every check (registered variant, existing output, inputs present, primary
     export vs the pseudobulk manifest, covariates manifest, annotation,
     thresholds, ``k``, cells and donor count, primary analysis vs the export
-    hashes, MOTCO version, seed, permutations and CV selection; for a variant
-    that excludes gene sets, residualizes or runs the adoption check, the
-    technical table vs the pseudobulk manifest, ``TECHNICAL_GENE_SETS`` and
-    completeness for the cohort donors, ``_check_technical_reference``) runs
+    hashes, MOTCO version, seed, permutations, rank floor and CV selection;
+    for a variant that excludes gene sets, residualizes or runs the adoption
+    check, the technical table vs the pseudobulk manifest,
+    ``TECHNICAL_GENE_SETS`` and completeness for the cohort donors,
+    ``_check_technical_reference``) runs
     for every requested variant and cohort before anything is written. Per
     cohort the variant export is one ``_export_cohort`` call with the
     variant's keyword(s) (the primary pipeline with the registered setting(s)
@@ -7430,7 +7504,10 @@ def run_preprocessing_sensitivity(
                         "not the ones the primary export was made from"
                     )
             loaded_v = load_analysis_inputs(exp["dir"])
-            params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+            params = TrajectoryAnalysisParams(
+                permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
+                min_components=ANALYSIS_RANK_FLOOR,
+            )
             ana = _analyze_cohort(
                 c, exp["dir"], loaded_v, params,
                 out_dir=v_root / PREPROCESSING_ANALYSIS_DIR, final_name=c, n_jobs=n_jobs,
@@ -7596,7 +7673,7 @@ def run_preprocessing_sensitivity(
                     },
                     "note": (
                         "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
-                        "export file hashes, MOTCO version, seed, permutations, CV selection), never rerun or modified"
+                        "export file hashes, MOTCO version, seed, permutations, rank floor, CV selection), never rerun or modified"
                     ),
                 },
                 "variant_run": {
@@ -9075,9 +9152,10 @@ def run_latent_sensitivity(
     ``covariates = LATENT_SENSITIVITY_COVARIATES``, the fractions merged from
     the technical table (``load_analysis_inputs(extra_covariates=...)``) and
     ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
-    seed=ANALYSIS_SEED, n_jobs=n_jobs, covariate_latent_adjustment=...)``, so
-    everything else equals ``analyze`` (blocks, stage order, orientation, CV
-    rank selection, seed, permutations). The arm manifests record the five
+    seed=ANALYSIS_SEED, n_jobs=n_jobs, covariate_latent_adjustment=...,
+    min_components=ANALYSIS_RANK_FLOOR)``, so everything else equals
+    ``analyze`` (blocks, stage order, orientation, CV rank selection and its
+    floor, seed, permutations). The arm manifests record the five
     export files as ``inputs.files`` (so ``axis-diagnostics`` can read an arm
     against the primary export) and the technical table under
     ``inputs.technical``. The arms are written as ``<cohort>.tmp/`` and the
@@ -9147,7 +9225,7 @@ def run_latent_sensitivity(
     params = {
         arm: TrajectoryAnalysisParams(
             permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
-            covariate_latent_adjustment=spec["latent_adjustment"],
+            covariate_latent_adjustment=spec["latent_adjustment"], min_components=ANALYSIS_RANK_FLOOR,
         )
         for arm, spec in LATENT_SENSITIVITY_ARMS.items()
     }
@@ -9408,7 +9486,7 @@ def run_latent_sensitivity(
                     "seed": reference["manifest"]["measurement"]["seed"],
                     "permutations": reference["manifest"]["measurement"]["permutations"],
                     "note": (
-                        "read and checked (export hashes, MOTCO version, seed, permutations, CV selection, orientation "
+                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection, orientation "
                         "and CV settings), never rerun or modified; its files hash identically after the run"
                     ),
                 },
@@ -10662,10 +10740,10 @@ def run_stage_de(
         A reference check fails (pseudobulk manifest hash, reproduction of the
         export from the counts, donors / sex / stage, k and cells, feature
         statuses, the analysis's export hashes, MOTCO version, seed,
-        permutations or CV selection), a covariate value is missing, a fit
-        record was made from other inputs (without ``force``), a design is not
-        full rank or a coefficient cannot be resolved, or ``out_dir`` lies
-        inside an input directory.
+        permutations, rank floor or CV selection), a covariate value is
+        missing, a fit record was made from other inputs (without ``force``),
+        a design is not full rank or a coefficient cannot be resolved, or
+        ``out_dir`` lies inside an input directory.
 
     Notes
     -----
@@ -10746,7 +10824,7 @@ def run_stage_de(
                 )
         print(
             f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
-            f"{motco_version}, seed, permutations, CV selection); delta rejected: "
+            f"{motco_version}, seed, permutations, rank floor, CV selection); delta rejected: "
             f"{'yes' if prep['delta_rejected'] else 'no'}"
         )
         prepared[c] = prep
@@ -10963,7 +11041,7 @@ def run_stage_de(
                 "seed": reference["manifest"]["measurement"]["seed"],
                 "permutations": reference["manifest"]["measurement"]["permutations"],
                 "note": (
-                    "read and checked (export hashes, MOTCO version, seed, permutations, CV selection), never rerun "
+                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection), never rerun "
                     "or modified; only its delta rejection status enters the concordance rule"
                 ),
             },
@@ -12200,7 +12278,7 @@ def run_stage_de_limma(
                 )
             print(
                 f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
-                f"{motco_version}, seed, permutations, CV selection); delta rejected: "
+                f"{motco_version}, seed, permutations, rank floor, CV selection); delta rejected: "
                 f"{'yes' if prep['delta_rejected'] else 'no'}"
             )
             prepared[c] = prep
@@ -12429,7 +12507,7 @@ def run_stage_de_limma(
                     "seed": reference["manifest"]["measurement"]["seed"],
                     "permutations": reference["manifest"]["measurement"]["permutations"],
                     "note": (
-                        "read and checked (export hashes, MOTCO version, seed, permutations, CV selection), never "
+                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection), never "
                         "rerun or modified; only its delta rejection status enters the concordance rules"
                     ),
                 },
@@ -13836,7 +13914,9 @@ def run_exclusion_sensitivity(
     motco_version = check_motco_version()
     from motco.analysis import TrajectoryAnalysisParams
 
-    params = TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs)
+    params = TrajectoryAnalysisParams(
+        permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR
+    )
     print(f"[{log}] MOTCO {motco_version}")
     print(f"[{log}] Cell type: {cell_type}")
     print(f"[{log}] Pseudobulk directory: {pb}")
@@ -14178,7 +14258,7 @@ def run_exclusion_sensitivity(
                         },
                         "note": (
                             "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
-                            "export file hashes, MOTCO version, seed, permutations, CV selection, orientation and CV "
+                            "export file hashes, MOTCO version, seed, permutations, rank floor, CV selection, orientation and CV "
                             "settings), never rerun or modified; its files hash identically after the run"
                         ),
                     },

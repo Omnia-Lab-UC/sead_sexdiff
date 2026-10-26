@@ -59,7 +59,8 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    MOTCO change.
 6. `analyze` – from `results/motco_input/` only, per cohort: the
    covariate-adjusted sex × stage trajectory comparison through MOTCO's
-   `analyze_trajectories` (≥ 0.8.0), writing `results/motco_analysis/<cohort>/`
+   `analyze_trajectories` (≥ 0.10.0) with CV rank selection at the rank
+   floor `ANALYSIS_RANK_FLOOR` (2), writing `results/motco_analysis/<cohort>/`
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
    `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
    `summary.md`). Never assemble it from `motco plsr` + `motco de`.
@@ -69,8 +70,8 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    rank forced to each value of `ANALYSIS_FORCED_RANKS`, everything else
    (inputs, covariates, orientation, permutations, seed) equal to `analyze`.
    The CV-selected analysis is read and checked (export hashes, MOTCO
-   version, seed, permutations), never rerun or modified, and is the
-   reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
+   version, seed, permutations, rank floor), never rerun or modified, and is
+   the reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
    (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
 8. `preprocessing-sensitivity` – from `results/pseudobulk/` (incl.
@@ -319,10 +320,19 @@ when behavior or defaults change.
   workstation, `--cell-type`, per-donor caches excluded), `check_tmm_edger.R`
   (one-off edgeR cross-check of the export's TMM / log2-CPM),
   `check_cyclic_loess_limma.R` (limma cross-check of the variants' cyclic
-  loess on `_export_cohort` debug files) and `check_stage_de_deseq2.R` (R
+  loess on `_export_cohort` debug files), `check_stage_de_deseq2.R` (R
   DESeq2 cross-check of one `stage-de` fit on `run_stage_de(debug_dir=...)`
-  files).
+  files) and `move_superseded.py` (moves superseded output directories under
+  `results/superseded/<change>/`, hash-checked, standard library only).
 - `data/`, `results/` – gitignored; never commit their contents.
+- `results/superseded/<change>/` – superseded outputs, moved (never
+  deleted) by the change that re-issued them, with their path relative to
+  `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
+  file); never an input of any step or a default directory, not cited as
+  results. Now `mtg-rank-floor-primary/` (the rank-1 outputs of MOTCO
+  0.8.0 / 0.9.0, both cell types) and
+  `mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/` (the former
+  `results/motco_analysis_0.8.0/`).
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
   Their numbers are pasted from generated outputs (`summary.md`, manifests),
   never retyped, and checked against `result.json` before committing.
@@ -337,14 +347,23 @@ when behavior or defaults change.
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
 - Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|donor-flags|exclusion-sensitivity|subset|de> [options]`.
 - `motco` is a git dependency pinned to a release tag of
-  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.9.0`;
+  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.10.0`;
   `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
   never as a path dependency on `../MOTCO`. It pins scikit-learn exactly; do
   not loosen that pin to resolve a conflict. `run_analysis` refuses a MOTCO
   older than `ANALYSIS_MOTCO_MIN_VERSION` and `run_latent_sensitivity` one
   older than `LATENT_MOTCO_MIN_VERSION`. A pin move reruns `analyze` (the
   reference checks compare MOTCO versions) after checking the rerun against
-  the kept outputs.
+  the kept outputs. A pin move that changes the measurement re-issues every
+  MOTCO-dependent output (spec `motco-release-migration`): a same-machine
+  gate first (new pin with the previous measurement against the previous pin
+  from the pre-change commit: byte-identical CSVs, equal records, or stop),
+  the superseded directories moved with `scripts/move_superseded.py` on
+  every machine, every MOTCO-dependent step rerun from scratch in dependency
+  order for every cell type, a version-consistency check of every manifest
+  outside `results/superseded/`, the MOTCO-independent outputs hashed before
+  and after, and one re-issue report with the superseded values beside the
+  new ones and its reading written before the reruns.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
 - Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)
@@ -449,7 +468,10 @@ when behavior or defaults change.
   the quality gradient (composition of the `Micro-PVM_*` bundle, rank-1
   selection, microglia ATAC depth); E3 on that basis carries the mediator
   caveat in both directions and a failure for that reason counts;
-  `cohort_50` is descriptive.
+  `cohort_50` is descriptive. Since `mtg-rank-floor-primary` the control's
+  outcome on the floored primary is the primary-basis outcome, with the
+  superseded (rank-1) outcome reported beside it per expectation and cohort
+  as dependence on the rank rule; E1–E3 and the all-three rule unchanged.
 - Technical-covariate constants (flag and ask before changing any of them):
   `TECHNICAL_GENE_SETS` (ribosomal `^RP[LS]\d+[A-Z]?$` / `^RPLP[0-2]$` /
   `RPSA`, so pseudogenes and kinases are excluded; the 13 `MT-` genes; `HBB`,
@@ -480,9 +502,19 @@ when behavior or defaults change.
   `ANALYSIS_MISSING_COVARIATES` (`error`, never impute),
   `ANALYSIS_PERMUTATIONS` (999), `ANALYSIS_SEED` (20261019),
   `ANALYSIS_ALPHA` (0.05) with `ANALYSIS_REJECTION_RULE` (p ≤ α),
-  `ANALYSIS_MOTCO_MIN_VERSION` (0.8.0). MOTCO's own defaults (net-displacement
-  orientation, double-CV rank) are not overridden, and there is no
-  unadjusted run. `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
+  `ANALYSIS_MOTCO_MIN_VERSION` (0.10.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
+  validated `min_components` default: passed explicitly in every
+  `TrajectoryAnalysisParams` the package builds, checked against MOTCO's
+  default before any input is read (`check_motco_rank_floor`; a mismatch
+  stops the run naming both values), recorded as `measurement.min_components`
+  and `--min-components` in `cli_equivalent`, printed in `summary.md`, and
+  checked by `_check_reference`, so no step compares against an unfloored
+  reference). MOTCO's own defaults (net-displacement orientation, double-CV
+  rank at the floor) are not overridden, and there is no unadjusted run. The
+  floored analysis is the primary of both cell types since
+  `mtg-rank-floor-primary`; the earlier rank-1 analyses are superseded
+  records, not a sensitivity arm. The rank-1 code paths stay for analyses
+  made at floor 1 by hand. `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
   worker), so report results from `n_jobs = 1`.
 - Rank-sensitivity constants (flag and ask before changing any of them):
   `ANALYSIS_FORCED_RANKS` (2, 3, 4, 6, 9, 12: 2 = `n_stages − 1`, 3 the next
@@ -490,14 +522,19 @@ when behavior or defaults change.
   the forced rank with a Type I check; a constant, never a flag, never
   chosen from results), the same `ANALYSIS_SEED` and `ANALYSIS_PERMUTATIONS`
   at every rank (so every rank draws the same permutation indices), rank 1
-  not forceable (MOTCO accepts `forced_components ≥ 2`; the CV-selected
-  analysis is the reference row), `n_jobs = 1` for reported results, and the
+  not forceable (MOTCO accepts `forced_components ≥ 2`), the CV-selected
+  analysis (rank ≥ the floor) as the reference row (the forced run at its
+  rank, when in the ladder, must equal it; otherwise the manifest says the
+  reference row stands in for it), `n_jobs = 1` for reported results, and the
   rule that the CV-selected analysis stays primary.
 - Reporting MOTCO results follows the binding rules in
   `../MOTCO/docs/roadmap.md` (Phase 6, Next changes item 1): CV-selected rank
   beside `angle`; `angle`/`shape` non-rejections are uninformative; a
   `delta` rejection is a difference, not specifically of size; report the
-  covariate block and the feature filtering beside the results. The
+  covariate block and the feature filtering beside the results. The rank
+  floor defines `angle` and `shape` in at least two dimensions without making
+  them powerful (two dimensions, not a second axis with signal): give each
+  analysis's `config_spectrum` eigengap and null summary beside `angle`. The
   forced-rank sweep is read as sensitivity only: the CV-selected analysis
   stays primary, a rejection status that differs between ranks is rank
   dependence (not a result at that rank), the non-rejection rules hold at
