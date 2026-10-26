@@ -42,4 +42,4 @@ dev = [
 packages = ["src/sead_sexdiff"]
 
 [tool.uv.sources]
-motco = { git = "https://github.com/tomszar/MOTCO", rev = "v0.9.0" }
+motco = { git = "https://github.com/tomszar/MOTCO", rev = "v0.10.0" }
