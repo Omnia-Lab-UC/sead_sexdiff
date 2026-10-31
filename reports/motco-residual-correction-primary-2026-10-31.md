@@ -80,7 +80,7 @@ Before the reruns, `scripts/move_superseded.py` moved 15 directories (1130 files
 
 ### 1.7 Cluster
 
-PENDING: section 7 of the change runs after this report is first committed.
+`cluster.ing.uc.cl` holds the canonical copy. There the branch was checked out at `ecf077e` and `uv sync --locked` replaced the git-pinned MOTCO 0.10.0 with `motco==0.13.0` from PyPI on the login node (`import motco` prints 0.13.0, scikit-learn 1.8.0). The same move (`scripts/move_superseded.py --change mtg-residual-correction-primary`, the directory list of 1.8) moved 15 directories (1,130 files; absent there too: `microglia/motco_rank_sensitivity`, `microglia/motco_sensitivity`), every file hashing as before; the moved tree is identical in files and sha256 to this machine's superseded tree and to the cluster's own hashes taken before its outputs were copied to this machine (section 1), and the 758 files of `pseudobulk/` and `motco_input/` of both cell types hash unchanged. Then the 15 re-issued directories (1,130 files) were copied from `nixos-dell-laptop` with rsync, every file's sha256 equal on both machines; every MOTCO version recorded in a JSON file outside `results/superseded/` on the cluster (172 fields) is 0.13.0.
 
 ### 1.8 Commands
 
