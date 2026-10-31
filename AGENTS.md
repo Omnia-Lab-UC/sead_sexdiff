@@ -59,8 +59,9 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    MOTCO change.
 6. `analyze` – from `results/motco_input/` only, per cohort: the
    covariate-adjusted sex × stage trajectory comparison through MOTCO's
-   `analyze_trajectories` (≥ 0.10.0) with CV rank selection at the rank
-   floor `ANALYSIS_RANK_FLOOR` (2), writing `results/motco_analysis/<cohort>/`
+   `analyze_trajectories` (≥ 0.13.0) with CV rank selection at the rank
+   floor `ANALYSIS_RANK_FLOOR` (2) and the RRPP null drawn under the residual
+   correction `ANALYSIS_RESIDUAL_CORRECTION` (`df`), writing `results/motco_analysis/<cohort>/`
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
    `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
    `summary.md`). Never assemble it from `motco plsr` + `motco de`.
@@ -346,11 +347,15 @@ when behavior or defaults change.
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
 - Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|donor-flags|exclusion-sensitivity|subset|de> [options]`.
-- `motco` is a git dependency pinned to a release tag of
-  `https://github.com/tomszar/MOTCO` (`[tool.uv.sources]`, now `v0.10.0`;
-  `uv.lock` holds the commit). Move it only with `uv add "motco @ git+https://github.com/tomszar/MOTCO@vX.Y.Z"`,
-  never as a path dependency on `../MOTCO`. It pins scikit-learn exactly; do
-  not loosen that pin to resolve a conflict. `run_analysis` refuses a MOTCO
+- `motco` is pinned to an exact PyPI version (`motco==0.13.0` in
+  `pyproject.toml`; `uv.lock` holds the wheel's and sdist's sha256). Move it
+  only with `uv add "motco==X.Y.Z"`, and before any run under the new pin
+  check that the wheel's `motco/` tree is byte-identical to `src/motco/` at
+  the release tag `vX.Y.Z` of `https://github.com/Omnia-Lab-UC/MOTCO`
+  (`git -C ../MOTCO archive vX.Y.Z src/motco`) and that `uv export` changes
+  only the motco line (no other locked package moves); record both checks in
+  the re-issue report. Never a git or path dependency (`../MOTCO`). It pins
+  scikit-learn exactly; do not loosen that pin to resolve a conflict. `run_analysis` refuses a MOTCO
   older than `ANALYSIS_MOTCO_MIN_VERSION` and `run_latent_sensitivity` one
   older than `LATENT_MOTCO_MIN_VERSION`. A pin move reruns `analyze` (the
   reference checks compare MOTCO versions) after checking the rerun against
@@ -358,7 +363,9 @@ when behavior or defaults change.
   MOTCO-dependent output (spec `motco-release-migration`): a same-machine
   gate first (new pin with the previous measurement against the previous pin
   from the pre-change commit: byte-identical CSVs, equal records, or stop),
-  the superseded directories moved with `scripts/move_superseded.py` on
+  for a new setting MOTCO documents as moving only named outputs a contract
+  gate on the primaries (new pin with and without it: everything else equal,
+  or stop), the superseded directories moved with `scripts/move_superseded.py` on
   every machine, every MOTCO-dependent step rerun from scratch in dependency
   order for every cell type, a version-consistency check of every manifest
   outside `results/superseded/`, the MOTCO-independent outputs hashed before
@@ -472,6 +479,13 @@ when behavior or defaults change.
   outcome on the floored primary is the primary-basis outcome, with the
   superseded (rank-1) outcome reported beside it per expectation and cohort
   as dependence on the rank rule; E1–E3 and the all-three rule unchanged.
+  Since `mtg-residual-correction-primary` the control's outcome on the
+  corrected primary (both bases) is the primary-basis outcome, with the
+  superseded (uncorrected) outcome beside it; no expectation reads a p-value,
+  so E1–E3's values are compared with the superseded ones (a difference
+  beyond rounding is a finding); the restated control reads only the arm's
+  CV AUROC and first-component correlations, which the `residualized_basis`
+  diagnosis does not bear on, so its predeclared reading stands.
 - Technical-covariate constants (flag and ask before changing any of them):
   `TECHNICAL_GENE_SETS` (ribosomal `^RP[LS]\d+[A-Z]?$` / `^RPLP[0-2]$` /
   `RPSA`, so pseudogenes and kinases are excluded; the 13 `MT-` genes; `HBB`,
@@ -502,19 +516,37 @@ when behavior or defaults change.
   `ANALYSIS_MISSING_COVARIATES` (`error`, never impute),
   `ANALYSIS_PERMUTATIONS` (999), `ANALYSIS_SEED` (20261019),
   `ANALYSIS_ALPHA` (0.05) with `ANALYSIS_REJECTION_RULE` (p ≤ α),
-  `ANALYSIS_MOTCO_MIN_VERSION` (0.10.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
+  `ANALYSIS_MOTCO_MIN_VERSION` (0.13.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
   validated `min_components` default: passed explicitly in every
   `TrajectoryAnalysisParams` the package builds, checked against MOTCO's
   default before any input is read (`check_motco_rank_floor`; a mismatch
   stops the run naming both values), recorded as `measurement.min_components`
   and `--min-components` in `cli_equivalent`, printed in `summary.md`, and
   checked by `_check_reference`, so no step compares against an unfloored
-  reference). MOTCO's own defaults (net-displacement orientation, double-CV
-  rank at the floor) are not overridden, and there is no unadjusted run. The
-  floored analysis is the primary of both cell types since
-  `mtg-rank-floor-primary`; the earlier rank-1 analyses are superseded
-  records, not a sensitivity arm. The rank-1 code paths stay for analyses
-  made at floor 1 by hand. `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
+  reference), `ANALYSIS_RESIDUAL_CORRECTION` (`df`: RRPP permutes the reduced
+  model's residuals multiplied by κ = √(n / (n − r)), r the reduced model's
+  rank, 10 with the six covariates and 12 with the eight of the latent arms,
+  so only the null moves (p-values, null summaries, the permutation-pooled
+  eigengap); MOTCO's validated opt-in by its verdict `adopt_df`
+  (`corrected-permutation-2026-10-30.md`), not its default: the one MOTCO
+  default the package overrides, never a flag; passed explicitly in every
+  `TrajectoryAnalysisParams` the package builds, checked in the record after
+  each run before anything is written (`measurement.residual_correction` of
+  the requested kind with κ, or the run stops naming both settings),
+  recorded as the manifest's `measurement.residual_correction` (kind, n,
+  reduced rank, κ) and `--residual-correction df` in `cli_equivalent`,
+  printed in `summary.md` ("RRPP null: residual correction …"; records
+  without one render as before), and checked by `_check_reference`
+  (`params.residual_correction`, absent meaning none), so no step compares
+  against an uncorrected reference). MOTCO's other defaults (net-displacement
+  orientation, double-CV rank at the floor) are not overridden, and there is
+  no unadjusted run. The floored, `df`-corrected analysis is the primary of
+  both cell types since `mtg-residual-correction-primary`; the earlier
+  floored uncorrected analyses (MOTCO 0.10.0, their p-values withheld by
+  MOTCO's roadmap from 2026-10-30) and rank-1 analyses are superseded
+  records, not a sensitivity arm. The rank-1 and uncorrected code paths stay
+  for analyses made by hand (`_analyze_cohort` with `min_components=1` or
+  `residual_correction=None`). `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
   worker), so report results from `n_jobs = 1`.
 - Rank-sensitivity constants (flag and ask before changing any of them):
   `ANALYSIS_FORCED_RANKS` (2, 3, 4, 6, 9, 12: 2 = `n_stages − 1`, 3 the next
@@ -542,7 +574,14 @@ when behavior or defaults change.
   forced 4 only, unadjusted; `shape` power loss and `angle` leakage at
   forced 2(K − 1); wider `angle` null above `n_stages − 1`) are carried as
   limitations, and the adjusted analysis has no Type I check at any forced
-  rank.
+  rank. Under the `df` residual correction the p-values are size-controlled
+  at the configuration MOTCO measured (six covariates, both `cohort_30`
+  tables; `corrected-permutation-2026-10-30.md`), with `delta` conservative
+  there (0.029 / 0.031 pooled), so a `delta` non-rejection stays weak
+  evidence; the size is inferred from the mechanism (n and the reduced rank),
+  not measured, for `cohort_50`, the eight-covariate latent arms, the
+  exclusion variants, the forced ranks and the preprocessing variants, each
+  carried as a limitation.
 - Preprocessing-sensitivity constants (flag and ask before changing any of
   them): `PREPROCESSING_VARIANTS`, a registry keyed by variant name with a
   `description` and the `_export_cohort` keyword(s) it changes (`keep_chrx`:
@@ -678,16 +717,24 @@ when behavior or defaults change.
   differs is covariate-set dependence (primary vs `extended_covariates`) or
   basis dependence (`extended_covariates` vs `latent_adjusted`), not a
   result of the arm; a CV-selected rank that differs is reported beside
-  `angle`; the non-rejection rules hold in every arm; an arm's first-axis
-  technical correlations (`axis-diagnostics` on the arm, whose tables label
-  it `primary`) are a measurement-space finding only. Carried limitations:
-  the mediator limitation with the mediator check's flags (no simulation can
-  tell a confounder from a mediator), MOTCO's Phase 6-only operating
-  characteristics (Type I `adopt_stage`; power `candidate_fails`, `shape`
-  power lost under a nuisance axis, small-magnitude power lost without one),
-  no operating characteristic measured on these blocks or at eight
-  covariates, and the nuclei counts and the fractions both proxying library
-  quality.
+  `angle`; the non-rejection rules hold in every arm; the `latent_adjusted`
+  arm's `angle` and `shape` p-values are reported but not read (MOTCO's
+  case-study diagnosis `residualized_basis`: the `stage` latent adjustment is
+  liberal on both at this configuration, an excess of the basis the residual
+  correction does not address, so neither a rejection nor a non-rejection is
+  interpretable; its `delta` is read under the rules above); an arm's
+  first-axis technical correlations (`axis-diagnostics` on the arm, whose
+  tables label it `primary`) are a measurement-space finding only. Carried
+  limitations: the mediator limitation with the mediator check's flags (no
+  simulation can tell a confounder from a mediator), MOTCO's Phase 6-only
+  operating characteristics (Type I `adopt_stage`; power `candidate_fails`,
+  `shape` power lost under a nuisance axis, small-magnitude power lost
+  without one), the `residualized_basis` diagnosis (anchor `angle`
+  0.084–0.090, `shape` 0.078–0.092 against 0.0695), no operating
+  characteristic measured on these blocks or at eight covariates (the
+  residual-corrected null's size measured at six covariates only, inferred at
+  eight, reduced rank 12), and the nuclei counts and the fractions both
+  proxying library quality.
 - Stage-DE constants (flag and ask before changing any of them):
   `STAGE_DE_MODELS` (a registry, never a flag, never chosen from results:
   `factor_additive` `~ sex + stage` testing `stage[T.1]`, `stage[T.2]`;

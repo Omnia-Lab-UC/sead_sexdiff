@@ -644,8 +644,8 @@ wheels = [
 
 [[package]]
 name = "motco"
-version = "0.10.0"
-source = { git = "https://github.com/tomszar/MOTCO?rev=v0.10.0#098b170e618959591c7a3d2277487765dcd0459a" }
+version = "0.13.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
@@ -655,6 +655,10 @@ dependencies = [
     { name = "scipy" },
     { name = "scipy-stubs" },
     { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/61/42/d17283142e20bedb2cc16af7745ba8c380b5532e02bdb16b715d50c032fc/motco-0.13.0.tar.gz", hash = "sha256:a03363ee14498647ad766cbcfbbba42273f40ce9fe2321712dfbf17ed7c35a7b", size = 1640133, upload-time = "2026-10-31T17:07:49.442Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/99/ff/a847e1801b067735d3e3d8018e1a1daf10ef891346cd68152b9d545cd43e/motco-0.13.0-py3-none-any.whl", hash = "sha256:614c2e9cc7fccb5579e4e46c04e5356514ab5bb268b6a821ab89b1a029df83ba", size = 1645887, upload-time = "2026-10-31T17:07:47.632Z" },
 ]
 
 [[package]]
@@ -1305,7 +1309,7 @@ requires-dist = [
     { name = "botocore-stubs", specifier = "==1.42.12" },
     { name = "decoupler", specifier = ">=2.1.2" },
     { name = "hatchling", specifier = "==1.28.0" },
-    { name = "motco", git = "https://github.com/tomszar/MOTCO?rev=v0.10.0" },
+    { name = "motco", specifier = "==0.13.0" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pandas-stubs", specifier = "==2.3.3.251201" },
