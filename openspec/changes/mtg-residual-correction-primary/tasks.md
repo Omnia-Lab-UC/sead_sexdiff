@@ -52,33 +52,33 @@
 
 ## 4. Re-issue every MOTCO-dependent output (Nix shell, `n_jobs = 1`)
 
-- [ ] 4.1 Run `analyze --cohort all` and `analyze --cell-type microglia --cohort all`. Verify that:
+- [x] 4.1 Run `analyze --cohort all` and `analyze --cell-type microglia --cohort all`. Verify that:
   - the four records carry `residual_correction = df` with the predicted κ, `min_components = 2`, MOTCO 0.13.0, seed 20261019 and 999 permutations;
   - their CSVs are byte-identical to the 2.6 scratch runs, with equal statistics, p-values, null summaries and rank (the reproducibility rerun).
-- [ ] 4.2 Run `rank-sensitivity --cohort all`. Verify that there are six forced ranks per cohort, each record carries `df`, and the manifest records the floor and `df`. Verify that the forced run at the CV-selected rank (when it is in the ladder) equals the reference, or that the manifest records why not.
-- [ ] 4.3 Run `axis-diagnostics` (astrocytes, with the sweep) and `axis-diagnostics --cell-type microglia`. Verify that the input-hash checks pass and that `pls_0` is recorded as identical across the primary and the forced ranks.
-- [ ] 4.4 Run `preprocessing-sensitivity --variant all`, then `axis-diagnostics` per variant root (design D6 step 4). Verify that all eight variants are complete in both cohorts, that `adoption_check.csv` exists for the three candidates, that `adoption_precedence` is set (not `incomplete`) in both trend candidates' comparison manifests, and that every variant record carries `df`.
-- [ ] 4.5 Run `latent-sensitivity --cohort all` for both cell types, then `axis-diagnostics` on the astrocyte primary and on both arms of both cell types into `<root>/motco_latent_sensitivity/diagnostics/<name>/`. Verify that:
+- [x] 4.2 Run `rank-sensitivity --cohort all`. Verify that there are six forced ranks per cohort, each record carries `df`, and the manifest records the floor and `df`. Verify that the forced run at the CV-selected rank (when it is in the ladder) equals the reference, or that the manifest records why not.
+- [x] 4.3 Run `axis-diagnostics` (astrocytes, with the sweep) and `axis-diagnostics --cell-type microglia`. Verify that the input-hash checks pass and that `pls_0` is recorded as identical across the primary and the forced ranks.
+- [x] 4.4 Run `preprocessing-sensitivity --variant all`, then `axis-diagnostics` per variant root (design D6 step 4). Verify that all eight variants are complete in both cohorts, that `adoption_check.csv` exists for the three candidates, that `adoption_precedence` is set (not `incomplete`) in both trend candidates' comparison manifests, and that every variant record carries `df`.
+- [x] 4.5 Run `latent-sensitivity --cohort all` for both cell types, then `axis-diagnostics` on the astrocyte primary and on both arms of both cell types into `<root>/motco_latent_sensitivity/diagnostics/<name>/`. Verify that:
   - both arms record `df` with reduced rank 12;
   - `mediator_check.csv` was written before the arms (file times);
   - each `extended_covariates` arm's rank and CV AUROC equal its primary's, or the difference is recorded as a finding.
-- [ ] 4.6 Run `stage-de --omic both --n-cpus 10` and `stage-de-limma --omic both` for both cell types. Verify that every concordance cell reads the corrected primary's `delta` status and that the fit manifests' reference hashes are the new primaries'.
-- [ ] 4.7 Run `exclusion-sensitivity --cohort all` for both cell types, then on each variant root `axis-diagnostics`, `stage-de --omic both --n-cpus 10` and `stage-de-limma --omic rna`. Verify that `flag_check.csv` predates the variant export (file times), that the variant records carry `df`, and that the stage-DE manifests record the `donor_exclusion` block.
-- [ ] 4.8 Run `positive-control --cohort all` and `positive-control --basis latent_adjusted --cohort all`. Verify that both bases' outputs exist for both cohorts and that every manifest read is the re-issued one (the chain checks pass).
+- [x] 4.6 Run `stage-de --omic both --n-cpus 10` and `stage-de-limma --omic both` for both cell types. Verify that every concordance cell reads the corrected primary's `delta` status and that the fit manifests' reference hashes are the new primaries'.
+- [x] 4.7 Run `exclusion-sensitivity --cohort all` for both cell types, then on each variant root `axis-diagnostics`, `stage-de --omic both --n-cpus 10` and `stage-de-limma --omic rna`. Verify that `flag_check.csv` predates the variant export (file times), that the variant records carry `df`, and that the stage-DE manifests record the `donor_exclusion` block.
+- [x] 4.8 Run `positive-control --cohort all` and `positive-control --basis latent_adjusted --cohort all`. Verify that both bases' outputs exist for both cohorts and that every manifest read is the re-issued one (the chain checks pass).
 
 ## 5. Comparisons and consistency checks
 
-- [ ] 5.1 Write and run the comparison script of design D7 (superseded against corrected). Verify that:
+- [x] 5.1 Write and run the comparison script of design D7 (superseded against corrected). Verify that:
   - it covers every analysis pair (4 primaries, 12 forced ranks, 16 variants, 8 arms, 4 exclusion variants) with the contract comparison, the κ check and the per-statistic p-values, directions and statuses;
   - it covers every p-free output listed in D7;
   - it produces the report's outcome tables;
   - it lists every failed reproduction and every status change (each becomes a report finding).
-- [ ] 5.2 Run the version-consistency check of design D8. Verify that it lists no manifest outside `results/superseded/` with a MOTCO version other than 0.13.0, and no `result.json` without `residual_correction = df` and either `min_components = 2` or a forced rank.
-- [ ] 5.3 Re-hash the files recorded in 3.1. Verify that every hash is unchanged.
+- [x] 5.2 Run the version-consistency check of design D8. Verify that it lists no manifest outside `results/superseded/` with a MOTCO version other than 0.13.0, and no `result.json` without `residual_correction = df` and either `min_components = 2` or a forced rank.
+- [x] 5.3 Re-hash the files recorded in 3.1. Verify that every hash is unchanged.
 
 ## 6. Report
 
-- [ ] 6.1 Write `reports/motco-residual-correction-primary-<date>.md` from the generated files (design D9). It contains:
+- [x] 6.1 Write `reports/motco-residual-correction-primary-<date>.md` from the generated files (design D9). It contains:
   - provenance: the machine, the pin and wheel check (1.1), the gates (2.4, 2.6), the kept-output comparison (2.5) and the move (3.2);
   - MOTCO's three reports with their numbers, and the statement that the 2026-10-26 primaries' p-values were withheld;
   - the corrected primaries of both cell types with κ, the eigengap and the null summaries beside `angle`;
@@ -88,7 +88,7 @@
   - limitations: size measured at six covariates on the `cohort_30` tables only, and inferred for `cohort_50`, the eight-covariate arms, the exclusion variants, the forced ranks and the variants; `delta` conservative under `df`; MOTCO's `residualized_basis` diagnosis; every earlier limitation carried.
 
   Verify with a check script that every statistic, p-value, rank, CV AUROC and κ of every re-issued `result.json`, every E1–E3 value, every adoption-check cell, every axis-check value and every concordance cell is in the text.
-- [ ] 6.2 Run `openspec validate mtg-residual-correction-primary`. Verify that it passes (requirement-length warnings only, as elsewhere in the repository).
+- [x] 6.2 Run `openspec validate mtg-residual-correction-primary`. Verify that it passes (requirement-length warnings only, as elsewhere in the repository).
 
 ## 7. Cluster
 
