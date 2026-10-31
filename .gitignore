@@ -210,3 +210,9 @@ results/
 data/
 # direnv / nix
 .direnv/
+
+# IDE state (per machine)
+.idea/
+
+# Claude Code personal settings (the shared skills and commands in .claude/ stay tracked)
+.claude/settings.local.json
