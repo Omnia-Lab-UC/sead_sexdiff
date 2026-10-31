@@ -775,6 +775,11 @@ A MOTCO pin move that changes the measurement re-issues every MOTCO-dependent ou
 Superseded directories are moved, never deleted, to `results/superseded/<change>/` (the change that superseded them), keeping their path relative to `results/`: `results/microglia/motco_analysis/` becomes `results/superseded/<change>/microglia/motco_analysis/`. `scripts/move_superseded.py` (standard library only, so it runs with any `python3`, also on the cluster login node) hashes every file, renames on the same filesystem, re-hashes (a difference stops it) and writes `results/superseded/<change>/MOVED.json` (per move: old and new path, host, time and the sha256 of every file; directories absent on that machine are listed under `absent`). It refuses an existing target. Nothing under `results/superseded/` is an input of any step or a default directory; the superseded outputs are records, not a sensitivity arm, and are not cited as results, but every hash an earlier report cites stays resolvable there. The MOTCO-independent outputs (`pseudobulk/`, `motco_input/`, the donor, covariate, technical and flag tables, the annotation) are never moved.
 
 ```
+python3 scripts/move_superseded.py --change mtg-residual-correction-primary \
+    motco_analysis motco_rank_sensitivity motco_diagnostics motco_sensitivity motco_latent_sensitivity \
+    stage_de stage_de_limma motco_exclusion_sensitivity \
+    microglia/motco_analysis microglia/motco_diagnostics microglia/motco_latent_sensitivity \
+    microglia/stage_de microglia/stage_de_limma microglia/motco_exclusion_sensitivity microglia/positive_control
 python3 scripts/move_superseded.py --change mtg-rank-floor-primary \
     motco_analysis motco_rank_sensitivity motco_diagnostics motco_sensitivity motco_latent_sensitivity \
     stage_de stage_de_limma motco_exclusion_sensitivity \
@@ -786,6 +791,7 @@ python3 scripts/move_superseded.py --change mtg-astrocyte-latent-adjustment-sens
 
 Current contents:
 
+- `mtg-residual-correction-primary/`: the floored, uncorrected outputs of MOTCO 0.10.0 (rank floor 2, RRPP null without the residual correction; MOTCO's roadmap withheld the primaries' p-values from 2026-10-30) and everything made from them: astrocyte `motco_analysis`, `motco_rank_sensitivity`, `motco_diagnostics`, `motco_sensitivity`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`; microglia under `microglia/` (`motco_analysis`, `motco_diagnostics`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`, `positive_control`). Superseded by the corrected primaries (MOTCO 0.13.0, `ANALYSIS_RESIDUAL_CORRECTION = "df"`; `reports/motco-residual-correction-primary-<date>.md`).
 - `mtg-rank-floor-primary/`: the MOTCO 0.8.0 / 0.9.0 outputs at rank floor 1 (every primary at CV-selected rank 1) and everything made from them: astrocyte `motco_analysis`, `motco_rank_sensitivity`, `motco_diagnostics`, `motco_sensitivity`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`; microglia under `microglia/` (`motco_analysis`, `motco_diagnostics`, `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`, `motco_exclusion_sensitivity`, `positive_control`). Superseded by the floored primaries (MOTCO 0.10.0, `ANALYSIS_RANK_FLOOR = 2`; `reports/motco-rank-floor-primary-<date>.md`).
 - `mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/`: the MOTCO 0.8.0 astrocyte primary that change kept as `results/motco_analysis_0.8.0/`.
 

@@ -29,12 +29,12 @@
 
 ## 2. Gates (re-issue machine, Nix shell)
 
-- [ ] 2.1 Prepare the re-issue machine (design D10). On `nixos-home`, verify that each current primary `result.json` and `analysis_manifest.json` of both cell types hashes as on the cluster. If `nixos-home` is unavailable, rsync the cluster's current directories of both cell types (not `superseded/`) to `nixos-dell-laptop` and verify every file's sha256 against the cluster's. Record the machine for the report.
-- [ ] 2.2 Pin-move gate, previous pin (design D4.1): create a scratchpad worktree of the pre-change commit, `uv sync --locked` there (MOTCO 0.10.0), and run `analyze --cell-type {astrocyte,microglia} --cohort all` on the real exports into scratch directories. Verify that the four manifests record MOTCO 0.10.0 and the real exports' hashes.
-- [ ] 2.3 Pin-move gate, new pin without the correction: from the change branch, run `_analyze_cohort` with the analyze parameters and `residual_correction=None` on the same four exports into scratch directories. Verify that the records carry no `residual_correction` and MOTCO 0.13.0 under `software`.
-- [ ] 2.4 Compare 2.2 with 2.3 using a scratch script. Pass condition: the four CSVs per cohort are byte-identical, and `result.json` and the manifest are equal after dropping `runtime_seconds`, `created_at`, `git`, `software.motco`, `cli_equivalent` and `measurement.residual_correction`. If anything differs, stop the change and report the differing file.
-- [ ] 2.5 Compare 2.3 with the kept primaries `results/motco_analysis/` and `results/microglia/motco_analysis/`. Record the outcome for the report: byte-identical on the machine that made them; otherwise the largest absolute differences and whether p-values, ranks and `analysis_metadata.csv` are equal.
-- [ ] 2.6 Contract gate (design D4.2): from the change branch, run `analyze --cell-type {astrocyte,microglia} --cohort all` into scratch directories and compare with 2.3. Pass condition:
+- [x] 2.1 Prepare the re-issue machine (design D10). On `nixos-home`, verify that each current primary `result.json` and `analysis_manifest.json` of both cell types hashes as on the cluster. If `nixos-home` is unavailable, rsync the cluster's current directories of both cell types (not `superseded/`) to `nixos-dell-laptop` and verify every file's sha256 against the cluster's. Record the machine for the report.
+- [x] 2.2 Pin-move gate, previous pin (design D4.1): create a scratchpad worktree of the pre-change commit, `uv sync --locked` there (MOTCO 0.10.0), and run `analyze --cell-type {astrocyte,microglia} --cohort all` on the real exports into scratch directories. Verify that the four manifests record MOTCO 0.10.0 and the real exports' hashes.
+- [x] 2.3 Pin-move gate, new pin without the correction: from the change branch, run `_analyze_cohort` with the analyze parameters and `residual_correction=None` on the same four exports into scratch directories. Verify that the records carry no `residual_correction` and MOTCO 0.13.0 under `software`.
+- [x] 2.4 Compare 2.2 with 2.3 using a scratch script. Pass condition: the four CSVs per cohort are byte-identical, and `result.json` and the manifest are equal after dropping `runtime_seconds`, `created_at`, `git`, `software.motco`, `cli_equivalent` and `measurement.residual_correction`. If anything differs, stop the change and report the differing file.
+- [x] 2.5 Compare 2.3 with the kept primaries `results/motco_analysis/` and `results/microglia/motco_analysis/`. Record the outcome for the report: byte-identical on the machine that made them; otherwise the largest absolute differences and whether p-values, ranks and `analysis_metadata.csv` are equal.
+- [x] 2.6 Contract gate (design D4.2): from the change branch, run `analyze --cell-type {astrocyte,microglia} --cohort all` into scratch directories and compare with 2.3. Pass condition:
   - the four CSVs are byte-identical;
   - `result.json` is equal after dropping `p_values`, `null_summary`, `config_spectrum.permutation_pooled_eigengap`, `params.residual_correction`, `measurement.residual_correction` and `measurement.runtime_seconds`;
   - each κ equals √(n / (n − 10)) to 1e-12 (1.0690, 1.0753, 1.0731, 1.0903).
@@ -43,12 +43,12 @@
 
 ## 3. Move the superseded outputs
 
-- [ ] 3.1 Record the sha256 of every file under both cell types' `pseudobulk/` and `motco_input/` and under `data/annotation/` into the scratchpad. Verify that the listing is complete (file counts per directory).
-- [ ] 3.2 Run `scripts/move_superseded.py --change mtg-residual-correction-primary` over the MOTCO-dependent directories of both cell types (design D5). Verify that:
+- [x] 3.1 Record the sha256 of every file under both cell types' `pseudobulk/` and `motco_input/` and under `data/annotation/` into the scratchpad. Verify that the listing is complete (file counts per directory).
+- [x] 3.2 Run `scripts/move_superseded.py --change mtg-residual-correction-primary` over the MOTCO-dependent directories of both cell types (design D5). Verify that:
   - every moved file hashes as before and `MOVED.json` is written;
   - no MOTCO-dependent directory is left at its old path;
   - the sha256 of each `result.json` cited by `reports/motco-rank-floor-primary-2026-10-26.md` is found under `results/superseded/mtg-residual-correction-primary/`.
-- [ ] 3.3 Add `mtg-residual-correction-primary/` (the floored, uncorrected outputs of MOTCO 0.10.0, both cell types) to the superseded entries in AGENTS.md and README. Verify that the documented paths match the moved tree.
+- [x] 3.3 Add `mtg-residual-correction-primary/` (the floored, uncorrected outputs of MOTCO 0.10.0, both cell types) to the superseded entries in AGENTS.md and README. Verify that the documented paths match the moved tree.
 
 ## 4. Re-issue every MOTCO-dependent output (Nix shell, `n_jobs = 1`)
 

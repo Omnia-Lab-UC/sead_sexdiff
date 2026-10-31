@@ -330,8 +330,15 @@ when behavior or defaults change.
   deleted) by the change that re-issued them, with their path relative to
   `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
   file); never an input of any step or a default directory, not cited as
-  results. Now `mtg-rank-floor-primary/` (the rank-1 outputs of MOTCO
-  0.8.0 / 0.9.0, both cell types) and
+  results. Now `mtg-residual-correction-primary/` (the floored, uncorrected
+  outputs of MOTCO 0.10.0, both cell types: astrocyte `motco_analysis`,
+  `motco_rank_sensitivity`, `motco_diagnostics`, `motco_sensitivity`,
+  `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`,
+  `motco_exclusion_sensitivity`; microglia `microglia/motco_analysis`,
+  `motco_diagnostics`, `motco_latent_sensitivity`, `stage_de`,
+  `stage_de_limma`, `motco_exclusion_sensitivity`, `positive_control`),
+  `mtg-rank-floor-primary/` (the rank-1 outputs of MOTCO 0.8.0 / 0.9.0, both
+  cell types) and
   `mtg-astrocyte-latent-adjustment-sensitivity/motco_analysis/` (the former
   `results/motco_analysis_0.8.0/`).
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
