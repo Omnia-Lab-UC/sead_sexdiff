@@ -26,7 +26,7 @@ dependencies = [
   "rpy2>=3.6.4",
   "decoupler>=2.1.2",
   "pydeseq2>=0.5.3",
-  "motco",
+  "motco==0.13.0",
   "statsmodels>=0.14.5",
 ]
 
@@ -40,6 +40,3 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sead_sexdiff"]
-
-[tool.uv.sources]
-motco = { git = "https://github.com/tomszar/MOTCO", rev = "v0.10.0" }

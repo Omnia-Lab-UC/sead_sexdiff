@@ -5007,14 +5007,21 @@ ANALYSIS_SEED = 20261019
 ANALYSIS_ALPHA = 0.05
 # As in MOTCO's covariate Type I check; exact size alpha for (1 + b) / (1 + B) p-values
 ANALYSIS_REJECTION_RULE = "p <= alpha"
-# 0.10.0: the first release with the latent-rank floor
-ANALYSIS_MOTCO_MIN_VERSION = "0.10.0"
+# 0.13.0: the first release with the residual-corrected RRPP null
+ANALYSIS_MOTCO_MIN_VERSION = "0.13.0"
 # Latent-rank floor of the CV rank selection (MOTCO's `min_components`): its
 # validated default, passed explicitly and checked against it, so a MOTCO that
 # moved its default stops the run instead of changing the primary. The floor
 # defines `angle` and `shape` in at least two dimensions; it does not make them
 # powerful. A constant, never a flag.
 ANALYSIS_RANK_FLOOR = 2
+# Residual correction of the RRPP null (MOTCO's `residual_correction`): the
+# reduced model's residuals are multiplied by κ = √(n / (n − r)) before they are
+# permuted, so only the null moves. MOTCO's validated opt-in, not its default
+# (MOTCO's verdict `adopt_df`, docs/reports/corrected-permutation-2026-10-30.md);
+# the one MOTCO default the package overrides. Passed explicitly in every
+# analysis, checked in the record and by every reader. A constant, never a flag.
+ANALYSIS_RESIDUAL_CORRECTION = "df"
 ANALYSIS_STATISTICS = ("delta", "angle", "shape")
 
 _ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "manifest.json")
@@ -5219,6 +5226,11 @@ def _record_rank_floor(record: dict) -> int:
     return int(record.get("params", {}).get("min_components") or 1)
 
 
+def _record_residual_correction(record: dict) -> str | None:
+    """The residual correction an analysis record was made under (MOTCO omits ``None`` from ``params``)."""
+    return record.get("params", {}).get("residual_correction")
+
+
 def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA) -> str:
     """Render ``summary.md`` from a MOTCO analysis record (``result.json``).
 
@@ -5243,7 +5255,10 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         ``latent_adjustment`` block (MOTCO ≥ 0.9.0) gets a "Latent adjustment"
         section (conditioning, residual df, smallest CV training df, median
         feature R² and the fraction above 0.5); records without one are
-        rendered as before.
+        rendered as before. A record with ``measurement.residual_correction``
+        (MOTCO ≥ 0.13.0) gets one line under the header naming the correction
+        the null was drawn under (kind, κ, n, reduced rank); records without
+        one are rendered as before.
     """
     design = record["design"]
     meas = record["measurement"]
@@ -5257,6 +5272,22 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         f"{' vs '.join(design['group_levels'])}; stages {' → '.join(stages)}; orientation "
         f"`{meas['orientation_estimator']}`; {meas['permutations']} RRPP permutations, seed {meas['seed']}; "
         f"α = {alpha} (rejected when p ≤ α).",
+    ]
+    correction = meas.get("residual_correction")
+    if correction is not None:
+        if correction["kind"] == "df":
+            detail = f"κ = {correction['kappa']:.6g}"
+        else:
+            detail = (
+                f"leverage {correction['leverage_min']:.3g}–{correction['leverage_max']:.3g}, "
+                f"multipliers {correction['scale_min']:.4g}–{correction['scale_max']:.4g}"
+            )
+        lines += [
+            "",
+            f"RRPP null: residual correction `{correction['kind']}` ({detail}; n = {correction['n']}, "
+            f"reduced rank {correction['reduced_rank']}).",
+        ]
+    lines += [
         "",
         "## Statistics",
         "",
@@ -5374,6 +5405,10 @@ def _cli_equivalent(
         "--permutations", str(params.permutations), "--seed", str(params.seed), "--n-jobs", str(n_jobs),
         "--orientation-estimator", params.orientation_estimator,
     ]
+    correction = getattr(params, "residual_correction", None)
+    if correction is not None:
+        # Acts on RRPP, so CV and forced runs alike
+        argv += ["--residual-correction", correction]
     if params.forced_components is not None:
         # Cross-validation does not run, so none of its knobs apply
         argv += ["--forced-components", str(params.forced_components)]
@@ -5436,7 +5471,13 @@ def _analyze_cohort(
         ``covariate_latent_adjustment`` set for a latent-adjusted run (recorded
         as ``measurement.latent_adjustment`` and ``--latent-adjustment`` in
         ``cli_equivalent``; both absent when it is ``None``, as MOTCO leaves
-        the setting out of its record).
+        the setting out of its record); ``residual_correction``
+        ``ANALYSIS_RESIDUAL_CORRECTION`` from every caller (``None`` only in
+        the pin-move gate, run by hand), checked against the record's
+        ``measurement.residual_correction`` before anything is written and
+        recorded as the manifest's ``measurement.residual_correction`` (the
+        record's block, or ``null``) and ``--residual-correction`` in
+        ``cli_equivalent``.
     out_dir:
         The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
         to ``<out_dir>/<final_name>`` when complete.
@@ -5479,7 +5520,9 @@ def _analyze_cohort(
     RuntimeError
         The installed MOTCO is older than ``ANALYSIS_MOTCO_MIN_VERSION``, or
         its default rank floor is not ``ANALYSIS_RANK_FLOOR``
-        (``check_motco_rank_floor``); nothing is written.
+        (``check_motco_rank_floor``), or the record's residual correction is
+        not the one ``params`` asked for (absent, of another kind, or present
+        without the setting); nothing is written.
     """
     import io
     import shutil
@@ -5535,6 +5578,16 @@ def _analyze_cohort(
         f"[{log_prefix}] {cohort}: rank {record['latent']['selected_lv']} ({record['latent']['component_selection']}), "
         f"{record['measurement']['runtime_seconds']:.1f} s"
     )
+    # The record must state the correction the null was drawn under before anything is written
+    wanted = getattr(params, "residual_correction", None)
+    applied = record["measurement"].get("residual_correction")
+    applied_kind = None if applied is None else applied.get("kind")
+    if applied_kind != wanted or (wanted == "df" and applied.get("kappa") is None):
+        raise RuntimeError(
+            f"MOTCO's record for {cohort} states residual correction {applied_kind!r} "
+            f"(measurement.residual_correction) but the analysis asked for {wanted!r}; the record must state the "
+            "correction the RRPP null was drawn under; nothing was written"
+        )
 
     findings = list(findings or [])
     n_capped = export_manifest.get("covariates", {}).get("n_age_capped")
@@ -5640,6 +5693,7 @@ def _analyze_cohort(
                 }}
             ),
             **({"latent_adjustment": latent} if latent is not None else {}),
+            "residual_correction": applied,
             "permutations": params.permutations,
             "seed": params.seed,
             "alpha": ANALYSIS_ALPHA,
@@ -5712,7 +5766,10 @@ def run_analysis(
     (missing policy ``error``), MOTCO's default net-displacement orientation
     and double-CV rank at the rank floor ``ANALYSIS_RANK_FLOOR`` (MOTCO's
     default, passed explicitly and checked against it before any input is
-    read), ``ANALYSIS_PERMUTATIONS`` RRPP permutations with ``ANALYSIS_SEED``. The model's metadata table is serialized to
+    read), ``ANALYSIS_PERMUTATIONS`` RRPP permutations with ``ANALYSIS_SEED``
+    under the residual correction ``ANALYSIS_RESIDUAL_CORRECTION`` (MOTCO's
+    validated opt-in, passed explicitly and checked in the record before
+    anything is written). The model's metadata table is serialized to
     ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
     parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
     run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete
@@ -5751,7 +5808,8 @@ def run_analysis(
         cohort_dir = input_dir / c
         loaded, findings = loaded_by_cohort.pop(c)
         params = TrajectoryAnalysisParams(
-            permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR
+            permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
+            residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
         )
         results[c] = _analyze_cohort(
             c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs, findings=findings,
@@ -5821,9 +5879,11 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
     ValueError
         An export file's sha256, the MOTCO version, the seed, the permutation
         count, the rank floor (``params.min_components`` of ``result.json``,
-        absent meaning 1, against ``ANALYSIS_RANK_FLOOR``) or the component
-        selection recorded by the analysis differs from the sweep's; the
-        message names the file or setting.
+        absent meaning 1, against ``ANALYSIS_RANK_FLOOR``), the residual
+        correction (``params.residual_correction``, absent meaning none,
+        against ``ANALYSIS_RESIDUAL_CORRECTION``) or the component selection
+        recorded by the analysis differs from the sweep's; the message names
+        the file or setting.
     """
     d = Path(analysis_dir)
     hint = "run `sead-sexdiff analyze` to produce it"
@@ -5861,6 +5921,13 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
         raise ValueError(
             f"{d / 'result.json'} was made at rank floor {floor} (params.min_components; absent means 1) but "
             f"the reference must be made at ANALYSIS_RANK_FLOOR = {ANALYSIS_RANK_FLOOR}; {rerun}"
+        )
+    correction = _record_residual_correction(record)
+    if correction != ANALYSIS_RESIDUAL_CORRECTION:
+        raise ValueError(
+            f"{d / 'result.json'} was made with residual correction {correction!r} (params.residual_correction; "
+            f"absent means none) but the reference must be made with ANALYSIS_RESIDUAL_CORRECTION = "
+            f"{ANALYSIS_RESIDUAL_CORRECTION!r}; {rerun}"
         )
     selection = record.get("latent", {}).get("component_selection")
     if selection != "cv":
@@ -6020,8 +6087,9 @@ def run_rank_sensitivity(
     cohort before anything is written. Each rank is one ``_analyze_cohort``
     call with ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
     seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
-    min_components=ANALYSIS_RANK_FLOOR)`` (the floor does not act on a forced
-    rank; it keeps ``params`` uniform), so the only
+    min_components=ANALYSIS_RANK_FLOOR,
+    residual_correction=ANALYSIS_RESIDUAL_CORRECTION)`` (the floor does not
+    act on a forced rank; it keeps ``params`` uniform), so the only
     difference from the ``analyze`` step is the rank; cross-validation does
     not run. A cohort is written under ``<cohort>.tmp/`` (``rank_<kk>/``
     directories, ``rank_sensitivity.csv``, ``rank_sensitivity.md``,
@@ -6097,7 +6165,7 @@ def run_rank_sensitivity(
             name = RANK_SENSITIVITY_DIR_TEMPLATE.format(k)
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
-                min_components=ANALYSIS_RANK_FLOOR,
+                min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
             )
             runs[k] = _analyze_cohort(
                 c, cohort_dir, loaded, params,
@@ -6179,6 +6247,11 @@ def run_rank_sensitivity(
             "rank_floor_note": (
                 "the reference was CV-selected at this floor; the floor does not act on a forced rank"
             ),
+            "residual_correction": ANALYSIS_RESIDUAL_CORRECTION,
+            "residual_correction_note": (
+                "the reference and every forced rank draw the RRPP null under this correction (it acts on RRPP, "
+                "not on the rank)"
+            ),
             "seed": ANALYSIS_SEED,
             "permutations": ANALYSIS_PERMUTATIONS,
             "same_seed_note": (
@@ -6200,10 +6273,11 @@ def run_rank_sensitivity(
                 "seed": reference["manifest"]["measurement"]["seed"],
                 "permutations": reference["manifest"]["measurement"]["permutations"],
                 "min_components": _record_rank_floor(ref_record),
+                "residual_correction": _record_residual_correction(ref_record),
                 "in_ladder": ref_rank in ladder,
                 "forced_run_at_cv_rank": at_cv_rank,
                 "note": (
-                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor), never rerun "
+                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction), never rerun "
                     "or modified"
                 ),
             },
@@ -7344,7 +7418,7 @@ def run_preprocessing_sensitivity(
     Every check (registered variant, existing output, inputs present, primary
     export vs the pseudobulk manifest, covariates manifest, annotation,
     thresholds, ``k``, cells and donor count, primary analysis vs the export
-    hashes, MOTCO version, seed, permutations, rank floor and CV selection;
+    hashes, MOTCO version, seed, permutations, rank floor, residual correction and CV selection;
     for a variant that excludes gene sets, residualizes or runs the adoption
     check, the technical table vs the pseudobulk manifest,
     ``TECHNICAL_GENE_SETS`` and completeness for the cohort donors,
@@ -7506,7 +7580,7 @@ def run_preprocessing_sensitivity(
             loaded_v = load_analysis_inputs(exp["dir"])
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
-                min_components=ANALYSIS_RANK_FLOOR,
+                min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
             )
             ana = _analyze_cohort(
                 c, exp["dir"], loaded_v, params,
@@ -7673,7 +7747,7 @@ def run_preprocessing_sensitivity(
                     },
                     "note": (
                         "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
-                        "export file hashes, MOTCO version, seed, permutations, rank floor, CV selection), never rerun or modified"
+                        "export file hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection), never rerun or modified"
                     ),
                 },
                 "variant_run": {
@@ -9153,9 +9227,10 @@ def run_latent_sensitivity(
     the technical table (``load_analysis_inputs(extra_covariates=...)``) and
     ``TrajectoryAnalysisParams(permutations=ANALYSIS_PERMUTATIONS,
     seed=ANALYSIS_SEED, n_jobs=n_jobs, covariate_latent_adjustment=...,
-    min_components=ANALYSIS_RANK_FLOOR)``, so everything else equals
-    ``analyze`` (blocks, stage order, orientation, CV rank selection and its
-    floor, seed, permutations). The arm manifests record the five
+    min_components=ANALYSIS_RANK_FLOOR,
+    residual_correction=ANALYSIS_RESIDUAL_CORRECTION)``, so everything else
+    equals ``analyze`` (blocks, stage order, orientation, CV rank selection and
+    its floor, residual correction, seed, permutations). The arm manifests record the five
     export files as ``inputs.files`` (so ``axis-diagnostics`` can read an arm
     against the primary export) and the technical table under
     ``inputs.technical``. The arms are written as ``<cohort>.tmp/`` and the
@@ -9226,6 +9301,7 @@ def run_latent_sensitivity(
         arm: TrajectoryAnalysisParams(
             permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
             covariate_latent_adjustment=spec["latent_adjustment"], min_components=ANALYSIS_RANK_FLOOR,
+            residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
         )
         for arm, spec in LATENT_SENSITIVITY_ARMS.items()
     }
@@ -9486,7 +9562,7 @@ def run_latent_sensitivity(
                     "seed": reference["manifest"]["measurement"]["seed"],
                     "permutations": reference["manifest"]["measurement"]["permutations"],
                     "note": (
-                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection, orientation "
+                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection, orientation "
                         "and CV settings), never rerun or modified; its files hash identically after the run"
                     ),
                 },
@@ -10740,7 +10816,7 @@ def run_stage_de(
         A reference check fails (pseudobulk manifest hash, reproduction of the
         export from the counts, donors / sex / stage, k and cells, feature
         statuses, the analysis's export hashes, MOTCO version, seed,
-        permutations, rank floor or CV selection), a covariate value is
+        permutations, rank floor, residual correction or CV selection), a covariate value is
         missing, a fit record was made from other inputs (without ``force``),
         a design is not full rank or a coefficient cannot be resolved, or
         ``out_dir`` lies inside an input directory.
@@ -10824,7 +10900,7 @@ def run_stage_de(
                 )
         print(
             f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
-            f"{motco_version}, seed, permutations, rank floor, CV selection); delta rejected: "
+            f"{motco_version}, seed, permutations, rank floor, residual correction, CV selection); delta rejected: "
             f"{'yes' if prep['delta_rejected'] else 'no'}"
         )
         prepared[c] = prep
@@ -11041,7 +11117,7 @@ def run_stage_de(
                 "seed": reference["manifest"]["measurement"]["seed"],
                 "permutations": reference["manifest"]["measurement"]["permutations"],
                 "note": (
-                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection), never rerun "
+                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection), never rerun "
                     "or modified; only its delta rejection status enters the concordance rule"
                 ),
             },
@@ -12278,7 +12354,7 @@ def run_stage_de_limma(
                 )
             print(
                 f"[{log}] {c}: primary analysis {prep['reference']['dir']} matches the export (hashes, MOTCO "
-                f"{motco_version}, seed, permutations, rank floor, CV selection); delta rejected: "
+                f"{motco_version}, seed, permutations, rank floor, residual correction, CV selection); delta rejected: "
                 f"{'yes' if prep['delta_rejected'] else 'no'}"
             )
             prepared[c] = prep
@@ -12507,7 +12583,7 @@ def run_stage_de_limma(
                     "seed": reference["manifest"]["measurement"]["seed"],
                     "permutations": reference["manifest"]["measurement"]["permutations"],
                     "note": (
-                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, CV selection), never "
+                        "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection), never "
                         "rerun or modified; only its delta rejection status enters the concordance rules"
                     ),
                 },
@@ -13915,7 +13991,8 @@ def run_exclusion_sensitivity(
     from motco.analysis import TrajectoryAnalysisParams
 
     params = TrajectoryAnalysisParams(
-        permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR
+        permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
+        residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
     )
     print(f"[{log}] MOTCO {motco_version}")
     print(f"[{log}] Cell type: {cell_type}")
@@ -14258,7 +14335,7 @@ def run_exclusion_sensitivity(
                         },
                         "note": (
                             "read and checked (pseudobulk, covariates and annotation hashes, thresholds, k, cells, "
-                            "export file hashes, MOTCO version, seed, permutations, rank floor, CV selection, orientation and CV "
+                            "export file hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection, orientation and CV "
                             "settings), never rerun or modified; its files hash identically after the run"
                         ),
                     },
