@@ -274,6 +274,49 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    donor-agreement check (they must be cohort donors and the rest must equal
    the export's donors) and record the block in their manifests; without the
    block nothing changes.
+16. `figures` – from the generated outputs of both cell types only (every
+   cell type's `cell_type_dirs` plus `results/motco_sensitivity/`; never raw
+   objects or `results/superseded/`), in `src/sead_sexdiff/figures.py`: the
+   registry `FIGURES` (ten figures, `01_cohorts` … `10_stage_de`), every
+   family of analyses enumerated from the registries (`ANALYSIS_FORCED_RANKS`,
+   `PREPROCESSING_VARIANTS`, `LATENT_SENSITIVITY_ARMS`,
+   `DONOR_EXCLUSION_VARIANTS`, `POSITIVE_CONTROL_BASES`, `EXPORT_COHORTS`),
+   a missing registered output an error naming the step that writes it.
+   Before anything is drawn, a consistency pre-pass (`check_consistency`)
+   checks the manifests the registries name and every other `*manifest.json`
+   under the registered directories:
+   - the cell type of each, against its root's;
+   - every recorded `{"path", "sha256"}` entry existing under `results/`
+     outside `superseded/` and hashing as recorded;
+   - one MOTCO version (the astrocyte primary's) and the registered
+     measurement in every analysis drawn (`ANALYSIS_RESIDUAL_CORRECTION`,
+     `ANALYSIS_RANK_FLOOR`, the forced rank under `rank-sensitivity` only,
+     `ANALYSIS_PERMUTATIONS`, `ANALYSIS_SEED`).
+
+   Per figure:
+   - the reproductions (adjusted cell means against `stage_means.csv`,
+     Spearman against `axis_correlations.csv`, counts against the stage-DE
+     summaries and `method_comparison.csv`, cells against the pseudobulk
+     manifest);
+   - the chain: each diagnostic, stage-DE and rank manifest read records the
+     analysis drawn, and figure 10 checks limma's `inputs.deseq2`.
+
+   Every read goes through one recording reader (`FigureReader`), so a
+   figure's inputs are the reader's log. Writes `results/figures/`, a
+   gitignored working copy:
+   - PNG, PDF and SVG per figure, with deterministic bytes and a fingerprint
+     of inputs, module and matplotlib in their metadata;
+   - `figures.md`, with generated captions in three parts: construction,
+     values read at run time, `FIGURE_READING_RULES`;
+   - `figures_manifest.json`.
+
+   The working copy is redrawn whole through `<out>.tmp` when any figure is
+   stale and left untouched when all are fresh. `--check` lists the stale
+   figures (exit 0 / 1 / 2, nothing written). `--report <stem>` runs the
+   checks, redraws if needed and freezes the SVGs, `figures.md` and the
+   manifest under `reports/figures/<stem>/`, never overwritten. A display
+   step: it tests nothing, and its outputs feed no export, analysis,
+   sensitivity, diagnostic, stage-DE or positive-control step.
 
 Cell types: steps 2–12 except the rank and preprocessing sensitivity steps,
 and steps 14–15 (the eleven commands `pseudobulk`, `covariates`,
@@ -291,7 +334,8 @@ reads as `astrocyte` with a finding. The per-donor caches record it too; the
 cell type stays out of the stage-DE fit-record fingerprints. The sensitivity
 steps `rank-sensitivity` and `preprocessing-sensitivity` have no flag and run
 on astrocytes only; `positive-control` reads both cell types by role and
-takes `--basis` instead.
+takes `--basis` instead; `figures` reads both cell types by role and takes
+neither (its reader checks every manifest's cell type against its root's).
 
 `README.md` documents CLI flags and the Python API in detail; keep it in sync
 when behavior or defaults change.
@@ -299,14 +343,25 @@ when behavior or defaults change.
 ## Layout
 
 - `src/sead_sexdiff/cli.py` – argparse CLI (`build_parser`, `main`); thin layer
-  that calls into `data.py` and prints `[command]`-prefixed progress messages.
+  that calls into `data.py` (and `figures.py` for `figures`) and prints
+  `[command]`-prefixed progress messages.
 - `src/sead_sexdiff/data.py` – all logic: S3 download, subsetting/QC,
   pseudobulk, differential expression, covariates, technical covariates,
   MOTCO export, analysis, the rank / preprocessing / latent-adjustment
   sensitivity analyses, the axis diagnostics, the pseudobulk stage DE
   (DESeq2, and limma-voom through the R script below), the cell-type
   registry, the positive control, the donor flags and the donor-exclusion
-  sensitivity analysis.
+  sensitivity analysis. Plotting is the one exception (`figures.py`).
+- `src/sead_sexdiff/figures.py` – the `figures` command (step 16): the
+  registry `FIGURES`, the display constants, the recording reader, the
+  consistency pre-pass, the ten figure functions with their caption
+  builders, the manifest, the staleness check and the report freeze. It
+  imports constants and helpers from `data.py` (`_git_revision`,
+  `_sha256_file`, `check_manifest_cell_type`, `cell_type_dirs`, `spearman`,
+  the registries) and nothing imports it but `cli.py`. It is the exception to
+  "all logic in `data.py`" for plotting (its own dependency and rcParams;
+  the user's decision of 2026-11-02). Its sha256 enters every figure's
+  fingerprint, so editing it makes every figure stale.
 - `src/sead_sexdiff/stage_de_limma.R` – the R side of `stage-de-limma`
   (TMM, voomWithQualityWeights, lmFit, eBayes, the R-side checks and the
   exact-F diagnostic); packaged beside `data.py` and run with `Rscript` on
@@ -326,6 +381,9 @@ when behavior or defaults change.
   files) and `move_superseded.py` (moves superseded output directories under
   `results/superseded/<change>/`, hash-checked, standard library only).
 - `data/`, `results/` – gitignored; never commit their contents.
+- `results/figures/` – the working copy of `figures`, redrawn freely, never
+  moved to `results/superseded/`. The record of a figure is the frozen set a
+  report carries.
 - `results/superseded/<change>/` – superseded outputs, moved (never
   deleted) by the change that re-issued them, with their path relative to
   `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
@@ -343,7 +401,22 @@ when behavior or defaults change.
   `results/motco_analysis_0.8.0/`).
 - `reports/` – committed case-study reports (e.g. `motco-astrocyte-<date>.md`).
   Their numbers are pasted from generated outputs (`summary.md`, manifests),
-  never retyped, and checked against `result.json` before committing.
+  never retyped, and checked against `result.json` before committing. Every
+  report committed from `mtg-case-study-figures` on carries the figure set
+  frozen by `figures --report <its stem>` after its last output run
+  (`reports/figures/<stem>/`: the ten SVGs, `figures.md`,
+  `figures_manifest.json`; committed, never regenerated or edited). It embeds
+  `figures/<stem>/<nn>_<name>.svg` and pastes each caption verbatim from the
+  frozen `figures.md`. Before the commit, its check script verifies:
+  - the pasted captions against `figures.md`;
+  - the frozen SVGs against the frozen manifest;
+  - every input the frozen manifest records, and every hash recorded by the
+    manifests it read, against the files on disk.
+
+  If an output is rerun after freezing, the uncommitted frozen set is
+  removed and `--report` is run again. Every report freezes the full set:
+  unchanged figures are byte-identical, so git stores them once. Reports
+  committed before that change are not edited.
 - `openspec/` – OpenSpec change proposals/specs (see below).
 
 ## Environment & commands
@@ -353,7 +426,12 @@ when behavior or defaults change.
   packages used by `DEG.R`, `check_tmm_edger.R`, `check_cyclic_loess_limma.R`, `check_stage_de_deseq2.R` (DESeq2) and `stage_de_limma.R` (limma, edgeR; `stage-de-limma` needs `Rscript` on `PATH`, so it runs inside the shell or through `nix develop -c`); its shell hook runs `uv sync --locked`. Enter it
   with direnv (`.envrc` → `use flake`) or `nix develop`. Python packages come
   from uv, not Nix; R packages come from Nix (add them to `flake.nix`).
-- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|donor-flags|exclusion-sensitivity|subset|de> [options]`.
+- Run the CLI: `uv run sead-sexdiff <download|pseudobulk|covariates|technical-covariates|export|analyze|rank-sensitivity|preprocessing-sensitivity|axis-diagnostics|latent-sensitivity|stage-de|stage-de-limma|positive-control|donor-flags|exclusion-sensitivity|figures|subset|de> [options]`.
+- `matplotlib` is a direct dependency pinned exactly (`matplotlib==3.10.7`,
+  the version scanpy already locked) because `figures` promises
+  byte-identical files. Move it only with `uv add "matplotlib==X.Y.Z"`
+  (no other locked package may move). A move changes every figure's bytes
+  and fingerprint, and `figures --check` then lists every figure as stale.
 - `motco` is pinned to an exact PyPI version (`motco==0.13.0` in
   `pyproject.toml`; `uv.lock` holds the wheel's and sdist's sha256). Move it
   only with `uv add "motco==X.Y.Z"`, and before any run under the new pin
@@ -375,9 +453,17 @@ when behavior or defaults change.
   or stop), the superseded directories moved with `scripts/move_superseded.py` on
   every machine, every MOTCO-dependent step rerun from scratch in dependency
   order for every cell type, a version-consistency check of every manifest
-  outside `results/superseded/`, the MOTCO-independent outputs hashed before
-  and after, and one re-issue report with the superseded values beside the
-  new ones and its reading written before the reruns.
+  outside `results/superseded/` (`results/figures/figures_manifest.json`
+  included: its per-figure analyses must record the new version), the
+  MOTCO-independent outputs hashed before and after, `figures --report
+  <re-issue report stem>` as the last rerun step once every other rerun has
+  finished, and one re-issue report with the superseded values beside the
+  new ones and its reading written before the reruns. `results/figures/` is
+  not moved: it is redrawn, and the superseded figures are those frozen with
+  the report that presented them. Figure 01 reads no MOTCO-dependent file,
+  so its byte identity with the previous report's frozen copy (same module
+  and matplotlib) is a check of the same kind as the MOTCO-independent
+  hashes.
   Outside the Nix shell numpy cannot load its native libraries; run commands
   through `nix develop -c ...` there.
 - Data root: explicit flag (`download --dest-root`, `--data-root` elsewhere)
@@ -865,6 +951,48 @@ when behavior or defaults change.
   the stage-2 cells are smaller (less power); MOTCO's operating
   characteristics were measured on neither cohort; the flag's sex split
   bears on the sex × stage comparison.
+- Figure constants (flag and ask before changing any of them):
+  - `FIGURES`: a registry keyed by name in drawing order, with number,
+    title, draw function, caption builder, fixed construction text and
+    reading keys. No flag selects, skips or adds a figure. Entries are added
+    or changed by a change proposal only, and a change that adds a step adds
+    its figure here, so the step's report freezes it.
+  - The display choices:
+    - `FIGURE_COHORT` (`cohort_30`, tied at import to
+      `POSITIVE_CONTROL_PRIMARY_COHORT`; the cohort of figures 03, 07, 08
+      and 10, with `cohort_50` wherever a figure draws both);
+    - `FIGURE_STAGE_DE` (`rna`, `factor_additive`, `stage_2_vs_0`, checked
+      at import against `STAGE_DE_MODELS`; the caption gives the
+      `stage_1_vs_0`, union and limma `stage_joint` counts too);
+    - `FIGURE_FIRST_AXIS_RULE` (figure 08's variable: E3's rule over
+      `POSITIVE_CONTROL_TECHNICAL_SOURCES`, values from the technical table
+      or the export manifest);
+    - `DIAGNOSTIC_CORRELATION_THRESHOLD` reused for the heatmap labels;
+    - `FIGURE_SENSITIVITY_CELL_TYPE` (astrocytes, the cell type
+      `rank-sensitivity` and `preprocessing-sensitivity` run on);
+    - `FIGURE_PREPROCESSING_ROOT` (tied at import to
+      `run_preprocessing_sensitivity`'s default).
+  - Rendering: `FIGURE_PALETTE` (sex and cell-type pairs validated; the
+    aqua is below 3:1 on white, so every cell-type mark has a legend entry
+    or a direct label), `FIGURE_DPI` (200), `FIGURE_FORMATS`,
+    `FIGURE_RASTER_MIN_POINTS` (500), `FIGURE_SVG_HASHSALT`, `FIGURE_FONT`
+    (matplotlib's bundled DejaVu Sans, checked at run time),
+    `FIGURE_JITTER_SEEDS`, and the reproduction tolerances
+    `FIGURE_STAGE_MEANS_ATOL` (1e-8) and `FIGURE_SPEARMAN_ATOL` (1e-9).
+  - `FIGURE_READING_RULES`: the caption texts that restate the rules of this
+    file (the binding MOTCO rules, the `df` size statement, sensitivity as
+    dependence, the forced-rank limitations, `latent_adjusted` not read,
+    measurement-space findings, the diagnostic rule, the stage-DE count
+    rules, the positive control's bases). A rule changed here by a later
+    change changes its text there in the same change.
+  - The output names (`FIGURE_*`).
+
+  Reading rules: the figures are a display step. They test nothing, are an
+  input of no step, and change no reading of the reports that made the
+  outputs. A caption contains the fixed construction, values read from the
+  files and the registered rules, and no other interpretation. A caption
+  value that differs from the report that made the output is a finding about
+  that report, recorded with both values.
 - DE: supertypes whose design matrix is not full rank are skipped (pydeseq2
   `UserWarning`), not treated as errors. Output filenames replace `/` with `-`.
 - Statistical choices (design formula, contrasts, QC thresholds, pseudobulk
