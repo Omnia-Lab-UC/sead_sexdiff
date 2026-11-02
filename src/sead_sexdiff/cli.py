@@ -55,6 +55,16 @@ from .data import (
     pseudobulk_and_filter,
     differential_expression,
 )
+from .figures import (
+    FIGURES,
+    FIGURE_COHORT,
+    FIGURE_MANIFEST,
+    FIGURE_OUT_DIR,
+    FIGURE_REPORT_SUBDIR,
+    FIGURE_REPORTS_DIR,
+    figure_stem,
+    run_figures,
+)
 
 
 def _parse_suffixes(values: list[str] | None) -> list[str] | None:
@@ -1145,6 +1155,51 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing cohort directories",
     )
+
+    # figures: the registered case-study figures from the generated outputs
+    sub_fg = sub.add_parser(
+        "figures",
+        help=f"Draw the {len(FIGURES)} registered case-study figures from the generated outputs of both cell types",
+        description=(
+            f"Draws the registry FIGURES ({', '.join(figure_stem(n) for n in FIGURES)}) from the generated outputs of "
+            "both cell types under results/ only (never results/superseded/ or raw data), read relative to the "
+            "working directory. Before drawing, a consistency check reads every manifest of the registries and under "
+            "the registered directories: the cell type of each, every recorded {path, sha256} entry hashing as "
+            "recorded, and one MOTCO version and measurement across every analysis drawn; any failure stops the run "
+            "with nothing written. Each figure is written as PNG, PDF and SVG (deterministic bytes, a fingerprint of "
+            f"its inputs and the code in its metadata), with a generated caption in figures.md and {FIGURE_MANIFEST} "
+            f"recording every file read. Display choices are constants ({FIGURE_COHORT} for the single-cohort "
+            "figures, among others). The output directory is a working copy: a run does nothing when every figure is "
+            "fresh and otherwise redraws the whole set through <out>.tmp/. The figures test nothing and are an input "
+            "of no step."
+        ),
+    )
+    sub_fg.add_argument(
+        "--out",
+        default=FIGURE_OUT_DIR,
+        type=Path,
+        help="The working copy (default: %(default)s)",
+    )
+    fg_mode = sub_fg.add_mutually_exclusive_group()
+    fg_mode.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Only list the figures whose inputs (or the files their manifests record), module or matplotlib version "
+            "changed since they were drawn, or whose inputs are gone; exit 0 when all are fresh, 1 when any is stale, "
+            "2 without a manifest; nothing is written"
+        ),
+    )
+    fg_mode.add_argument(
+        "--report",
+        default=None,
+        metavar="REPORT_STEM",
+        help=(
+            "Run the consistency check, redraw the working copy if it is stale or absent, then freeze its SVGs, "
+            f"figures.md and {FIGURE_MANIFEST} under {FIGURE_REPORTS_DIR}/{FIGURE_REPORT_SUBDIR}/REPORT_STEM/ (the "
+            "stem of the report that embeds them; never overwritten)"
+        ),
+    )
     return parser
 
 
@@ -1567,6 +1622,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"E1 {o['E1']}, E2 {o['E2']}, E3 {o['E3']}; all three hold: {'yes' if o['all_hold'] else 'no'}"
             )
         print("[positive-control] Done.")
+        return 0
+
+    if args.command == "figures":
+        result = run_figures(out_dir=args.out, check=args.check, report=args.report)
+        if args.check:
+            state = result["status"]["state"]
+            print(f"[figures] {'all figures fresh' if state == 'fresh' else 'no working copy' if state == 'absent' else 'stale figures listed above'} "
+                  f"(exit {result['exit_code']})")
+            return result["exit_code"]
+        print("[figures] Done.")
         return 0
 
     parser.error("Unknown command")

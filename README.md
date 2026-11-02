@@ -14,6 +14,7 @@ Project layout:
 │   └── sead_sexdiff/
 │       ├── cli.py
 │       ├── data.py
+│       ├── figures.py       # `figures`: the registered case-study figures (plotting)
 │       └── stage_de_limma.R   # R side of `stage-de-limma` (limma-voom), run with Rscript
 ├── pyproject.toml   # project configuration (uv/pip compatible)
 ├── LICENSE
@@ -108,7 +109,7 @@ The microglia labels and preregistered cohort cells come from a metadata-only sp
 
 The flag sets the population (one selection path, `select_nuclei`, shared by `pseudobulk` and `technical-covariates`; `select_astrocyte_nuclei` is its astrocyte wrapper) and every default directory: `<root>/pseudobulk/`, `<root>/motco_input/`, `<root>/motco_analysis/`, `<root>/motco_diagnostics/`, `<root>/motco_rank_sensitivity/` (read by `axis-diagnostics`), `<root>/motco_latent_sensitivity/`, `<root>/stage_de/`, `<root>/stage_de_limma/` (`cell_type_dirs`). Explicit directory flags take precedence. Thresholds, stage coding and every export, analysis and stage-DE setting are the same for every cell type.
 
-Every manifest of these steps records `cell_type`, and every reader checks it: `export` and `technical-covariates` refuse a pseudobulk manifest of another cell type; `analyze`, `axis-diagnostics`, `latent-sensitivity`, `stage-de` and `stage-de-limma` an export manifest of another; `stage-de-limma` also a DESeq2 manifest of another; `latent-sensitivity` also an analysis, technical or pseudobulk manifest of another. Each refusal names the file and both cell types and writes nothing. A manifest written before the registry existed has no `cell_type`; it reads as `astrocyte` and the reader records that as a finding, so the existing astrocyte outputs are not rerun. The per-donor caches record the cell type and a cache of another one is refused; the stage-DE fit-record fingerprints do not include it (their input hashes already differ between cell types). The sensitivity commands `rank-sensitivity` and `preprocessing-sensitivity` have no flag and read astrocytes; `latent-sensitivity` has the flag (its registry of arms, covariate set and settings are the same for every cell type), and `positive-control` reads both cell types' roots by role and takes `--basis` instead.
+Every manifest of these steps records `cell_type`, and every reader checks it: `export` and `technical-covariates` refuse a pseudobulk manifest of another cell type; `analyze`, `axis-diagnostics`, `latent-sensitivity`, `stage-de` and `stage-de-limma` an export manifest of another; `stage-de-limma` also a DESeq2 manifest of another; `latent-sensitivity` also an analysis, technical or pseudobulk manifest of another. Each refusal names the file and both cell types and writes nothing. A manifest written before the registry existed has no `cell_type`; it reads as `astrocyte` and the reader records that as a finding, so the existing astrocyte outputs are not rerun. The per-donor caches record the cell type and a cache of another one is refused; the stage-DE fit-record fingerprints do not include it (their input hashes already differ between cell types). The sensitivity commands `rank-sensitivity` and `preprocessing-sensitivity` have no flag and read astrocytes; `latent-sensitivity` has the flag (its registry of arms, covariate set and settings are the same for every cell type), and `positive-control` reads both cell types' roots by role and takes `--basis` instead; `figures` reads both cell types by role and takes neither (its readers check every manifest's cell type against its root's).
 
 ```
 sead-sexdiff pseudobulk --cell-type microglia --omic both      # results/microglia/pseudobulk/
@@ -768,9 +769,72 @@ Reading rules, binding for the report (`reports/motco-donor-exclusion-sensitivit
 - The variant's exported RNA stage counts (DESeq2 `factor_additive` union, limma `stage_joint`) beside the primary's say how much of the stage signal survives the exclusion; the concordance cells apply to the variant analysis as to the primary. The cross-cell-type comparisons (variant CV AUROC, microglia against astrocytes; each cell type's variant counts against its primary counts) are compared, not tested.
 - Limitations carried: the excluded donors carry the most severe pathology, so the exclusion truncates the late epoch along with the quality tail and a stage effect concentrated in them is removed with them; the flag was made from QC metrics, so the variant conditions on quality by donor selection; the stage-2 cells are smaller, so the variant has less power; MOTCO's operating characteristics were measured on neither cohort; the flag's sex split bears on the sex × stage comparison.
 
+### Case-study figures
+
+```
+sead-sexdiff figures                                         # draw the set if stale or absent
+sead-sexdiff figures --check                                 # list stale figures; exit 0 / 1 / 2
+sead-sexdiff figures --report motco-case-study-figures-2026-11-03   # freeze the set for a report
+```
+
+Options: `--out` (default `results/figures`, the working copy), `--check` (compare the working copy with the files on disk and write nothing), `--report REPORT_STEM` (freeze the set under `reports/figures/REPORT_STEM/`); `--check` and `--report` are exclusive. There is no per-figure, cell-type or directory flag: the figure set is the registry `FIGURES` and both cell types are read by role, as `positive-control` does. Inputs are read from `results/` relative to the working directory, so run it from the repository root.
+
+It draws the ten figures of `FIGURES` (in `src/sead_sexdiff/figures.py`, the one module outside `data.py` with logic of its own: plotting, by the user's decision of 2026-11-02) from the generated outputs of both cell types only, never from raw donor objects or `results/superseded/`:
+
+| # | file stem | shows |
+|---|---|---|
+| 01 | `01_cohorts` | nuclei per donor (RNA against ATAC) with the cohort thresholds; donors per sex × stage cell, both cohorts and cell types |
+| 02 | `02_trajectories` | LS-mean trajectories per sex in `pls_0` × `pls_1` with covariate-adjusted donors; the four primaries |
+| 03 | `03_components_by_stage` | LS-means per component by stage, with the geometry shares; `cohort_30` |
+| 04 | `04_statistics_vs_null` | observed `delta`, `angle`, `shape` against their RRPP null quantiles, `angle` with rank, eigengap and its null; the four primaries |
+| 05 | `05_pvalue_overview` | every MOTCO analysis of the registries × 3 statistics (44 analyses, 132 p-values today); `latent_adjusted` `angle` / `shape` drawn as reported, not read |
+| 06 | `06_rank_sensitivity` | astrocyte forced ranks against their nulls, with the CV-selected rank |
+| 07 | `07_axis_correlations` | Spearman ρ of every component with every diagnostic variable; `cohort_30` |
+| 08 | `08_first_axis` | `pls_0` against stage and against E3's largest technical variable; `cohort_30` |
+| 09 | `09_positive_control` | E1–E3, control against reference, both bases and cohorts |
+| 10 | `10_stage_de` | volcano (`factor_additive` `stage_2_vs_0`, RNA) and DESeq2 against limma; `cohort_30` |
+
+The analyses are enumerated from the registries (`ANALYSIS_FORCED_RANKS`, `PREPROCESSING_VARIANTS`, `LATENT_SENSITIVITY_ARMS`, `DONOR_EXCLUSION_VARIANTS`, `POSITIVE_CONTROL_BASES`, `EXPORT_COHORTS`); a registered output that is missing stops the run naming it and the step that writes it. The display choices are constants recorded in the manifest, never flags: `FIGURE_COHORT` (`cohort_30`, tied to `POSITIVE_CONTROL_PRIMARY_COHORT`) for 03, 07, 08 and 10; `FIGURE_STAGE_DE` (`rna`, `factor_additive`, `stage_2_vs_0`, checked against `STAGE_DE_MODELS`), whose caption also gives the `stage_1_vs_0`, union and limma `stage_joint` counts; figure 08's variable by E3's rule over `POSITIVE_CONTROL_TECHNICAL_SOURCES` (values from the technical table, or from the export manifest for the TMM factors and library sizes); `DIAGNOSTIC_CORRELATION_THRESHOLD` for the heatmap labels; astrocytes only for 06; `FIGURE_PALETTE`, `FIGURE_DPI` (200), `FIGURE_RASTER_MIN_POINTS` (500).
+
+Checks, before and while drawing (any failure stops the run, removes `<out>.tmp/` and leaves the previous set unchanged):
+
+- **Consistency pre-pass.** It reads the manifests the registries name (each must exist) and every other `*manifest.json` under the registered directories (every cell type's `cell_type_dirs`, plus `results/motco_sensitivity/`), 156 today. Each one's cell type is checked against its root's (`check_manifest_cell_type`), and every recorded `{"path", "sha256"}` entry must exist under `results/` outside `superseded/` and hash as recorded (1,498 entries today). Every registered analysis's `result.json` must carry the astrocyte primary's MOTCO version, `params.residual_correction == ANALYSIS_RESIDUAL_CORRECTION`, `params.min_components == ANALYSIS_RANK_FLOOR`, its forced rank under `rank-sensitivity` (none elsewhere), `ANALYSIS_PERMUTATIONS` and `ANALYSIS_SEED`. A half-finished re-issue therefore cannot produce a figure that mixes two measurements. Hashes a step records in other forms (`*_sha256` keys, `dir` + `files` maps, `tables` blocks) were checked by the step that wrote them. Figure 10 checks the limma step's `inputs.deseq2` record against the DESeq2 files it draws.
+- **Reproductions.** Every value a figure recomputes is checked against the output that holds it: the covariate-adjusted donor scores' cell means against `stage_means.csv` (to `FIGURE_STAGE_MEANS_ATOL`, 1e-8), figure 08's two Spearman ρ against `axis_correlations.csv` (to `FIGURE_SPEARMAN_ATOL`, 1e-9), figure 10's counts against `stage_de_summary.csv` and its DESeq2/limma overlap counts against `method_comparison.csv` (exact; a missing DESeq2 `padj`, pydeseq2's independent filter, counts as not significant), and figure 01's cells against the pseudobulk manifest. A failure names the value and both numbers.
+- **Chain.** Each diagnostic, stage-DE and rank-sensitivity manifest a figure reads must record the analysis drawn beside it.
+
+Every file a figure reads goes through one recording reader, so the manifest's input list is the reader's log. Outputs in the working copy:
+
+| file | content |
+|---|---|
+| `<nn>_<name>.png` / `.pdf` / `.svg` | each figure at 200 dpi (PNG) and as vector files; scatter layers with more than 500 points are embedded as images in the PDF and SVG |
+| `figures.md` | per figure `## Figure N. <title>`, the SVG link and the caption in three parts: *Construction* (fixed text), *Values* (read from the files at run time) and *Reading* (the rules of `FIGURE_READING_RULES` that apply: the binding MOTCO rules, the `df` size statement, sensitivity as dependence, the forced-rank limitations, `latent_adjusted` not read, measurement-space findings, the stage-DE count rules, the positive control's bases) |
+| `figures_manifest.json` | run level: module path and sha256, package version, git revision, matplotlib, numpy and pandas versions, the display constants (incl. the font files resolved), the reading rules, the consistency summary (counts, MOTCO version, measurement, findings). Per figure: every file read with its sha256, the manifests read, the MOTCO version and measurement of every analysis drawn, the fingerprint, the caption, each image's sha256, and the cell-type findings |
+
+The files are deterministic. Two runs on the same inputs, code and matplotlib version give byte-identical PNG, PDF and SVG files:
+- the font is matplotlib's bundled DejaVu Sans, checked at run time;
+- SVG text is stored as paths, and the SVG id salt is `FIGURE_SVG_HASHSALT`;
+- no creation date is written, and jitter uses fixed seeds.
+
+matplotlib is pinned exactly (`matplotlib==3.10.7`). Each image's metadata (PNG `Title` / `Description`, PDF `Title` / `Subject`, SVG `dc:title` / `dc:description`) carries the figure stem and a fingerprint, so a copied figure stays traceable. The fingerprint is the sha256 of the canonical JSON of the figure, its inputs with their sha256, the module's sha256 and the matplotlib version. The git revision is recorded in the manifest only, so a commit that does not touch the module changes no image.
+
+Run modes:
+
+- **Plain run.** With a manifest at `--out` and every figure fresh, it prints that the set is fresh and writes nothing. Otherwise it lists the stale figures, runs the pre-pass and redraws the whole set into `<out>.tmp/`, writing the manifest last. The old directory moves to `<out>.old/`, the new one into place, and `<out>.old/` is removed after the rename. Unchanged figures come out byte-identical. There is no `--force`: the working copy is gitignored and the record of a figure is the frozen copy a report carries.
+- **`--check`.** A figure is stale when a file it read, or a file recorded with a sha256 by a manifest it read, hashes differently or is missing (moved to `superseded/`); when the module's sha256 or the matplotlib version differs; when it is not in the manifest; or when one of the working copy's images is missing or differs from its recorded sha256. It lists the stale figures with reasons and exits 0 when all are fresh, 1 when any is stale and 2 without a manifest. After a re-issue of the primaries, figures 02–10 are stale (07 and 10 through their manifests' recorded hashes) and 01 stays fresh.
+- **`--report REPORT_STEM`.** The stem must match `^[a-z0-9][a-z0-9.-]*$`, and `reports/figures/REPORT_STEM/` must not exist; both are checked before anything is drawn. It runs the pre-pass, redraws the working copy if it is stale or absent, and copies the ten SVGs, `figures.md` and `figures_manifest.json` through `REPORT_STEM.tmp/`, checking each SVG's sha256 against the manifest. A frozen set is never regenerated or edited. Every report freezes the full set; unchanged figures are byte-identical, so git stores them once.
+
+Every report committed under `reports/` from `mtg-case-study-figures` on does the following:
+- it carries the set frozen by `figures --report <its stem>` after its last output run;
+- it embeds `figures/<stem>/<nn>_<name>.svg` and pastes each caption verbatim from the frozen `figures.md`;
+- its check script verifies, before the commit, that the pasted captions equal `figures.md`, that the frozen SVGs hash as the frozen manifest records, and that every input the frozen manifest records (and every hash recorded by the manifests it read) hashes as recorded on disk.
+
+If an output is rerun after freezing, the uncommitted frozen set is removed and `figures --report` is run again. Reports committed before this change are not edited. A change that adds a step adds its figure to `FIGURES` in its own proposal, so the step's report freezes it.
+
+Reading: the figures are a display step. They test nothing, are an input of no export, analysis, sensitivity, diagnostic, stage-DE or positive-control step, and change no reading of the reports that made the outputs. A caption value that differs from the report that made the output is a finding about that report, recorded with both values. The captions restate the binding rules and interpret nothing beyond them.
+
 ### Superseded outputs (`results/superseded/<change>/`)
 
-A MOTCO pin move that changes the measurement re-issues every MOTCO-dependent output, so that no output mixes two releases, rank rules or nulls: a same-machine gate first (the new pin with the previous measurement restored against the previous pin from the pre-change commit; byte-identical CSVs, equal records), for a new setting MOTCO documents as moving only named outputs a contract gate on the primaries (the new pin with and without it; everything outside the named outputs equal), then the superseded directories are moved, every MOTCO-dependent step is rerun from scratch in dependency order for every cell type it ran on, and a version-consistency check lists any manifest outside `results/superseded/` that records another MOTCO version or an analysis record without the current measurement setting.
+A MOTCO pin move that changes the measurement re-issues every MOTCO-dependent output, so that no output mixes two releases, rank rules or nulls: a same-machine gate first (the new pin with the previous measurement restored against the previous pin from the pre-change commit; byte-identical CSVs, equal records), for a new setting MOTCO documents as moving only named outputs a contract gate on the primaries (the new pin with and without it; everything outside the named outputs equal), then the superseded directories are moved, every MOTCO-dependent step is rerun from scratch in dependency order for every cell type it ran on, and a version-consistency check lists any manifest outside `results/superseded/` that records another MOTCO version or an analysis record without the current measurement setting, `results/figures/figures_manifest.json` included (its per-figure analyses must record the new version). `figures --report <re-issue report stem>` is the last rerun step, after every other rerun has finished. `results/figures/` is a working copy and is never moved: it is redrawn, and the superseded figures are the ones frozen with the report that presented them, under `reports/figures/<that stem>/`. Figure 01 reads no MOTCO-dependent file, so it is byte-identical to its copy in the previous report's frozen set when the module and matplotlib are unchanged.
 
 Superseded directories are moved, never deleted, to `results/superseded/<change>/` (the change that superseded them), keeping their path relative to `results/`: `results/microglia/motco_analysis/` becomes `results/superseded/<change>/microglia/motco_analysis/`. `scripts/move_superseded.py` (standard library only, so it runs with any `python3`, also on the cluster login node) hashes every file, renames on the same filesystem, re-hashes (a difference stops it) and writes `results/superseded/<change>/MOVED.json` (per move: old and new path, host, time and the sha256 of every file; directories absent on that machine are listed under `absent`). It refuses an existing target. Nothing under `results/superseded/` is an input of any step or a default directory; the superseded outputs are records, not a sensitivity arm, and are not cited as results, but every hash an earlier report cites stays resolvable there. The MOTCO-independent outputs (`pseudobulk/`, `motco_input/`, the donor, covariate, technical and flag tables, the annotation) are never moved.
 
@@ -997,6 +1061,16 @@ adata_sub = subset_adata(
 ```
 
 Note: `subset_adata` applies the same rudimentary QC by default (cells `min_genes=200`, genes `min_cells=3`).
+
+- Case-study figures (run from the repository root; inputs are read from `results/`):
+
+```python
+from sead_sexdiff.figures import run_figures, figures_status
+
+status = figures_status("results/figures")        # state, exit_code, stale (stem -> reasons), fresh
+result = run_figures()                             # redraw results/figures if stale or absent
+result = run_figures(report="motco-case-study-figures-2026-11-03")  # check, redraw if needed, freeze
+```
 
 - Subset every donor file in a folder and concatenate them:
 
