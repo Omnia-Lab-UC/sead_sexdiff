@@ -49,6 +49,7 @@ from .data import (
     ANALYSIS_RANK_FLOOR,
     ANALYSIS_RESIDUAL_CORRECTION,
     ANALYSIS_SEED,
+    ANALYSIS_SPAN_SPLIT_TEST,
     ANALYSIS_STATISTICS,
     CELL_TYPES,
     COHORT_THRESHOLDS,
@@ -65,6 +66,7 @@ from .data import (
     LATENT_SENSITIVITY_ARMS,
     LATENT_SENSITIVITY_COMPARISON_DIR,
     LATENT_SENSITIVITY_MANIFEST,
+    LATENT_SENSITIVITY_SPLIT_UNAVAILABLE,
     POSITIVE_CONTROL_BASES,
     POSITIVE_CONTROL_CELL_TYPES,
     POSITIVE_CONTROL_DEFAULT_BASIS,
@@ -79,6 +81,11 @@ from .data import (
     PREPROCESSING_VARIANTS,
     RANK_SENSITIVITY_DIR_TEMPLATE,
     RANK_SENSITIVITY_MANIFEST,
+    SPAN_SPLIT_CONCORDANCE_PART,
+    SPAN_SPLIT_CONFIRMATORY_PART,
+    SPAN_SPLIT_PARTS,
+    SPAN_SPLIT_ROLES,
+    SPAN_SPLIT_STATISTIC,
     STAGE_DE_ALPHA,
     STAGE_DE_LIMMA_COMPARISON,
     STAGE_DE_LIMMA_JOINT_TESTS,
@@ -95,6 +102,7 @@ from .data import (
     TECHNICAL_OUTPUTS,
     _git_revision,
     _sha256_file,
+    _span_split_status,
     cell_type_dirs,
     check_manifest_cell_type,
     run_preprocessing_sensitivity,
@@ -256,6 +264,24 @@ FIGURE_READING_RULES: dict[str, str] = {
         "not depend on the basis; the latent_adjusted basis is a diagnosis of the primary-basis control, never a "
         "replacement (the arm is not promoted). No expectation reads a p-value."
     ),
+    "span_split": (
+        "MOTCO's split interaction test splits the group x stage interaction energy of the analysed features into the "
+        "fitted stage-PLS span, its orthogonal complement and all of it. Only the complement is confirmatory: its "
+        "pseudo-F p-value is read at alpha = 0.05, unadjusted (no adjustment across delta, angle, shape and the "
+        "complement, so each primary carries four tests read at alpha), and each cell type's cohort_30 primary gives "
+        "the result; a complement status that differs from the primary's elsewhere is rank, preprocessing, "
+        "covariate-set or cohort dependence. The span part is a concordance cell against any of delta, angle and "
+        "shape rejected in the same analysis, a discordance a finding and never a result; total, the in-span share "
+        "and the interaction-SS p-values are reported and not read. A complement rejection is a sex x stage "
+        "difference with interaction energy outside the fitted span, not a different molecular program: it may hold "
+        "leakage from an in-span difference and what the fitted span missed of the stage program, and it carries no "
+        "direction, feature list or attribution. A complement non-rejection is uninformative: no power was shown at "
+        "SEA-AD's stage signal, nor for sparse differences at any signal. The in-span share grows with the fitted rank "
+        "and is read against no null here. Size was measured on real noise only for the astrocyte cohort_30 export at "
+        "this configuration (complement 0.012); for cohort_50, microglia, the eight-covariate arm, the exclusion "
+        "variants, the forced ranks and the preprocessing variants it is inferred. The test is not available with a "
+        "latent adjustment."
+    ),
 }
 
 
@@ -388,6 +414,8 @@ def _measurement(record: dict) -> dict:
         "selected_lv": record.get("latent", {}).get("selected_lv"),
         "permutations": params.get("permutations"),
         "seed": params.get("seed"),
+        "span_split_test": bool(params.get("span_split_test", False)),
+        "span_split_present": isinstance(record.get("span_split"), dict),
     }
 
 
@@ -509,7 +537,10 @@ def check_consistency(reader: FigureReader) -> dict:
     for one MOTCO version (the astrocyte primary's) and the registered
     measurement (``ANALYSIS_RESIDUAL_CORRECTION``, ``ANALYSIS_RANK_FLOOR``,
     the forced rank under rank-sensitivity and none elsewhere,
-    ``ANALYSIS_PERMUTATIONS``, ``ANALYSIS_SEED``).
+    ``ANALYSIS_PERMUTATIONS``, ``ANALYSIS_SEED``, and the split test
+    ``ANALYSIS_SPAN_SPLIT_TEST`` with its ``span_split`` block, except in the
+    arms of ``LATENT_SENSITIVITY_SPLIT_UNAVAILABLE``, which must carry
+    neither).
 
     Returns
     -------
@@ -587,6 +618,13 @@ def check_consistency(reader: FigureReader) -> dict:
             errors.append(f"{path}: params.permutations is {m['permutations']!r}; expected {ANALYSIS_PERMUTATIONS}")
         if m["seed"] != ANALYSIS_SEED:
             errors.append(f"{path}: params.seed is {m['seed']!r}; expected {ANALYSIS_SEED}")
+        unavailable = a["family"] == "latent" and a["label"] in LATENT_SENSITIVITY_SPLIT_UNAVAILABLE
+        want = ANALYSIS_SPAN_SPLIT_TEST and not unavailable
+        if (m["span_split_test"], m["span_split_present"]) != (want, want):
+            expected = (f"the split test (params.span_split_test = true and a span_split block; ANALYSIS_SPAN_SPLIT_TEST)"
+                        if want else "no split test (not available with a latent adjustment)")
+            errors.append(f"{path}: params.span_split_test is {m['span_split_test']}, span_split block "
+                          f"{'present' if m['span_split_present'] else 'absent'}; expected {expected}")
     if errors:
         shown = errors[:40]
         more = f"; ... and {len(errors) - len(shown)} more" if len(errors) > len(shown) else ""
@@ -606,6 +644,8 @@ def check_consistency(reader: FigureReader) -> dict:
             "forced_components": sorted(forced_seen),
             "permutations": ANALYSIS_PERMUTATIONS,
             "seed": ANALYSIS_SEED,
+            "span_split_test": ANALYSIS_SPAN_SPLIT_TEST,
+            "span_split_unavailable": list(LATENT_SENSITIVITY_SPLIT_UNAVAILABLE),
         },
         "findings": findings,
     }
@@ -1689,6 +1729,179 @@ def _caption_stage_de(v: dict) -> str:
     return " ".join(parts)
 
 
+_SPLIT_P_TICKS = (0.001, 0.01, ANALYSIS_ALPHA, 0.2, 1.0)
+
+
+def _split_p_axis(ax) -> None:
+    """A log pseudo-F p axis from the smallest attainable p, with the α band."""
+    low = 1.0 / (1 + ANALYSIS_PERMUTATIONS)
+    ax.axvspan(low * 0.7, ANALYSIS_ALPHA, color=_P["alpha_band"], alpha=0.45, linewidth=0, zorder=0)
+    ax.axvline(ANALYSIS_ALPHA, color=_P["critical"], linewidth=0.8, zorder=1)
+    ax.set_xscale("log")
+    ax.set_xlim(low * 0.7, 1.4)
+    ax.set_xticks(_SPLIT_P_TICKS, [f"{x:g}" if x != ANALYSIS_ALPHA else "α" for x in _SPLIT_P_TICKS])
+    ax.xaxis.set_minor_locator(mticker.NullLocator())
+    ax.grid(axis="y", visible=False)
+
+
+def _draw_span_split(r: FigureReader) -> tuple[Figure, dict]:
+    rows, primaries = [], []
+    for a in registered_analyses():
+        rec = r.result(a["dir"] / _RESULT)
+        man = r.manifest(a["dir"] / _ANALYSIS_MANIFEST, a["cell_type"])
+        status = _span_split_status(rec, alpha=ANALYSIS_ALPHA)
+        row = {**{k: a[k] for k in ("cell_type", "family", "label", "cohort")},
+               "rank": rec["latent"]["selected_lv"], "available": status is not None}
+        if status is not None:
+            split = rec["span_split"]
+            row.update({f"{part}_p": split["parts"][part][SPAN_SPLIT_STATISTIC] for part in SPAN_SPLIT_PARTS})
+            row.update({f"{part}_f": split["parts"][part]["f"] for part in SPAN_SPLIT_PARTS})
+            row.update({f"{part}_dim": split["parts"][part]["dimension"] for part in SPAN_SPLIT_PARTS})
+            row.update(status, share=split["span_share"])
+        rows.append(row)
+        if a["family"] == "primary":
+            primaries.append((f"{a['cell_type']} {a['cohort']}", rec, man))
+    table = pd.DataFrame(rows)
+    available = table[table["available"]]
+    keys = table[["cell_type", "family", "label"]].drop_duplicates().reset_index(drop=True)
+    n = len(keys)
+    fig = Figure(figsize=(12, 0.27 * n + 2.2))
+    gs = fig.add_gridspec(2, 2, width_ratios=(1, 1.2), height_ratios=(1, 1.45))
+    ax_a, ax_c, ax_b = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[:, 1])
+
+    # (a) the primaries: every part's pseudo-F p-value, marked by its role
+    prim = table[table["family"] == "primary"].reset_index(drop=True)
+    _split_p_axis(ax_a)
+    offsets = {"total": -0.24, "span": 0.0, "complement": 0.24}
+    for y, t in prim.iterrows():
+        color = _CELL[t["cell_type"]]
+        ax_a.scatter(t["total_p"], y + offsets["total"], s=26, marker="s", color=_MUTED, edgecolor="white",
+                     linewidth=1, zorder=3)
+        ax_a.scatter(t["span_p"], y + offsets["span"], s=34, marker="D", facecolor="white", edgecolor=color,
+                     linewidth=1.5, zorder=3)
+        ax_a.scatter(t["complement_p"], y + offsets["complement"], s=40, marker="o", color=color, edgecolor="white",
+                     linewidth=1.2, zorder=4)
+        ax_a.annotate(f"span {'concordant' if t['span_concordant'] else 'discordant'}", (1.0, y), xytext=(8, 0),
+                      textcoords="offset points", va="center", fontsize=6.6, color=_INK2, annotation_clip=False)
+    ax_a.set_ylim(len(prim) - 0.5, -0.5)
+    ax_a.set_yticks(range(len(prim)), [f"{t['cell_type']} · {t['cohort']}  [rank {t['rank']}]" for _, t in prim.iterrows()])
+    ax_a.set_title("(a) primaries: pseudo-F p per part")
+
+    # (b) the complement of every registered analysis that carries the test
+    _split_p_axis(ax_b)
+    not_available = []
+    for y, key in keys.iterrows():
+        sub = table[(table[["cell_type", "family", "label"]] == key.values).all(axis=1)].set_index("cohort")
+        color = _CELL[key["cell_type"]]
+        if not sub["available"].any():
+            not_available += [f"{key['cell_type']} {key['label']} {c}" for c in sub.index]
+            ax_b.text(0.0012, y, "not available: no split test with a latent adjustment", va="center", ha="left",
+                      fontsize=6.6, color=_MUTED, fontstyle="italic")
+            continue
+        for i, cohort in enumerate(EXPORT_COHORTS):
+            t = sub.loc[cohort]
+            face = color if cohort == EXPORT_COHORTS[0] else "white"
+            ax_b.scatter(t["complement_p"], y + (i - (len(EXPORT_COHORTS) - 1) / 2) * 0.3, s=26, marker="o",
+                         facecolor=face, edgecolor=color, linewidth=1.3, zorder=3)
+    labels = []
+    for _, key in keys.iterrows():
+        ranks = table[(table[["cell_type", "family", "label"]] == key.values).all(axis=1)].set_index("cohort")["rank"]
+        labels.append(f"{key['cell_type']} · {key['label']}  [{' / '.join(str(ranks[c]) for c in EXPORT_COHORTS)}]")
+    ax_b.set_yticks(range(n), labels)
+    ax_b.set_ylim(n - 0.5, -0.5)
+    previous = None
+    for y, key in keys.iterrows():
+        group = (key["cell_type"], key["family"])
+        if previous is not None and group != previous:
+            ax_b.axhline(y - 0.5, color=_AXIS, linewidth=0.6)
+        previous = group
+    ax_b.set_title(f"(b) complement pseudo-F p per analysis [rank {' / '.join(EXPORT_COHORTS)}]")
+
+    # (c) the in-span share against the fitted rank, no reference line
+    shift = {c: (i - (len(EXPORT_COHORTS) - 1) / 2) * 0.22 for i, c in enumerate(EXPORT_COHORTS)}
+    for _, t in available.iterrows():
+        if pd.isna(t["share"]):
+            continue
+        color = _CELL[t["cell_type"]]
+        face = color if t["cohort"] == EXPORT_COHORTS[0] else "white"
+        ax_c.scatter(t["rank"] + shift[t["cohort"]], t["share"], s=26, marker="o", facecolor=face, edgecolor=color,
+                     linewidth=1.3, zorder=3)
+    ranks = sorted(available["rank"].unique())
+    ax_c.set_xticks(ranks)
+    ax_c.set_xlim(min(ranks) - 0.8, max(ranks) + 0.8)
+    ax_c.set_ylim(bottom=0)
+    ax_c.set_xlabel("fitted latent rank (span dimension)")
+    ax_c.set_ylabel("in-span share of the interaction SS")
+    ax_c.set_title("(c) in-span share by fitted rank (not read)")
+
+    legend = [
+        Line2D([], [], marker="o", linestyle="", color=_INK2, markersize=6, label="complement (confirmatory; a)"),
+        Line2D([], [], marker="D", linestyle="", markerfacecolor="white", markeredgecolor=_INK2, markersize=5,
+               label="span (concordance cell; a)"),
+        Line2D([], [], marker="s", linestyle="", color=_MUTED, markersize=6, label="total (not read; a)"),
+        Line2D([], [], marker="o", linestyle="", color=_INK2, markersize=6, label=f"{EXPORT_COHORTS[0]} (b, c)"),
+        *[Line2D([], [], marker="o", linestyle="", markerfacecolor="white", markeredgecolor=_INK2, markersize=6,
+                 label=f"{c} (b, c)") for c in EXPORT_COHORTS[1:]],
+        *[Line2D([], [], marker="o", linestyle="", color=_CELL[ct], markersize=6, label=ct) for ct in CELL_TYPES],
+    ]
+    rejected = available[available["complement_rejected"].astype(bool)]
+    _suptitle(fig, f"Split interaction test: complement p ≤ {ANALYSIS_ALPHA} in {len(rejected)} of {len(available)} "
+                   f"analyses carrying it; only each cell type's {FIGURE_COHORT} primary complement is confirmatory")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.965))
+    fig.legend(handles=legend, loc="lower center", ncol=len(legend), bbox_to_anchor=(0.5, 0.012))
+    _footnote(fig, "Only the complement is confirmatory (p ≤ α, unadjusted; each primary carries four tests read at α); "
+                   "the span part is a concordance cell against any of delta, angle and shape rejected; total and the "
+                   "in-span share are reported and not read; every analysis other than the primaries is sensitivity, a "
+                   "differing complement status being rank, preprocessing, covariate-set or cohort dependence; a "
+                   "complement non-rejection is uninformative. Primaries: " + _context(primaries), y=0.0)
+    values = {
+        "n_analyses": len(table),
+        "n_drawn": len(available),
+        "not_available": not_available,
+        "primaries": {
+            f"{t['cell_type']} {t['cohort']}": {
+                "rank": int(t["rank"]),
+                "dims": {part: int(t[f"{part}_dim"]) for part in SPAN_SPLIT_PARTS},
+                "f": {part: float(t[f"{part}_f"]) for part in SPAN_SPLIT_PARTS},
+                "p": {part: float(t[f"{part}_p"]) for part in SPAN_SPLIT_PARTS},
+                "share": None if pd.isna(t["share"]) else float(t["share"]),
+                "complement_rejected": bool(t["complement_rejected"]),
+                "span_rejected": bool(t["span_rejected"]),
+                "production_rejected": bool(t["production_rejected"]),
+                "span_concordant": bool(t["span_concordant"]),
+            }
+            for _, t in prim.iterrows()
+        },
+        "complement_rejected": [f"{t['cell_type']} {t['label']} {t['cohort']} p {_p(t['complement_p'])}"
+                                for _, t in rejected.iterrows()],
+        "discordant": [f"{t['cell_type']} {t['label']} {t['cohort']}" for _, t in available.iterrows()
+                       if not bool(t["span_concordant"])],
+        "share_range": (float(pd.to_numeric(available["share"]).min()), float(pd.to_numeric(available["share"]).max())),
+    }
+    return fig, values
+
+
+def _caption_span_split(v: dict) -> str:
+    parts = [f"{v['n_drawn']} of {v['n_analyses']} analyses carry the split test (not available: "
+             f"{', '.join(v['not_available']) or 'none'})."]
+    for name, e in v["primaries"].items():
+        dims = ", ".join(f"{part} {e['dims'][part]:,}" for part in SPAN_SPLIT_PARTS)
+        ps = ", ".join(f"{part} {e['p'][part]:.3f} (F {e['f'][part]:.4g}; {SPAN_SPLIT_ROLES[part]})"
+                       for part in SPAN_SPLIT_PARTS)
+        share = "n/a" if e["share"] is None else f"{e['share']:.4f}"
+        parts.append(
+            f"{name} (rank {e['rank']}; dimensions {dims}): pseudo-F p {ps}; complement "
+            f"{'rejected' if e['complement_rejected'] else 'not rejected'}; span cell "
+            f"{'concordant' if e['span_concordant'] else 'discordant'} (span rejected "
+            f"{'yes' if e['span_rejected'] else 'no'}, any of delta, angle, shape rejected "
+            f"{'yes' if e['production_rejected'] else 'no'}); in-span share {share}."
+        )
+    parts.append(f"Complement p <= {ANALYSIS_ALPHA}: {'; '.join(v['complement_rejected']) or 'none'}. Discordant span "
+                 f"cells: {'; '.join(v['discordant']) or 'none'}. In-span share over the analyses drawn "
+                 f"{v['share_range'][0]:.4f}–{v['share_range'][1]:.4f}.")
+    return " ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # The registry. Entries are added or changed by a change proposal only; a
 # change that adds a step adds its figure here. Flag and ask before changing.
@@ -1826,6 +2039,22 @@ FIGURES: dict[str, dict] = {
             "against stage_de_summary.csv and method_comparison.csv, a missing DESeq2 padj counting as not significant."
         ),
         "reading": ("display_only", "stage_de_counts"),
+    },
+    "span_split": {
+        "number": 11,
+        "title": "Split interaction test",
+        "draw": _draw_span_split,
+        "caption": _caption_span_split,
+        "construction": (
+            "MOTCO's split interaction test from each record's span_split block: (a) per primary analysis (both cell "
+            "types and cohorts) the pseudo-F p-value of each part on a log axis with alpha, the complement a filled "
+            "circle (confirmatory), the span a hollow diamond with its concordance cell beside the production "
+            "statistics, total a grey square (descriptive); (b) the complement p-value of every registered analysis that carries the test, enumerated "
+            "as in figure 5 (filled: cohort_30, hollow: cohort_50), the latent_adjusted arms listed as not available; "
+            "(c) the in-span share of the same analyses against their fitted rank, with no reference line: the share "
+            "is descriptive, grows with the fitted rank, and is read against no null here."
+        ),
+        "reading": ("display_only", "span_split", "sensitivity_dependence", "forced_rank"),
     },
 }
 for _name, _entry in FIGURES.items():
@@ -2234,7 +2463,8 @@ def run_figures(
               f"under the registered directories), {consistency['entries']} recorded entries "
               f"({consistency['distinct_files']} files) hashing as recorded; {consistency['analyses']} analyses on "
               f"MOTCO {consistency['motco']}, residual correction {ANALYSIS_RESIDUAL_CORRECTION}, rank floor "
-              f"{ANALYSIS_RANK_FLOOR}, {ANALYSIS_PERMUTATIONS} permutations, seed {ANALYSIS_SEED}")
+              f"{ANALYSIS_RANK_FLOOR}, {ANALYSIS_PERMUTATIONS} permutations, seed {ANALYSIS_SEED}, split test "
+              f"(not available in {', '.join(LATENT_SENSITIVITY_SPLIT_UNAVAILABLE)})")
         if consistency["findings"]:
             print(f"[figures] FINDING: {len(consistency['findings'])} manifests record no cell_type (written before "
                   "the cell-type registry; read as their root's cell type); listed in the manifest")

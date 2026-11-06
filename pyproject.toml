@@ -26,7 +26,7 @@ dependencies = [
   "rpy2>=3.6.4",
   "decoupler>=2.1.2",
   "pydeseq2>=0.5.3",
-  "motco==0.13.0",
+  "motco==0.18.0",
   "statsmodels>=0.14.5",
   "matplotlib==3.10.7",
 ]
