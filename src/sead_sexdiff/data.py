@@ -5007,8 +5007,9 @@ ANALYSIS_SEED = 20261019
 ANALYSIS_ALPHA = 0.05
 # As in MOTCO's covariate Type I check; exact size alpha for (1 + b) / (1 + B) p-values
 ANALYSIS_REJECTION_RULE = "p <= alpha"
-# 0.13.0: the first release with the residual-corrected RRPP null
-ANALYSIS_MOTCO_MIN_VERSION = "0.13.0"
+# 0.18.0: the first release with the split interaction test (and 0.13.0's
+# residual-corrected RRPP null)
+ANALYSIS_MOTCO_MIN_VERSION = "0.18.0"
 # Latent-rank floor of the CV rank selection (MOTCO's `min_components`): its
 # validated default, passed explicitly and checked against it, so a MOTCO that
 # moved its default stops the run instead of changing the primary. The floor
@@ -5022,6 +5023,41 @@ ANALYSIS_RANK_FLOOR = 2
 # the one MOTCO default the package overrides. Passed explicitly in every
 # analysis, checked in the record and by every reader. A constant, never a flag.
 ANALYSIS_RESIDUAL_CORRECTION = "df"
+# Split interaction test (MOTCO's `span_split_test`): the group × stage
+# interaction energy of the analysed features split exactly into the fitted
+# stage-PLS span, its orthogonal complement and all of it, each part tested by a
+# trace pseudo-F under RRPP's draws at the analysis's seed, so it only adds the
+# record's `span_split` block. MOTCO's validated opt-in, not its default
+# (MOTCO's verdict `split_validated`, docs/reports/span-split-2026-11-05.md).
+# Passed explicitly in every analysis except a latent-adjusted one, where MOTCO
+# rejects it (LATENT_SENSITIVITY_SPLIT_UNAVAILABLE), and checked in the record
+# and by every reader. A constant, never a flag.
+ANALYSIS_SPAN_SPLIT_TEST = True
+# The predeclared multiplicity policy over the parts (proposal of
+# mtg-span-split-test, committed before any real-label split test): the
+# complement is the one confirmatory part, its pseudo-F p-value read at
+# ANALYSIS_ALPHA under ANALYSIS_REJECTION_RULE, unadjusted; the span part is a
+# concordance cell against "any of delta, angle, shape rejected"; total, the
+# in-span share and the interaction-SS p-values are reported and not read. No
+# adjustment across delta, angle, shape and the complement. Checked against
+# MOTCO's INTERACTION_SPLIT_PARTS before any analysis; flag and ask before
+# changing any of them.
+SPAN_SPLIT_PARTS = ("total", "span", "complement")
+SPAN_SPLIT_CONFIRMATORY_PART = "complement"
+SPAN_SPLIT_CONCORDANCE_PART = "span"
+SPAN_SPLIT_STATISTIC = "p_value_f"
+SPAN_SPLIT_NOT_READ = ("total", "span_share", "p_value_ss")
+SPAN_SPLIT_ROLES: dict[str, str] = {"total": "descriptive", "span": "concordance", "complement": "confirmatory"}
+if (
+    SPAN_SPLIT_ROLES.get(SPAN_SPLIT_CONFIRMATORY_PART) != "confirmatory"
+    or SPAN_SPLIT_ROLES.get(SPAN_SPLIT_CONCORDANCE_PART) != "concordance"
+    or tuple(SPAN_SPLIT_ROLES) != SPAN_SPLIT_PARTS
+    or [p for p, role in SPAN_SPLIT_ROLES.items() if role == "descriptive"] != [p for p in SPAN_SPLIT_NOT_READ if p in SPAN_SPLIT_PARTS]
+):
+    raise AssertionError(
+        f"SPAN_SPLIT_ROLES {SPAN_SPLIT_ROLES} disagrees with SPAN_SPLIT_PARTS, SPAN_SPLIT_CONFIRMATORY_PART, "
+        "SPAN_SPLIT_CONCORDANCE_PART or SPAN_SPLIT_NOT_READ"
+    )
 ANALYSIS_STATISTICS = ("delta", "angle", "shape")
 
 _ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "manifest.json")
@@ -5032,7 +5068,7 @@ def check_motco_version(
     *,
     required: str = ANALYSIS_MOTCO_MIN_VERSION,
     purpose: str = "the analysis needs",
-    feature: str = "covariate-adjusted analyze_trajectories",
+    feature: str = "covariate-adjusted analyze_trajectories with the split interaction test",
 ) -> str:
     """Return the installed MOTCO version; raise if it is older than the minimum.
 
@@ -5091,6 +5127,28 @@ def check_motco_rank_floor() -> int:
             "change of either is a change proposal, not a run; nothing was written"
         )
     return ANALYSIS_RANK_FLOOR
+
+
+def check_motco_split_parts() -> tuple[str, ...]:
+    """Return ``SPAN_SPLIT_PARTS``; raise if MOTCO's split-test parts differ.
+
+    Raises
+    ------
+    RuntimeError
+        ``motco.stats.interaction.INTERACTION_SPLIT_PARTS`` is not
+        ``SPAN_SPLIT_PARTS``; the message names both. The multiplicity policy
+        is written over these part names, so a MOTCO that renamed or reordered
+        a part stops the run instead of changing what is read.
+    """
+    from motco.stats.interaction import INTERACTION_SPLIT_PARTS
+
+    if tuple(INTERACTION_SPLIT_PARTS) != SPAN_SPLIT_PARTS:
+        raise RuntimeError(
+            f"MOTCO's split-test parts (motco.stats.interaction.INTERACTION_SPLIT_PARTS) are "
+            f"{tuple(INTERACTION_SPLIT_PARTS)} but SPAN_SPLIT_PARTS is {SPAN_SPLIT_PARTS}; the multiplicity policy is "
+            "written over these parts, so a change of either is a change proposal, not a run; nothing was written"
+        )
+    return SPAN_SPLIT_PARTS
 
 
 def load_analysis_inputs(cohort_dir: str | Path, *, extra_covariates: pd.DataFrame | None = None) -> dict:
@@ -5231,6 +5289,106 @@ def _record_residual_correction(record: dict) -> str | None:
     return record.get("params", {}).get("residual_correction")
 
 
+def _record_span_split(record: dict) -> bool:
+    """Whether an analysis record carries the split test (``params.span_split_test`` and a ``span_split`` block).
+
+    MOTCO omits ``span_split_test`` from ``params`` while it is false.
+    """
+    return bool(record.get("params", {}).get("span_split_test")) and isinstance(record.get("span_split"), dict)
+
+
+def _span_split_problem(record: dict, params, *, n_jobs: int) -> str | None:
+    """The first entry of a record's split test that disagrees with the request, or ``None``.
+
+    When ``params.span_split_test`` is set the record must carry
+    ``params.span_split_test = true`` and a ``span_split`` block with exactly
+    ``SPAN_SPLIT_PARTS``, each with a pseudo-F p-value and
+    ``df_interaction = len(STAGES) − 1``; the analysis's permutations, seed
+    and residual correction; a ``span`` dimension equal to the selected rank,
+    a ``total`` dimension equal to the summed block widths and a
+    ``complement`` dimension equal to their difference; and
+    ``draws_match_rrpp`` true exactly when ``n_jobs`` is 1. When it is not
+    set the record must carry neither the setting nor the block.
+    """
+    requested = bool(getattr(params, "span_split_test", False))
+    block = record.get("span_split")
+    recorded = bool(record.get("params", {}).get("span_split_test"))
+    if not requested:
+        if block is not None or recorded:
+            return "a span_split block or params.span_split_test although the test was not requested"
+        return None
+    if not recorded:
+        return "params.span_split_test (absent or false)"
+    if not isinstance(block, dict):
+        return "the span_split block (absent)"
+    parts = block.get("parts") or {}
+    if tuple(parts) != SPAN_SPLIT_PARTS:
+        return f"span_split.parts {tuple(parts)} (expected {SPAN_SPLIT_PARTS})"
+    for name in SPAN_SPLIT_PARTS:
+        if parts[name].get(SPAN_SPLIT_STATISTIC) is None:
+            return f"span_split.parts.{name}.{SPAN_SPLIT_STATISTIC} (null)"
+        if parts[name].get("df_interaction") != len(STAGES) - 1:
+            return f"span_split.parts.{name}.df_interaction = {parts[name].get('df_interaction')} (expected {len(STAGES) - 1})"
+    for key, want in (
+        ("permutations", params.permutations), ("seed", params.seed),
+        ("residual_correction", getattr(params, "residual_correction", None)),
+    ):
+        if block.get(key) != want:
+            return f"span_split.{key} = {block.get(key)!r} (the analysis's is {want!r})"
+    rank = record["latent"]["selected_lv"]
+    width = sum(int(b["n_features"]) for b in record["blocks"])
+    dims = {name: parts[name].get("dimension") for name in SPAN_SPLIT_PARTS}
+    for name, want in (("span", rank), ("total", width), ("complement", width - rank)):
+        if dims[name] != want:
+            return f"span_split.parts.{name}.dimension = {dims[name]} (expected {want})"
+    if block.get("draws_match_rrpp") is not (n_jobs == 1):
+        return f"span_split.draws_match_rrpp = {block.get('draws_match_rrpp')!r} at n_jobs = {n_jobs}"
+    return None
+
+
+def _span_split_status(record: dict, *, alpha: float = ANALYSIS_ALPHA) -> dict | None:
+    """The predeclared reading cells of a record's split test, or ``None`` without one.
+
+    ``complement_rejected`` and ``span_rejected`` are ``p ≤ alpha`` on the
+    pseudo-F p-values; ``production_rejected`` is whether any of ``delta``,
+    ``angle`` and ``shape`` is rejected in the same record; ``span_concordant``
+    is ``span_rejected == production_rejected``. ``total`` gets no status.
+    """
+    if not _record_span_split(record):
+        return None
+    parts = record["span_split"]["parts"]
+    p_span = parts[SPAN_SPLIT_CONCORDANCE_PART][SPAN_SPLIT_STATISTIC]
+    p_comp = parts[SPAN_SPLIT_CONFIRMATORY_PART][SPAN_SPLIT_STATISTIC]
+    production = any(
+        record["p_values"].get(s) is not None and record["p_values"][s] <= alpha for s in ANALYSIS_STATISTICS
+    )
+    span_rejected = bool(p_span <= alpha)
+    return {
+        "complement_rejected": bool(p_comp <= alpha),
+        "span_rejected": span_rejected,
+        "production_rejected": production,
+        "span_concordant": span_rejected == production,
+    }
+
+
+def _split_dependence_findings(ref_record: dict, record: dict, *, label: str, reference: str, kind: str) -> list[str]:
+    """A finding when the complement status of ``record`` differs from ``ref_record``'s (both carrying the test).
+
+    ``label`` names the sensitivity analysis, ``reference`` the analysis it is
+    compared with, and ``kind`` the dependence it is read as (rank,
+    preprocessing, covariate-set or cohort dependence of the split test).
+    """
+    a, b = _span_split_status(ref_record), _span_split_status(record)
+    if a is None or b is None or a["complement_rejected"] == b["complement_rejected"]:
+        return []
+    p_ref = ref_record["span_split"]["parts"][SPAN_SPLIT_CONFIRMATORY_PART][SPAN_SPLIT_STATISTIC]
+    p_new = record["span_split"]["parts"][SPAN_SPLIT_CONFIRMATORY_PART][SPAN_SPLIT_STATISTIC]
+    return [
+        f"split test: complement status in {label} (p = {_fmt(p_new, '.4g')}) differs from {reference} "
+        f"(p = {_fmt(p_ref, '.4g')}); {kind}, not a result of {label}"
+    ]
+
+
 def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA) -> str:
     """Render ``summary.md`` from a MOTCO analysis record (``result.json``).
 
@@ -5258,7 +5416,12 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         rendered as before. A record with ``measurement.residual_correction``
         (MOTCO ≥ 0.13.0) gets one line under the header naming the correction
         the null was drawn under (kind, κ, n, reduced rank); records without
-        one are rendered as before.
+        one are rendered as before. A record with a ``span_split`` block
+        (MOTCO ≥ 0.18.0) gets a "Split interaction test" table after the
+        statistics (part, role, dimension, pseudo-F, pseudo-F p-value), the
+        in-span share labelled as not read and a line on the draws; the
+        interaction-SS p-values stay in ``result.json``. Records without one
+        are rendered as before.
     """
     design = record["design"]
     meas = record["measurement"]
@@ -5312,6 +5475,48 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
             f"| {s} | {_fmt(record['statistics'].get(s))} | {_fmt(p, '.4g')} | {rejected} | "
             f"{_fmt(null.get('mean'))} | {_fmt(null.get('sd'))} | {_fmt(null.get('q95'))} | {note} |"
         )
+    split = record.get("span_split")
+    status = _span_split_status(record, alpha=alpha)
+    if split is not None and status is not None:
+        parts = split["parts"]
+        production = "yes" if status["production_rejected"] else "no"
+        roles = {
+            "total": "descriptive, not read",
+            "span": (
+                f"concordance cell: rejected {'yes' if status['span_rejected'] else 'no'}, any of delta, angle, shape "
+                f"rejected {production}: {'concordant' if status['span_concordant'] else 'discordant (a finding)'}"
+            ),
+            "complement": f"confirmatory: rejected {'yes' if status['complement_rejected'] else 'no'}",
+        }
+        if split.get("draws_match_rrpp"):
+            draws = "RRPP's permutation sequence at the analysis's seed"
+        else:
+            draws = "not RRPP's permutation sequence (n_jobs ≠ 1)"
+        lines += [
+            "",
+            "## Split interaction test",
+            "",
+            f"Group × stage interaction energy of the analysed features split into the fitted stage-PLS span "
+            f"(rank {latent['selected_lv']}), its orthogonal complement and all of it; a trace pseudo-F per part "
+            f"under {split['permutations']} Freedman–Lane draws with seed {split['seed']} and residual correction "
+            f"`{split['residual_correction']}`. Only the complement is read (p ≤ α, unadjusted); the span part is a "
+            "concordance cell against `delta`, `angle` and `shape`; `total` and the in-span share are reported and "
+            "not read. A complement non-rejection is uninformative.",
+            "",
+            "| part | role | dimension | pseudo-F | p (pseudo-F) |",
+            "|---|---|---:|---:|---:|",
+        ]
+        for name in SPAN_SPLIT_PARTS:
+            part = parts[name]
+            lines.append(
+                f"| {name} | {roles[name]} | {part['dimension']} | {_fmt(part['f'])} | "
+                f"{_fmt(part.get(SPAN_SPLIT_STATISTIC), '.4g')} |"
+            )
+        lines += [
+            "",
+            f"- in-span share: {_fmt(split.get('span_share'), '.4g')} (descriptive, not read)",
+            f"- draws: {draws}",
+        ]
     lines += [
         "",
         "## Cell sizes",
@@ -5384,7 +5589,7 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
 def _cli_equivalent(
     cohort_dir: Path, metadata_path: Path, params, n_jobs: int, *, covariates: Iterable[str] = ANALYSIS_COVARIATES,
 ) -> dict:
-    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank, optionally latent-adjusted)."""
+    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank, optionally latent-adjusted, with the split test when requested)."""
     import shlex
 
     argv = ["motco", "analyze"]
@@ -5409,6 +5614,9 @@ def _cli_equivalent(
     if correction is not None:
         # Acts on RRPP, so CV and forced runs alike
         argv += ["--residual-correction", correction]
+    if getattr(params, "span_split_test", False):
+        # Adds the record's span_split block only, so CV and forced runs alike
+        argv += ["--span-split-test"]
     if params.forced_components is not None:
         # Cross-validation does not run, so none of its knobs apply
         argv += ["--forced-components", str(params.forced_components)]
@@ -5477,7 +5685,15 @@ def _analyze_cohort(
         ``measurement.residual_correction`` before anything is written and
         recorded as the manifest's ``measurement.residual_correction`` (the
         record's block, or ``null``) and ``--residual-correction`` in
-        ``cli_equivalent``.
+        ``cli_equivalent``; ``span_split_test`` ``ANALYSIS_SPAN_SPLIT_TEST``
+        from every caller except a latent-adjusted arm (``False``, as MOTCO
+        rejects the test there; ``False`` also in the pin-move gate, run by
+        hand), checked against the record's ``span_split`` block before
+        anything is written (``_span_split_problem``) and recorded as the
+        manifest's ``measurement.span_split`` (requested, with the policy's
+        roles; or not requested, with MOTCO's reason quoted as
+        ``not_available`` for a latent-adjusted arm) and
+        ``--span-split-test`` in ``cli_equivalent``.
     out_dir:
         The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
         to ``<out_dir>/<final_name>`` when complete.
@@ -5520,9 +5736,13 @@ def _analyze_cohort(
     RuntimeError
         The installed MOTCO is older than ``ANALYSIS_MOTCO_MIN_VERSION``, or
         its default rank floor is not ``ANALYSIS_RANK_FLOOR``
-        (``check_motco_rank_floor``), or the record's residual correction is
-        not the one ``params`` asked for (absent, of another kind, or present
-        without the setting); nothing is written.
+        (``check_motco_rank_floor``), or its split-test parts are not
+        ``SPAN_SPLIT_PARTS`` (``check_motco_split_parts``), or the record's
+        residual correction is not the one ``params`` asked for (absent, of
+        another kind, or present without the setting), or its split test is
+        not the one ``params`` asked for (``_span_split_problem``: the block
+        absent, present without the request, or disagreeing with the
+        analysis); nothing is written.
     """
     import io
     import shutil
@@ -5532,6 +5752,7 @@ def _analyze_cohort(
 
     motco_version = check_motco_version()
     check_motco_rank_floor()
+    check_motco_split_parts()
     covariates = tuple(covariates)
     blocks = loaded["blocks"]
     export_manifest = loaded["export_manifest"]
@@ -5588,6 +5809,42 @@ def _analyze_cohort(
             f"(measurement.residual_correction) but the analysis asked for {wanted!r}; the record must state the "
             "correction the RRPP null was drawn under; nothing was written"
         )
+    # The record must carry the split test exactly when it was requested, made with the analysis's draws
+    problem = _span_split_problem(record, params, n_jobs=n_jobs)
+    if problem is not None:
+        raise RuntimeError(
+            f"MOTCO's record for {cohort} does not carry the split interaction test as requested "
+            f"(span_split_test = {bool(getattr(params, 'span_split_test', False))}): {problem}; nothing was written"
+        )
+    split_requested = bool(getattr(params, "span_split_test", False))
+    if split_requested:
+        split_measurement = {
+            "requested": True,
+            "confirmatory": SPAN_SPLIT_CONFIRMATORY_PART,
+            "concordance": SPAN_SPLIT_CONCORDANCE_PART,
+            "statistic": SPAN_SPLIT_STATISTIC,
+            "roles": dict(SPAN_SPLIT_ROLES),
+            "not_read": list(SPAN_SPLIT_NOT_READ),
+        }
+    elif latent is not None:
+        # MOTCO's own reason, quoted: it rejects the request before fitting anything
+        from dataclasses import replace
+
+        from motco.analysis import TrajectoryAnalysisError
+
+        try:
+            analyze_trajectories(dataset, replace(params, span_split_test=True))
+        except TrajectoryAnalysisError as exc:
+            reason = str(exc)
+        else:
+            raise RuntimeError(
+                f"MOTCO {motco_version} accepts the split interaction test with the {latent} latent adjustment, so "
+                "LATENT_SENSITIVITY_SPLIT_UNAVAILABLE is out of date; that is a change proposal, not a run; nothing "
+                "was written"
+            )
+        split_measurement = {"requested": False, "not_available": reason}
+    else:
+        split_measurement = {"requested": False}
 
     findings = list(findings or [])
     n_capped = export_manifest.get("covariates", {}).get("n_age_capped")
@@ -5606,6 +5863,13 @@ def _analyze_cohort(
         findings.append(
             "CV selected rank 1: in a one-dimensional latent space the net displacements are parallel "
             "or antiparallel, so angle is 0° or 180° by construction and carries no orientation information"
+        )
+    status = _span_split_status(record)
+    if status is not None and not status["span_concordant"]:
+        findings.append(
+            f"split test: span part rejected {'yes' if status['span_rejected'] else 'no'}, any of delta, angle, shape "
+            f"rejected {'yes' if status['production_rejected'] else 'no'}: a discordant concordance cell (the span part "
+            "trails delta and shape in power), a finding that changes no reading"
         )
 
     tmp = out_dir / f"{final_name}.tmp"
@@ -5694,6 +5958,7 @@ def _analyze_cohort(
             ),
             **({"latent_adjustment": latent} if latent is not None else {}),
             "residual_correction": applied,
+            "span_split": split_measurement,
             "permutations": params.permutations,
             "seed": params.seed,
             "alpha": ANALYSIS_ALPHA,
@@ -5767,8 +6032,9 @@ def run_analysis(
     and double-CV rank at the rank floor ``ANALYSIS_RANK_FLOOR`` (MOTCO's
     default, passed explicitly and checked against it before any input is
     read), ``ANALYSIS_PERMUTATIONS`` RRPP permutations with ``ANALYSIS_SEED``
-    under the residual correction ``ANALYSIS_RESIDUAL_CORRECTION`` (MOTCO's
-    validated opt-in, passed explicitly and checked in the record before
+    under the residual correction ``ANALYSIS_RESIDUAL_CORRECTION``, with the
+    split interaction test ``ANALYSIS_SPAN_SPLIT_TEST`` (both MOTCO's
+    validated opt-ins, passed explicitly and checked in the record before
     anything is written). The model's metadata table is serialized to
     ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
     parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
@@ -5777,6 +6043,7 @@ def run_analysis(
     """
     motco_version = check_motco_version()
     rank_floor = check_motco_rank_floor()
+    check_motco_split_parts()
     from motco.analysis import TrajectoryAnalysisParams
 
     cell_type_entry(cell_type)
@@ -5809,7 +6076,7 @@ def run_analysis(
         loaded, findings = loaded_by_cohort.pop(c)
         params = TrajectoryAnalysisParams(
             permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
-            residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
+            residual_correction=ANALYSIS_RESIDUAL_CORRECTION, span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
         )
         results[c] = _analyze_cohort(
             c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs, findings=findings,
@@ -5881,9 +6148,11 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
         count, the rank floor (``params.min_components`` of ``result.json``,
         absent meaning 1, against ``ANALYSIS_RANK_FLOOR``), the residual
         correction (``params.residual_correction``, absent meaning none,
-        against ``ANALYSIS_RESIDUAL_CORRECTION``) or the component selection
-        recorded by the analysis differs from the sweep's; the message names
-        the file or setting.
+        against ``ANALYSIS_RESIDUAL_CORRECTION``), the split test
+        (``params.span_split_test`` and the ``span_split`` block, against
+        ``ANALYSIS_SPAN_SPLIT_TEST``) or the component selection recorded by
+        the analysis differs from the sweep's; the message names the file or
+        setting.
     """
     d = Path(analysis_dir)
     hint = "run `sead-sexdiff analyze` to produce it"
@@ -5929,6 +6198,11 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
             f"absent means none) but the reference must be made with ANALYSIS_RESIDUAL_CORRECTION = "
             f"{ANALYSIS_RESIDUAL_CORRECTION!r}; {rerun}"
         )
+    if ANALYSIS_SPAN_SPLIT_TEST and not _record_span_split(record):
+        raise ValueError(
+            f"{d / 'result.json'} carries no split interaction test (params.span_split_test and the span_split block) "
+            f"but the reference must be made with ANALYSIS_SPAN_SPLIT_TEST = {ANALYSIS_SPAN_SPLIT_TEST}; {rerun}"
+        )
     selection = record.get("latent", {}).get("component_selection")
     if selection != "cv":
         raise ValueError(
@@ -5939,6 +6213,74 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
     return {"dir": d, "record": record, "manifest": manifest, "files": files}
 
 
+# The split columns of every comparison table, after the shape columns: the
+# pseudo-F and its p-value per part, the span status and concordance cell, the
+# complement status and the in-span share. No total status, so no table invites
+# reading total.
+SPAN_SPLIT_COLUMNS = (
+    "total_f", "total_p", "span_f", "span_p", "span_rejected", "span_concordant",
+    "complement_f", "complement_p", "complement_rejected", "span_share",
+)
+
+
+def _split_columns(record: dict) -> dict:
+    """The ``SPAN_SPLIT_COLUMNS`` cells of one record, every cell ``None`` without the split test."""
+    status = _span_split_status(record)
+    if status is None:
+        return {col: None for col in SPAN_SPLIT_COLUMNS}
+    split = record["span_split"]
+    parts = split["parts"]
+    cells = {
+        "total_f": parts["total"]["f"],
+        "total_p": parts["total"][SPAN_SPLIT_STATISTIC],
+        "span_f": parts["span"]["f"],
+        "span_p": parts["span"][SPAN_SPLIT_STATISTIC],
+        "span_rejected": status["span_rejected"],
+        "span_concordant": status["span_concordant"],
+        "complement_f": parts["complement"]["f"],
+        "complement_p": parts["complement"][SPAN_SPLIT_STATISTIC],
+        "complement_rejected": status["complement_rejected"],
+        "span_share": split.get("span_share"),
+    }
+    return {col: cells[col] for col in SPAN_SPLIT_COLUMNS}
+
+
+def _render_split_table(rows: list[dict], *, label: str, rank_key: str = "rank", unavailable: str = "") -> list[str]:
+    """Markdown lines of the split columns of comparison rows (one row per analysis).
+
+    ``label`` is the row key naming the analysis (``component_selection``,
+    ``variant`` or ``arm``); a row without the split test reads
+    ``unavailable`` (or "no split test") in every cell.
+    """
+    lines = [
+        "",
+        "## Split interaction test",
+        "",
+        "Pseudo-F p-values of the parts (MOTCO's split interaction test, the span being each row's own rank). Only "
+        "the complement is read (rejected when p ≤ α, unadjusted); the span part is a concordance cell against any "
+        "of `delta`, `angle`, `shape` rejected in the same row; `total` and the in-span share are reported and not "
+        "read. A complement status that differs from the reference row's is dependence of the split test, not a "
+        "result of that row; a complement non-rejection is uninformative.",
+        "",
+        f"| {label} | rank | total p | span F | span p | span rejected | span concordant | complement F | "
+        "complement p | complement rejected | in-span share (not read) |",
+        "|---|---:|---:|---:|---:|:---:|:---:|---:|---:|:---:|---:|",
+    ]
+    yes_no = lambda v: "yes" if v else "no"  # noqa: E731
+    for r in rows:
+        if r.get("complement_p") is None:
+            note = unavailable or "no split test"
+            lines.append(f"| {r[label]} | {r[rank_key]} | " + " | ".join([note] * 9) + " |")
+            continue
+        lines.append(
+            f"| {r[label]} | {r[rank_key]} | {_fmt(r['total_p'], '.4g')} | {_fmt(r['span_f'])} | "
+            f"{_fmt(r['span_p'], '.4g')} | {yes_no(r['span_rejected'])} | {yes_no(r['span_concordant'])} | "
+            f"{_fmt(r['complement_f'])} | {_fmt(r['complement_p'], '.4g')} | {yes_no(r['complement_rejected'])} | "
+            f"{_fmt(r['span_share'], '.4g')} |"
+        )
+    return lines
+
+
 def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, directory: str) -> dict:
     """Flatten one analysis record into a row of the cross-rank table.
 
@@ -5946,7 +6288,9 @@ def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, dir
     the ``rank_<kk>`` name (relative to the cohort directory) for a forced
     row, so the table does not depend on where the sweep was written.
     ``runtime_seconds`` is rendered in the Markdown and recorded in the
-    manifest but left out of the CSV.
+    manifest but left out of the CSV. The split columns
+    (``SPAN_SPLIT_COLUMNS``) follow the ``shape`` columns, empty for a
+    record without the split test.
     """
     row = {"cohort": cohort, "component_selection": component_selection, "rank": record["latent"]["selected_lv"]}
     for s in ANALYSIS_STATISTICS:
@@ -5958,6 +6302,7 @@ def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, dir
         row[f"{s}_null_mean"] = null.get("mean")
         row[f"{s}_null_sd"] = null.get("sd")
         row[f"{s}_null_q95"] = null.get("q95")
+    row.update(_split_columns(record))
     row["cv_mean_auroc"] = record["latent"].get("cv_mean_auroc")
     row["runtime_seconds"] = record["measurement"]["runtime_seconds"]
     row["dir"] = directory
@@ -5989,7 +6334,8 @@ def render_rank_sensitivity(
     str
         Markdown: a header naming the ladder, seed, permutations, α and the
         reference rank, one table per statistic (rank × observed / p /
-        rejected / null mean / sd / q95) and a table of the runs (CV AUROC,
+        rejected / null mean / sd / q95), the split table
+        (``_render_split_table``) and a table of the runs (CV AUROC,
         runtime, directory). Every number comes from the rows; the runtimes
         are the one thing here that is not in ``rank_sensitivity.csv``.
     """
@@ -6020,6 +6366,7 @@ def render_rank_sensitivity(
                 f"{'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
+    lines += _render_split_table(rows, label="component_selection")
     lines += [
         "",
         "## Runs",
@@ -6166,6 +6513,7 @@ def run_rank_sensitivity(
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
                 min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
+                span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
             )
             runs[k] = _analyze_cohort(
                 c, cohort_dir, loaded, params,
@@ -6204,12 +6552,16 @@ def run_rank_sensitivity(
                 for s in ANALYSIS_STATISTICS
             )
             p_equal = forced_rec["p_values"] == ref_record["p_values"]
-            at_cv_rank = {"rank": ref_rank, "statistics_equal": bool(stats_equal), "p_values_equal": bool(p_equal)}
-            if not (stats_equal and p_equal):
+            split_equal = forced_rec.get("span_split") == ref_record.get("span_split")
+            at_cv_rank = {
+                "rank": ref_rank, "statistics_equal": bool(stats_equal), "p_values_equal": bool(p_equal),
+                "span_split_equal": bool(split_equal),
+            }
+            if not (stats_equal and p_equal and split_equal):
                 findings.append(
                     f"the forced run at the CV-selected rank {ref_rank} differs from the reference analysis "
-                    f"(statistics equal: {stats_equal}; p-values equal: {p_equal}); the same data, rank and "
-                    "seed should give the same record"
+                    f"(statistics equal: {stats_equal}; p-values equal: {p_equal}; split parts equal: {split_equal}); "
+                    "the same data, rank and seed should give the same record"
                 )
         else:
             findings.append(
@@ -6230,6 +6582,10 @@ def run_rank_sensitivity(
                         f"CV-selected analysis (p = {_fmt(p_ref, '.4g')}); rank dependence of the sensitivity "
                         "analysis, the CV-selected result stays primary"
                     )
+            findings += _split_dependence_findings(
+                ref_record, runs[k]["record"], label=f"forced rank {k}", reference="the CV-selected analysis",
+                kind="rank dependence of the split test",
+            )
 
         software = _software_versions()
         software["motco"] = motco_version
@@ -6251,6 +6607,12 @@ def run_rank_sensitivity(
             "residual_correction_note": (
                 "the reference and every forced rank draw the RRPP null under this correction (it acts on RRPP, "
                 "not on the rank)"
+            ),
+            "span_split_test": ANALYSIS_SPAN_SPLIT_TEST,
+            "span_split_note": (
+                "the reference and every forced rank carry the split interaction test, its span the run's own rank; "
+                "a complement status that differs from the reference's is rank dependence of the split test, and the "
+                "in-span share grows with the rank (reported, not read)"
             ),
             "seed": ANALYSIS_SEED,
             "permutations": ANALYSIS_PERMUTATIONS,
@@ -6274,11 +6636,12 @@ def run_rank_sensitivity(
                 "permutations": reference["manifest"]["measurement"]["permutations"],
                 "min_components": _record_rank_floor(ref_record),
                 "residual_correction": _record_residual_correction(ref_record),
+                "span_split_test": _record_span_split(ref_record),
                 "in_ladder": ref_rank in ladder,
                 "forced_run_at_cv_rank": at_cv_rank,
                 "note": (
-                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction), never rerun "
-                    "or modified"
+                    "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, "
+                    "split test), never rerun or modified"
                 ),
             },
             "ranks": {
@@ -7101,7 +7464,8 @@ def render_preprocessing_sensitivity(
     str
         Markdown: a header naming the variant, its settings beside the
         primary's, seed, permutations, α and both ranks and the reading rules;
-        one table per statistic (two rows); the feature table per omic and
+        one table per statistic (two rows); the split table
+        (``_render_split_table``); the feature table per omic and
         export and, when the variant calls for them, the chrX, gene-set,
         selection-rule, residualization, normalization and adoption-check
         blocks; a run table
@@ -7147,6 +7511,7 @@ def render_preprocessing_sensitivity(
                 f"{_fmt(r[f'{s}_p'], '.4g')} | {'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
+    lines += _render_split_table(rows, label="variant")
 
     show_chrx, show_sets = has("chrx"), has("gene_sets")
     header = ["omic", "export", "input", "after chromosome removal"]
@@ -7581,6 +7946,7 @@ def run_preprocessing_sensitivity(
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
                 min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
+                span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
             )
             ana = _analyze_cohort(
                 c, exp["dir"], loaded_v, params,
@@ -7658,6 +8024,10 @@ def run_preprocessing_sensitivity(
                         f"analysis (p = {_fmt(p_ref, '.4g')}); preprocessing dependence of the sensitivity analysis, "
                         "the primary result stays primary"
                     )
+            findings += _split_dependence_findings(
+                ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
+                kind="preprocessing dependence of the split test",
+            )
             if n_jobs != 1:
                 findings.append(
                     f"n_jobs = {n_jobs}: MOTCO's parallel RRPP seeds one stream per worker, so the permutation "
@@ -8871,6 +9241,18 @@ LATENT_SENSITIVITY_ARMS: dict[str, dict] = {
         "latent_adjustment": LATENT_SENSITIVITY_CONDITIONING,
     },
 }
+# The arms in which MOTCO does not allow the split interaction test: exactly the
+# arms with a latent adjustment (MOTCO defines the test on the covariate-blind
+# basis and rejects the request before fitting). Those arms request it off and
+# their manifests quote MOTCO's reason; every other arm carries it.
+LATENT_SENSITIVITY_SPLIT_UNAVAILABLE = ("latent_adjusted",)
+if LATENT_SENSITIVITY_SPLIT_UNAVAILABLE != tuple(
+    arm for arm, spec in LATENT_SENSITIVITY_ARMS.items() if spec["latent_adjustment"] is not None
+):
+    raise AssertionError(
+        f"LATENT_SENSITIVITY_SPLIT_UNAVAILABLE {LATENT_SENSITIVITY_SPLIT_UNAVAILABLE} must list exactly the arms of "
+        "LATENT_SENSITIVITY_ARMS with a latent adjustment, where MOTCO does not allow the split interaction test"
+    )
 LATENT_SENSITIVITY_REFERENCE_LABEL = "primary"
 # Layout under <out_dir>: <arm>/motco_analysis/<cohort>/ mirrors results/motco_analysis
 # so axis-diagnostics and rank-sensitivity can read an arm; comparison/<cohort>/
@@ -9020,7 +9402,9 @@ def render_latent_sensitivity(
     -------
     str
         Markdown: a header with the arms and the reading rules, one table per
-        statistic (observed, p, rejected, null mean / sd / q95 per row), a run
+        statistic (observed, p, rejected, null mean / sd / q95 per row), the
+        split table (``_render_split_table``; "not available" for a
+        latent-adjusted arm, with the reason stated), a run
         table (selection, rank, CV AUROC, covariates, conditioning, runtime,
         directory), the latent-adjustment block of the adjusted arm(s), the
         mediator check with flagged rows first, and the findings. Every number
@@ -9067,6 +9451,15 @@ def render_latent_sensitivity(
                 f"{_fmt(r[f'{s}_p'], '.4g')} | {'n/a' if rejected is None else ('yes' if rejected else 'no')} | "
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
+    lines += _render_split_table(rows, label="arm", unavailable="not available")
+    unavailable = [r["arm"] for r in rows if r.get("complement_p") is None]
+    if unavailable:
+        lines += [
+            "",
+            "The split test is not available with a latent adjustment (MOTCO rejects the request: the test is defined "
+            "on the covariate-blind basis), so " + ", ".join(f"`{a}`" for a in unavailable) + " carries no split "
+            "cells; its manifest quotes MOTCO's reason under `measurement.span_split.not_available`.",
+        ]
     lines += [
         "",
         "## Runs",
@@ -9302,6 +9695,8 @@ def run_latent_sensitivity(
             permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
             covariate_latent_adjustment=spec["latent_adjustment"], min_components=ANALYSIS_RANK_FLOOR,
             residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
+            # MOTCO rejects the split test with a latent adjustment (LATENT_SENSITIVITY_SPLIT_UNAVAILABLE)
+            span_split_test=ANALYSIS_SPAN_SPLIT_TEST and spec["latent_adjustment"] is None,
         )
         for arm, spec in LATENT_SENSITIVITY_ARMS.items()
     }
@@ -9473,6 +9868,10 @@ def run_latent_sensitivity(
                             f"{b} (p = {_fmt(by_arm[b][f'{s}_p'], '.4g')}); {kind} of the sensitivity analysis, not a "
                             "result of the arm; the primary result stays primary"
                         )
+                rec_a = reference["record"] if a == ref_label else runs[a]["record"]
+                findings += _split_dependence_findings(
+                    rec_a, runs[b]["record"], label=b, reference=a, kind=f"{kind} of the split test",
+                )
             for _, r in flagged.iterrows():
                 findings.append(
                     f"mediator candidate: {r['covariate']} has Spearman {_fmt(r['spearman'], '.3f')} with stage "
@@ -13724,7 +14123,8 @@ def render_exclusion_sensitivity(
     -------
     str
         Markdown: a header with the variant and the reading rules, the flagged
-        donors per cell, the flag check, one table per statistic, a run table
+        donors per cell, the flag check, one table per statistic, the split
+        table (``_render_split_table``), a run table
         (donors, ``k``, cells, rank, CV AUROC, runtime, directory), the axis
         check and the findings. Every number comes from the three tables; the
         runtimes are the one thing here that is not in a CSV.
@@ -13788,6 +14188,7 @@ def render_exclusion_sensitivity(
                 f"{'n/a' if rejected is None else ('yes' if rejected else 'no')} | {_fmt(r[f'{s}_null_mean'])} | "
                 f"{_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
+    lines += _render_split_table(rows, label="variant")
     lines += [
         "",
         "## Runs",
@@ -13992,7 +14393,7 @@ def run_exclusion_sensitivity(
 
     params = TrajectoryAnalysisParams(
         permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
-        residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
+        residual_correction=ANALYSIS_RESIDUAL_CORRECTION, span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
     )
     print(f"[{log}] MOTCO {motco_version}")
     print(f"[{log}] Cell type: {cell_type}")
@@ -14238,6 +14639,10 @@ def run_exclusion_sensitivity(
                             f"the primary analysis (p = {_fmt(rows[0][f'{s}_p'], '.4g')}); cohort dependence of the "
                             "sensitivity analysis, not a result of the variant; the primary result stays primary"
                         )
+                findings += _split_dependence_findings(
+                    ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
+                    kind="cohort dependence of the split test",
+                )
                 findings.append(
                     f"axis check {'holds' if a['holds'] else 'does not hold'} in {c} ({a['reading']}, role {a['role']}): "
                     f"|Spearman| of {a['component']} with stage {_fmt(a['stage_abs_spearman'], '.4f')} vs "

@@ -23,6 +23,9 @@ from .data import (
     EXPORT_COHORTS,
     ANALYSIS_STATISTICS,
     ANALYSIS_FORCED_RANKS,
+    SPAN_SPLIT_PARTS,
+    SPAN_SPLIT_ROLES,
+    SPAN_SPLIT_STATISTIC,
     PREPROCESSING_VARIANTS,
     DIAGNOSTIC_CORRELATION_THRESHOLD,
     LATENT_SENSITIVITY_ARMS,
@@ -1400,6 +1403,16 @@ def main(argv: list[str] | None = None) -> int:
                 })
         print("[analyze] Statistics (p from RRPP; rank = CV-selected latent rank):")
         print(pd.DataFrame(rows).to_string(index=False))
+        for cohort, res in results.items():
+            split = res["record"].get("span_split")
+            if split is not None:
+                print(
+                    f"[analyze] {cohort}: split interaction test (pseudo-F p): "
+                    + ", ".join(
+                        f"{part} {split['parts'][part][SPAN_SPLIT_STATISTIC]:.4g} ({SPAN_SPLIT_ROLES[part]})"
+                        for part in SPAN_SPLIT_PARTS
+                    )
+                )
         print("[analyze] Done.")
         return 0
 
@@ -1418,6 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
         columns = ["cohort", "component_selection", "rank"]
         for s in ANALYSIS_STATISTICS:
             columns += [s, f"{s}_p", f"{s}_rejected"]
+        columns += ["complement_p", "complement_rejected"]
         table = pd.concat([res["table"][columns] for res in results.values()], ignore_index=True)
         print("[rank-sensitivity] Cross-rank table (cv = the CV-selected analysis, primary; forced = sensitivity):")
         print(table.to_string(index=False))
@@ -1442,6 +1456,7 @@ def main(argv: list[str] | None = None) -> int:
         columns = ["variant", "cohort", "component_selection", "rank"]
         for s in ANALYSIS_STATISTICS:
             columns += [s, f"{s}_p", f"{s}_rejected"]
+        columns += ["complement_p", "complement_rejected"]
         tables = [res["table"][columns] for per_cohort in results.values() for res in per_cohort.values()]
         if tables:
             table = pd.concat(tables, ignore_index=True)
@@ -1496,6 +1511,7 @@ def main(argv: list[str] | None = None) -> int:
         columns = ["arm", "cohort", "conditioning", "rank"]
         for s in ANALYSIS_STATISTICS:
             columns += [s, f"{s}_p", f"{s}_rejected"]
+        columns += ["complement_p", "complement_rejected"]
         table = pd.concat([res["table"][columns] for res in results.values()], ignore_index=True)
         print("[latent-sensitivity] Comparison table (primary = the analyze step's result, primary; the arms are "
               "sensitivity):")
@@ -1527,6 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
         columns = ["variant", "cohort", "n_donors", "k", "rank"]
         for s in ANALYSIS_STATISTICS:
             columns += [s, f"{s}_p", f"{s}_rejected"]
+        columns += ["complement_p", "complement_rejected"]
         tables = [res["table"][columns] for by_cohort in results.values() for res in by_cohort.values()]
         if tables:
             print("[exclusion-sensitivity] Comparison table (primary = the analyze step's result, primary; the "

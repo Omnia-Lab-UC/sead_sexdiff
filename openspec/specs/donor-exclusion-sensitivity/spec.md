@@ -75,11 +75,17 @@ The step SHALL write, under `<root>/motco_exclusion_sensitivity/<variant>/`: `fl
 - **THEN** its input-hash and cell-type checks pass and it reports the variant's components against the predeclared variables
 
 ### Requirement: Comparison table generated from the records
-Per cohort the step SHALL write `exclusion_sensitivity.csv` with the primary row and the variant row (donors, cells, `k`, selected rank, CV mean AUROC, and for `delta`, `angle` and `shape` the observed value, p-value, rejection and null mean, SD and q95), its Markdown rendering and a manifest recording the variant, the excluded donors, every input path and sha256, seed, permutations, `n_jobs`, software, git revision and findings. Every value SHALL be read from the records, not computed again.
+Per cohort the step SHALL write `exclusion_sensitivity.csv` with the primary row and the variant row. Each row gives:
+- donors, cells and `k`;
+- the selected rank and CV mean AUROC;
+- for `delta`, `angle` and `shape`, the observed value, p-value, rejection and null mean, SD and q95;
+- the split columns of spec `motco-span-split-test`.
+
+The step SHALL also write the table's Markdown rendering and a manifest. The manifest records the variant, the excluded donors, every input path and sha256, seed, permutations, `n_jobs`, software, git revision and findings. Every value SHALL be read from the records, not computed again.
 
 #### Scenario: Values traceable
 - **WHEN** `exclusion_sensitivity.csv` is written
-- **THEN** every statistic, p-value and rank equals the corresponding value in the primary or variant `result.json`
+- **THEN** every statistic, p-value, split cell and rank equals the corresponding value in the primary or variant `result.json`
 
 ### Requirement: The primary export and analysis are never modified
 The step SHALL NOT write under the cell type's `pseudobulk/`, `motco_input/` or `motco_analysis/`, and the primary row SHALL be taken from the primary record unchanged.

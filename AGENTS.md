@@ -59,9 +59,10 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    MOTCO change.
 6. `analyze` – from `results/motco_input/` only, per cohort: the
    covariate-adjusted sex × stage trajectory comparison through MOTCO's
-   `analyze_trajectories` (≥ 0.13.0) with CV rank selection at the rank
-   floor `ANALYSIS_RANK_FLOOR` (2) and the RRPP null drawn under the residual
-   correction `ANALYSIS_RESIDUAL_CORRECTION` (`df`), writing `results/motco_analysis/<cohort>/`
+   `analyze_trajectories` (≥ 0.18.0) with CV rank selection at the rank
+   floor `ANALYSIS_RANK_FLOOR` (2), the RRPP null drawn under the residual
+   correction `ANALYSIS_RESIDUAL_CORRECTION` (`df`) and the split interaction
+   test `ANALYSIS_SPAN_SPLIT_TEST`, writing `results/motco_analysis/<cohort>/`
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
    `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
    `summary.md`). Never assemble it from `motco plsr` + `motco de`.
@@ -69,7 +70,8 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `results/motco_analysis/` only, per cohort: MOTCO's dimensionality
    sensitivity analysis, the same `analyze_trajectories` call with the latent
    rank forced to each value of `ANALYSIS_FORCED_RANKS`, everything else
-   (inputs, covariates, orientation, permutations, seed) equal to `analyze`.
+   (inputs, covariates, orientation, correction, split test, permutations,
+   seed) equal to `analyze`.
    The CV-selected analysis is read and checked (export hashes, MOTCO
    version, seed, permutations, rank floor), never rerun or modified, and is
    the reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
@@ -277,7 +279,7 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
 16. `figures` – from the generated outputs of both cell types only (every
    cell type's `cell_type_dirs` plus `results/motco_sensitivity/`; never raw
    objects or `results/superseded/`), in `src/sead_sexdiff/figures.py`: the
-   registry `FIGURES` (ten figures, `01_cohorts` … `10_stage_de`), every
+   registry `FIGURES` (eleven figures, `01_cohorts` … `11_span_split`), every
    family of analyses enumerated from the registries (`ANALYSIS_FORCED_RANKS`,
    `PREPROCESSING_VARIANTS`, `LATENT_SENSITIVITY_ARMS`,
    `DONOR_EXCLUSION_VARIANTS`, `POSITIVE_CONTROL_BASES`, `EXPORT_COHORTS`),
@@ -291,7 +293,9 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    - one MOTCO version (the astrocyte primary's) and the registered
      measurement in every analysis drawn (`ANALYSIS_RESIDUAL_CORRECTION`,
      `ANALYSIS_RANK_FLOOR`, the forced rank under `rank-sensitivity` only,
-     `ANALYSIS_PERMUTATIONS`, `ANALYSIS_SEED`).
+     `ANALYSIS_PERMUTATIONS`, `ANALYSIS_SEED`, the split test
+     `ANALYSIS_SPAN_SPLIT_TEST` with its `span_split` block, except the arms
+     of `LATENT_SENSITIVITY_SPLIT_UNAVAILABLE`, which carry neither).
 
    Per figure:
    - the reproductions (adjusted cell means against `stage_means.csv`,
@@ -354,7 +358,7 @@ when behavior or defaults change.
   sensitivity analysis. Plotting is the one exception (`figures.py`).
 - `src/sead_sexdiff/figures.py` – the `figures` command (step 16): the
   registry `FIGURES`, the display constants, the recording reader, the
-  consistency pre-pass, the ten figure functions with their caption
+  consistency pre-pass, the eleven figure functions with their caption
   builders, the manifest, the staleness check and the report freeze. It
   imports constants and helpers from `data.py` (`_git_revision`,
   `_sha256_file`, `check_manifest_cell_type`, `cell_type_dirs`, `spearman`,
@@ -388,7 +392,15 @@ when behavior or defaults change.
   deleted) by the change that re-issued them, with their path relative to
   `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
   file); never an input of any step or a default directory, not cited as
-  results. Now `mtg-residual-correction-primary/` (the floored, uncorrected
+  results. Now `mtg-span-split-test/` (the MOTCO 0.13.0 `df` outputs
+  without the split interaction test, both cell types: astrocyte
+  `motco_analysis`, `motco_rank_sensitivity`, `motco_diagnostics`,
+  `motco_sensitivity`, `motco_latent_sensitivity`, `stage_de`,
+  `stage_de_limma`, `motco_exclusion_sensitivity`; microglia
+  `microglia/motco_analysis`, `motco_diagnostics`,
+  `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`,
+  `motco_exclusion_sensitivity`, `positive_control`),
+  `mtg-residual-correction-primary/` (the floored, uncorrected
   outputs of MOTCO 0.10.0, both cell types: astrocyte `motco_analysis`,
   `motco_rank_sensitivity`, `motco_diagnostics`, `motco_sensitivity`,
   `motco_latent_sensitivity`, `stage_de`, `stage_de_limma`,
@@ -404,7 +416,7 @@ when behavior or defaults change.
   never retyped, and checked against `result.json` before committing. Every
   report committed from `mtg-case-study-figures` on carries the figure set
   frozen by `figures --report <its stem>` after its last output run
-  (`reports/figures/<stem>/`: the ten SVGs, `figures.md`,
+  (`reports/figures/<stem>/`: the eleven SVGs, `figures.md`,
   `figures_manifest.json`; committed, never regenerated or edited). It embeds
   `figures/<stem>/<nn>_<name>.svg` and pastes each caption verbatim from the
   frozen `figures.md`. Before the commit, its check script verifies:
@@ -432,7 +444,7 @@ when behavior or defaults change.
   byte-identical files. Move it only with `uv add "matplotlib==X.Y.Z"`
   (no other locked package may move). A move changes every figure's bytes
   and fingerprint, and `figures --check` then lists every figure as stale.
-- `motco` is pinned to an exact PyPI version (`motco==0.13.0` in
+- `motco` is pinned to an exact PyPI version (`motco==0.18.0` in
   `pyproject.toml`; `uv.lock` holds the wheel's and sdist's sha256). Move it
   only with `uv add "motco==X.Y.Z"`, and before any run under the new pin
   check that the wheel's `motco/` tree is byte-identical to `src/motco/` at
@@ -448,13 +460,17 @@ when behavior or defaults change.
   MOTCO-dependent output (spec `motco-release-migration`): a same-machine
   gate first (new pin with the previous measurement against the previous pin
   from the pre-change commit: byte-identical CSVs, equal records, or stop),
-  for a new setting MOTCO documents as moving only named outputs a contract
-  gate on the primaries (new pin with and without it: everything else equal,
-  or stop), the superseded directories moved with `scripts/move_superseded.py` on
+  for a new setting MOTCO documents as moving only named outputs, or only
+  adding a named record block, a contract gate on the primaries (new pin
+  with and without it: everything else equal, or stop), the superseded
+  directories moved with `scripts/move_superseded.py` on
   every machine, every MOTCO-dependent step rerun from scratch in dependency
   order for every cell type, a version-consistency check of every manifest
   outside `results/superseded/` (`results/figures/figures_manifest.json`
-  included: its per-figure analyses must record the new version), the
+  included: its per-figure analyses must record the new version) and of
+  every analysis record's measurement setting (an analysis where MOTCO does
+  not allow the setting passes only when its manifest records it as not
+  available), the
   MOTCO-independent outputs hashed before and after, `figures --report
   <re-issue report stem>` as the last rerun step once every other rerun has
   finished, and one re-issue report with the superseded values beside the
@@ -609,7 +625,7 @@ when behavior or defaults change.
   `ANALYSIS_MISSING_COVARIATES` (`error`, never impute),
   `ANALYSIS_PERMUTATIONS` (999), `ANALYSIS_SEED` (20261019),
   `ANALYSIS_ALPHA` (0.05) with `ANALYSIS_REJECTION_RULE` (p ≤ α),
-  `ANALYSIS_MOTCO_MIN_VERSION` (0.13.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
+  `ANALYSIS_MOTCO_MIN_VERSION` (0.18.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
   validated `min_components` default: passed explicitly in every
   `TrajectoryAnalysisParams` the package builds, checked against MOTCO's
   default before any input is read (`check_motco_rank_floor`; a mismatch
@@ -621,8 +637,8 @@ when behavior or defaults change.
   rank, 10 with the six covariates and 12 with the eight of the latent arms,
   so only the null moves (p-values, null summaries, the permutation-pooled
   eigengap); MOTCO's validated opt-in by its verdict `adopt_df`
-  (`corrected-permutation-2026-10-30.md`), not its default: the one MOTCO
-  default the package overrides, never a flag; passed explicitly in every
+  (`corrected-permutation-2026-10-30.md`), not its default: one of the two
+  MOTCO defaults the package overrides, never a flag; passed explicitly in every
   `TrajectoryAnalysisParams` the package builds, checked in the record after
   each run before anything is written (`measurement.residual_correction` of
   the requested kind with κ, or the run stops naming both settings),
@@ -631,7 +647,30 @@ when behavior or defaults change.
   printed in `summary.md` ("RRPP null: residual correction …"; records
   without one render as before), and checked by `_check_reference`
   (`params.residual_correction`, absent meaning none), so no step compares
-  against an uncorrected reference). MOTCO's other defaults (net-displacement
+  against an uncorrected reference), `ANALYSIS_SPAN_SPLIT_TEST` (`True`:
+  MOTCO's split interaction test, its verdict `split_validated`
+  (`span-split-2026-11-05.md`), not its default, never a flag: the group ×
+  stage interaction energy of the analysed features split into the fitted
+  stage-PLS span (dimension = the selected rank), its orthogonal complement
+  and all of it, each part tested by a trace pseudo-F under RRPP's draws at
+  the analysis's seed, so it only adds the record's `span_split` block;
+  passed explicitly in every `TrajectoryAnalysisParams` the package builds
+  except a latent-adjusted arm, where MOTCO rejects it
+  (`LATENT_SENSITIVITY_SPLIT_UNAVAILABLE`, tied at import to the arms with a
+  latent adjustment; their manifests quote MOTCO's reason as
+  `measurement.span_split.not_available`); `SPAN_SPLIT_PARTS` checked against
+  MOTCO's `INTERACTION_SPLIT_PARTS` before any input is read
+  (`check_motco_split_parts`); checked in the record after each run before
+  anything is written (`_span_split_problem`: the block present exactly when
+  requested, the parts, a pseudo-F p each, the analysis's permutations,
+  seed and correction, a `span` dimension equal to the selected rank, a
+  `complement` dimension equal to the total minus it, `draws_match_rrpp` at
+  `n_jobs = 1`; or the run stops naming the cohort and the entry), recorded
+  as the manifest's `measurement.span_split` and `--span-split-test` in
+  `cli_equivalent`, printed in `summary.md` (the "Split interaction test"
+  table; records without a block render as before), and checked by
+  `_check_reference` (`params.span_split_test` and the block), so no step
+  compares against a reference without it). MOTCO's other defaults (net-displacement
   orientation, double-CV rank at the floor) are not overridden, and there is
   no unadjusted run. The floored, `df`-corrected analysis is the primary of
   both cell types since `mtg-residual-correction-primary`; the earlier
@@ -639,8 +678,52 @@ when behavior or defaults change.
   MOTCO's roadmap from 2026-10-30) and rank-1 analyses are superseded
   records, not a sensitivity arm. The rank-1 and uncorrected code paths stay
   for analyses made by hand (`_analyze_cohort` with `min_components=1` or
-  `residual_correction=None`). `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
+  `residual_correction=None`), and so does the path without the split test
+  (`span_split_test=False`, the pin-move gate of `mtg-span-split-test`).
+  `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
   worker), so report results from `n_jobs = 1`.
+- Split-test policy constants (flag and ask before changing any of them;
+  predeclared in the proposal of `mtg-span-split-test`, committed before any
+  real-label split test ran, never changed from results): `SPAN_SPLIT_PARTS`
+  (`total`, `span`, `complement`), `SPAN_SPLIT_CONFIRMATORY_PART`
+  (`complement`: the one confirmatory part, its pseudo-F p-value
+  `SPAN_SPLIT_STATISTIC` = `p_value_f` read at `ANALYSIS_ALPHA` under
+  `ANALYSIS_REJECTION_RULE`, unadjusted), `SPAN_SPLIT_CONCORDANCE_PART`
+  (`span`: a concordance cell against "any of `delta`, `angle`, `shape`
+  rejected" in the same analysis, a discordance in either direction a
+  finding, never a result), `SPAN_SPLIT_NOT_READ` (`total`, `span_share`,
+  `p_value_ss`: reported, not read), `SPAN_SPLIT_ROLES`, and
+  `SPAN_SPLIT_COLUMNS` (the split columns of every comparison table, after
+  the `shape` columns: F and p per part, `span_rejected`, `span_concordant`,
+  `complement_rejected`, `span_share`; empty for a row without the test; no
+  `total` status). No adjustment across `delta`, `angle`, `shape` and the
+  complement, or across cohorts and cell types: each primary carries four
+  tests read at α, stated in the report. Reading rules for the report: each
+  cell type's `cohort_30` primary gives its split-test result; `cohort_50`
+  and every other analysis are sensitivity, a complement status that differs
+  from the primary's being rank, preprocessing, covariate-set or cohort
+  dependence (not a result of that analysis); a complement rejection is a
+  sex × stage difference with interaction energy outside the fitted
+  stage-PLS span, not a different molecular program (it may hold leakage
+  from an in-span difference, 0.32 of replicates for a 45° in-span rotation
+  on the SEA-AD table, and what the fitted span missed of the true stage
+  program, about 0.10 kept at SEA-AD's stage signal), with no geometry,
+  direction, feature list or attribution, and it starts no attribution; a
+  complement non-rejection is uninformative (no power shown at SEA-AD's
+  stage signal for any plant, nor for sparse differences: 0.02–0.05 for 20
+  features at 2–3 within-stage SDs; the dense-rotation power 0.68 was
+  measured at a strong stage signal); the in-span share is reported beside
+  the rank and never read against 0. Carried limitations: size measured on
+  real noise only for the astrocyte `cohort_30` export at this
+  configuration (complement 0.012, span 0.050, total 0.040), inferred for
+  `cohort_50`, microglia, the eight-covariate arm, the exclusion variants,
+  the forced ranks and the preprocessing variants; out-of-span power shown
+  only for a dense rotation at a strong stage signal; the null in-span share
+  grows with the fitted rank (0.236 at rank 5 on this export) and no null
+  share is computed here; the test is not available on the `latent_adjusted`
+  arm. Nothing else is re-read: the stage-DE concordance rules (which read
+  `delta`), the positive control (no p-value), the adoption, mediator, flag
+  and axis checks and the `latent_adjusted` reading are unchanged.
 - Rank-sensitivity constants (flag and ask before changing any of them):
   `ANALYSIS_FORCED_RANKS` (2, 3, 4, 6, 9, 12: 2 = `n_stages − 1`, 3 the next
   rank, 4/6/9/12 the steps of MOTCO's latent-rank ladder with 4 = 2(K − 1)
@@ -649,9 +732,13 @@ when behavior or defaults change.
   at every rank (so every rank draws the same permutation indices), rank 1
   not forceable (MOTCO accepts `forced_components ≥ 2`), the CV-selected
   analysis (rank ≥ the floor) as the reference row (the forced run at its
-  rank, when in the ladder, must equal it; otherwise the manifest says the
-  reference row stands in for it), `n_jobs = 1` for reported results, and the
-  rule that the CV-selected analysis stays primary.
+  rank, when in the ladder, must equal it in statistics, p-values and split
+  parts; otherwise the manifest says the reference row stands in for it),
+  the split test at every rank (each rank's `span` part its own rank, a
+  complement status that differs from the reference's rank dependence of the
+  split test, the in-span share reported beside the rank and not read),
+  `n_jobs = 1` for reported results, and the rule that the CV-selected
+  analysis stays primary.
 - Reporting MOTCO results follows the binding rules in
   `../MOTCO/docs/roadmap.md` (Phase 6, Next changes item 1): CV-selected rank
   beside `angle`; `angle`/`shape` non-rejections are uninformative; a
@@ -793,6 +880,12 @@ when behavior or defaults change.
   conditioning; `group_stage` is never run), `LATENT_SENSITIVITY_ARMS`
   (`extended_covariates`, `latent_adjusted`; a registry, never a flag, never
   chosen from results, the same for every cell type the step runs on),
+  `LATENT_SENSITIVITY_SPLIT_UNAVAILABLE` (`latent_adjusted`: exactly the
+  arms with a latent adjustment, tied at import; MOTCO rejects the split
+  test there, so the arm requests it off, its record carries no
+  `span_split` block, its manifest quotes MOTCO's reason as
+  `measurement.span_split.not_available` and its split cells are empty;
+  `extended_covariates` carries the test),
   `LATENT_MOTCO_MIN_VERSION` (0.9.0), the mediator
   check (`mediator_check`, the `DIAGNOSTIC_CORRELATION_THRESHOLD` reused,
   not partial on the covariates, written before the arms, never a gate),
@@ -809,7 +902,9 @@ when behavior or defaults change.
   replacement, so the arms are sensitivity only; a rejection status that
   differs is covariate-set dependence (primary vs `extended_covariates`) or
   basis dependence (`extended_covariates` vs `latent_adjusted`), not a
-  result of the arm; a CV-selected rank that differs is reported beside
+  result of the arm (a complement status that differs between primary and
+  `extended_covariates` is covariate-set dependence of the split test); a
+  CV-selected rank that differs is reported beside
   `angle`; the non-rejection rules hold in every arm; the `latent_adjusted`
   arm's `angle` and `shape` p-values are reported but not read (MOTCO's
   case-study diagnosis `residualized_basis`: the `stage` latent adjustment is
@@ -826,8 +921,9 @@ when behavior or defaults change.
   0.084–0.090, `shape` 0.078–0.092 against 0.0695), no operating
   characteristic measured on these blocks or at eight covariates (the
   residual-corrected null's size measured at six covariates only, inferred at
-  eight, reduced rank 12), and the nuclei counts and the fractions both
-  proxying library quality.
+  eight, reduced rank 12), the split test's size inferred, not measured, at
+  eight covariates and not available on `latent_adjusted`, and the nuclei
+  counts and the fractions both proxying library quality.
 - Stage-DE constants (flag and ask before changing any of them):
   `STAGE_DE_MODELS` (a registry, never a flag, never chosen from results:
   `factor_additive` `~ sex + stage` testing `stage[T.1]`, `stage[T.2]`;
@@ -971,7 +1067,13 @@ when behavior or defaults change.
     - `FIGURE_SENSITIVITY_CELL_TYPE` (astrocytes, the cell type
       `rank-sensitivity` and `preprocessing-sensitivity` run on);
     - `FIGURE_PREPROCESSING_ROOT` (tied at import to
-      `run_preprocessing_sensitivity`'s default).
+      `run_preprocessing_sensitivity`'s default);
+    - figure 11 (`11_span_split`, from `mtg-span-split-test`): the four
+      primaries' pseudo-F p per part marked by role, the complement p of
+      every registered analysis carrying the test (the `latent_adjusted`
+      arms listed as not available), the in-span share against the fitted
+      rank with no reference line; not added to figure 05, whose
+      construction stays frozen.
   - Rendering: `FIGURE_PALETTE` (sex and cell-type pairs validated; the
     aqua is below 3:1 on white, so every cell-type mark has a legend entry
     or a direct label), `FIGURE_DPI` (200), `FIGURE_FORMATS`,
@@ -983,7 +1085,8 @@ when behavior or defaults change.
     file (the binding MOTCO rules, the `df` size statement, sensitivity as
     dependence, the forced-rank limitations, `latent_adjusted` not read,
     measurement-space findings, the diagnostic rule, the stage-DE count
-    rules, the positive control's bases). A rule changed here by a later
+    rules, the positive control's bases, the split test's policy and
+    reading, `span_split`). A rule changed here by a later
     change changes its text there in the same change.
   - The output names (`FIGURE_*`).
 

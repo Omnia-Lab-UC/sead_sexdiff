@@ -18,7 +18,7 @@ For each requested cohort the sweep SHALL read the export (`rna.csv`, `atac.csv`
 - **THEN** the sweep stops with an error naming the directory and the `export` command, and writes nothing
 
 ### Requirement: Reference analysis must match the sweep's inputs and settings
-Before any rank runs, the sweep SHALL check that the reference analysis manifest records the same sha256 for each of the five export files as the files now on disk, and the same MOTCO version, seed, permutation count, latent-rank floor and residual correction as the sweep uses. On any difference it SHALL stop with an error naming the file or setting.
+Before any rank runs, the sweep SHALL check the reference analysis manifest against the sweep. Each of the five export files' sha256 SHALL equal the file now on disk. The MOTCO version, seed, permutation count, latent-rank floor, residual correction and split test SHALL equal the sweep's. On any difference it SHALL stop with an error naming the file or setting.
 
 #### Scenario: Export regenerated after the analysis
 - **WHEN** `rna.csv` was rewritten after `analyze` ran and its sha256 differs from the one in `analysis_manifest.json`
@@ -26,7 +26,7 @@ Before any rank runs, the sweep SHALL check that the reference analysis manifest
 
 #### Scenario: Matching reference
 - **WHEN** every hash and setting matches
-- **THEN** the reference row of the sweep carries the analysis record's statistics, p-values, null summaries and CV-selected rank unchanged
+- **THEN** the reference row of the sweep carries the analysis record's statistics, p-values, null summaries, split parts and CV-selected rank unchanged
 
 #### Scenario: Unfloored reference
 - **WHEN** the reference analysis was made with the rank floor 1
@@ -35,6 +35,10 @@ Before any rank runs, the sweep SHALL check that the reference analysis manifest
 #### Scenario: Uncorrected reference
 - **WHEN** the reference analysis was made without the residual correction
 - **THEN** the sweep stops with an error naming the reference `result.json`, the recorded setting, `df` and the `analyze` command, and writes nothing
+
+#### Scenario: Reference without the split test
+- **WHEN** the reference analysis carries no `span_split` block
+- **THEN** the sweep stops with an error naming the reference `result.json` and the `analyze` command, and writes nothing
 
 ### Requirement: Predeclared rank ladder
 The sweep SHALL run the ranks 2, 3, 4, 6, 9 and 12, each once, through MOTCO's trajectory-analysis entry point with the rank forced. The ladder SHALL be a fixed constant, not a runtime option, and the sweep SHALL NOT add, drop or choose ranks from the results. Before any run it SHALL stop with an error naming the rank when a rank exceeds what the cohort can support.
@@ -48,15 +52,15 @@ The sweep SHALL run the ranks 2, 3, 4, 6, 9 and 12, each once, through MOTCO's t
 - **THEN** the sweep stops with an error naming that rank before writing anything
 
 ### Requirement: Every setting other than the rank equals the analysis
-Each forced-rank run SHALL use the same blocks and units, stage order, six covariates in the same order, missing-covariate policy, orientation estimator, residual correction, permutation count and seed as the CV-selected analysis, so that every rank draws the same permutation indices and differences between ranks are measurement differences. Cross-validation SHALL NOT run.
+Each forced-rank run SHALL use the same settings as the CV-selected analysis. These are the blocks and units, the stage order, the six covariates in the same order, the missing-covariate policy, the orientation estimator, the residual correction, the split test, the permutation count and the seed. Every rank then draws the same permutation indices, and differences between ranks are measurement differences. Cross-validation SHALL NOT run.
 
 #### Scenario: Record carries the settings
 - **WHEN** the rank-4 run of `cohort_30` finishes
-- **THEN** its `result.json` records `forced_components = 4`, `component_selection = forced`, `residual_correction = df` with its κ, `permutations = 999`, the analysis seed, `orientation_estimator = net_displacement`, the six covariate names in order and no cross-validation AUROC
+- **THEN** its `result.json` records `forced_components = 4`, `component_selection = forced`, `residual_correction = df` with its κ, `span_split_test = true` with a `span` dimension of 4, `permutations = 999`, the analysis seed, `orientation_estimator = net_displacement`, the six covariate names in order and no cross-validation AUROC
 
 #### Scenario: CV-selected rank inside the ladder
 - **WHEN** the reference analysis's CV-selected rank is one of the ladder's ranks
-- **THEN** the forced run at that rank gives the same statistics and p-values as the reference analysis, and any difference is recorded as a finding
+- **THEN** the forced run at that rank gives the same statistics, p-values and split parts as the reference analysis, and any difference is recorded as a finding
 
 ### Requirement: Per-rank outputs
 Each forced-rank run SHALL be written to `results/motco_rank_sensitivity/<cohort>/rank_<kk>/` (`kk` zero-padded to two digits) holding the same files as a CV-selected analysis directory: MOTCO's artifact (`result.json`, `latent_scores.csv`, `pls_loadings.csv`, `stage_means.csv`), `analysis_metadata.csv`, `analysis_manifest.json` and `summary.md`. The sweep SHALL refuse to overwrite an existing cohort directory unless forced.
@@ -77,7 +81,7 @@ The sweep SHALL write `results/motco_rank_sensitivity/<cohort>/rank_sensitivity.
 - **THEN** `rank_sensitivity.csv` has seven rows, the first with `component_selection = cv` and the reference rank, the rest with ranks 2, 3, 4, 6, 9, 12 in that order
 
 ### Requirement: Cross-rank table columns
-Each row SHALL give, per statistic (`delta`, `angle`, `shape`), the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95, plus the reference row's CV AUROC and the row's directory. The CSV SHALL hold only values that reproduce across reruns; each run's runtime goes to the Markdown and the manifest.
+Each row SHALL give, per statistic (`delta`, `angle`, `shape`), the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95. It SHALL also give the split columns of spec `motco-span-split-test`, the reference row's CV AUROC and the row's directory. The CSV SHALL hold only values that reproduce across reruns; each run's runtime goes to the Markdown and the manifest.
 
 #### Scenario: Table values equal the records
 - **WHEN** a cell of `rank_sensitivity.csv` is compared with the `result.json` of its row's directory
@@ -90,6 +94,10 @@ Each row SHALL give, per statistic (`delta`, `angle`, `shape`), the observed val
 #### Scenario: Runtime and directories
 - **WHEN** the table of `cohort_30` is written
 - **THEN** it has no runtime column, its forced rows name their directory as `rank_<kk>` relative to the cohort directory and its reference row names the reference analysis directory, while `rank_sensitivity.md` and the manifest carry each run's runtime
+
+#### Scenario: Split share across ranks
+- **WHEN** the table of `cohort_30` is written
+- **THEN** each row carries its in-span share beside its rank (the `span` dimension), so the share's dependence on the rank can be read from the table, and no row reads the share as a test
 
 ### Requirement: Sweep manifest records provenance
 `rank_sensitivity_manifest.json` SHALL record the cohort, the ladder, the seed, the permutation count, the rank floor, the residual correction, α, `n_jobs`, the reference analysis directory with the sha256 of its `result.json` and `analysis_manifest.json`, the sha256 of each export input, each per-rank directory, the MOTCO, Python and library versions, the git revision and findings, including that the CV-selected rank is not in the ladder when it is not.

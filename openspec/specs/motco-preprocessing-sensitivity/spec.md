@@ -123,7 +123,11 @@ The step SHALL NOT write under `results/motco_input/` or `results/motco_analysis
 - **THEN** every file under `results/motco_input/` and `results/motco_analysis/` is byte-identical to before the run
 
 ### Requirement: Comparison table generated from the records
-The step SHALL write `comparison/<cohort>/sensitivity.csv` and its Markdown rendering `sensitivity.md`, generated from the records and never typed by hand, with the primary row first (`variant = primary`) and the variant row second. Each row SHALL give the rank selection and rank, and per statistic (`delta`, `angle`, `shape`) the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95, plus the CV AUROC and the row's directory.
+The step SHALL write `comparison/<cohort>/sensitivity.csv` and its Markdown rendering `sensitivity.md`, generated from the records and never typed by hand. The primary row comes first (`variant = primary`) and the variant row second. Each row SHALL give:
+- the rank selection and the rank;
+- per statistic (`delta`, `angle`, `shape`), the observed value, the RRPP p-value, whether p ≤ α and the null mean, sd and q95;
+- the split columns of spec `motco-span-split-test`;
+- the CV AUROC and the row's directory.
 
 #### Scenario: Table rows
 - **WHEN** the comparison of `cohort_30` is written
@@ -136,6 +140,10 @@ The step SHALL write `comparison/<cohort>/sensitivity.csv` and its Markdown rend
 #### Scenario: Runtime and directories
 - **WHEN** the table of `cohort_30` is written
 - **THEN** it has no runtime column, its variant row names `motco_analysis/cohort_30` relative to the variant root and its primary row names the primary analysis directory, while `sensitivity.md` and the manifest carry each run's runtime
+
+#### Scenario: Variant carries the split test
+- **WHEN** a variant analysis finishes
+- **THEN** its record carries a `span_split` block made with the primary's permutations, seed and correction, and its row's split cells are filled
 
 ### Requirement: Comparison carries the feature accounting
 `sensitivity.md` and `sensitivity_manifest.json` SHALL give, per omic and for both the primary and the variant export, the feature counts after each export step and the numbers of kept features shared with the primary, kept only by the primary and kept only by the variant; for `keep_chrx` the number and names of kept chrX features; for a variant that excludes gene sets the number of genes removed per set; for a variant with a non-variance selection rule the rule per omic and the quantiles (5, 25, 50, 75, 95) of the kept features' mean log2-CPM in both exports; for a residualized variant the covariates and the quantiles of the per-feature R²; for a trend-normalized variant the normalization rule per omic, the span and iterations, the quantiles over donors of the tilt statistics before and after normalization and the largest absolute correction.
