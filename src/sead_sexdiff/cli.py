@@ -1413,6 +1413,14 @@ def main(argv: list[str] | None = None) -> int:
                         for part in SPAN_SPLIT_PARTS
                     )
                 )
+            scan = res["record"].get("interaction_scan")
+            if scan is not None:
+                print(
+                    f"[analyze] {cohort}: interaction scan: global p {scan['p_value_global']:.4g} (confirmatory), "
+                    f"max F {scan['max_f']:.4g} ({scan['max_feature']}, {scan['max_block']}), hits "
+                    + ", ".join(f"{name} {b['hits']}" for name, b in scan["blocks"].items())
+                    + f" (adjusted p <= {scan['hit_alpha']:g})"
+                )
         print("[analyze] Done.")
         return 0
 

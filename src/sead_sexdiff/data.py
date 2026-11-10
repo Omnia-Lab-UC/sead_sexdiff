@@ -25,6 +25,7 @@ Notes
 from __future__ import annotations
 
 import gc
+import math
 import os
 import re
 import subprocess
@@ -5007,9 +5008,9 @@ ANALYSIS_SEED = 20261019
 ANALYSIS_ALPHA = 0.05
 # As in MOTCO's covariate Type I check; exact size alpha for (1 + b) / (1 + B) p-values
 ANALYSIS_REJECTION_RULE = "p <= alpha"
-# 0.18.0: the first release with the split interaction test (and 0.13.0's
-# residual-corrected RRPP null)
-ANALYSIS_MOTCO_MIN_VERSION = "0.18.0"
+# 0.20.0: the first release with the per-feature interaction scan (and
+# 0.18.0's split interaction test and 0.13.0's residual-corrected RRPP null)
+ANALYSIS_MOTCO_MIN_VERSION = "0.20.0"
 # Latent-rank floor of the CV rank selection (MOTCO's `min_components`): its
 # validated default, passed explicitly and checked against it, so a MOTCO that
 # moved its default stops the run instead of changing the primary. The floor
@@ -5058,6 +5059,69 @@ if (
         f"SPAN_SPLIT_ROLES {SPAN_SPLIT_ROLES} disagrees with SPAN_SPLIT_PARTS, SPAN_SPLIT_CONFIRMATORY_PART, "
         "SPAN_SPLIT_CONCORDANCE_PART or SPAN_SPLIT_NOT_READ"
     )
+# Per-feature interaction scan (MOTCO's `interaction_scan`): each analysed
+# feature's group × stage interaction F with the covariate-adjusted trajectory
+# models, combined by the maximum F (global permutation p-value) with
+# Westfall–Young step-down max-T adjusted p-values, under RRPP's draws at the
+# analysis's seed and correction; it reads neither the latent space nor the
+# bootstrap, so it adds the record's `interaction_scan` block and
+# `interaction_scan.csv` and is available with a latent adjustment. MOTCO's
+# validated opt-in, not its default (MOTCO's verdict `scan_validated`,
+# docs/reports/interaction-scan-2026-11-09.md). Passed explicitly in every
+# analysis and checked in the record, the table and by every reader. A
+# constant, never a flag.
+ANALYSIS_INTERACTION_SCAN = True
+# The predeclared policy (proposal of mtg-interaction-scan, committed before any
+# real-label scan): the global p-value is the scan's one confirmatory reading,
+# read at ANALYSIS_ALPHA under ANALYSIS_REJECTION_RULE, unadjusted (a fifth test
+# per analysis beside delta, angle, shape and the complement; no adjustment
+# across them, cohorts or cell types); a hit is a feature whose adjusted p-value
+# is <= ANALYSIS_ALPHA (familywise over the scanned features); the values in
+# INTERACTION_SCAN_NOT_READ are reported and not read. MOTCO's hit level is
+# checked against ANALYSIS_ALPHA before any analysis; flag and ask before
+# changing any of them.
+INTERACTION_SCAN_STATISTIC = "p_value_global"
+INTERACTION_SCAN_HIT_STATISTIC = "p_value_adjusted"
+INTERACTION_SCAN_NOT_READ = ("f", "ss_interaction", "max_f", "difference", "null_max_share")
+INTERACTION_SCAN_TABLE = "interaction_scan.csv"
+# The table's columns as MOTCO writes them; the differences per declared stage
+INTERACTION_SCAN_TABLE_COLUMNS = (
+    "block", "feature", "ss_interaction", "rss", "f", "p_value_adjusted", "degenerate",
+)
+# The power statement a non-rejection of the astrocyte cohort_30 primary
+# carries (and no other analysis): MOTCO's plasmode on this export's design,
+# bound to the five export files' sha256 as MOTCO's plasmode settings record
+# them at v0.20.0. When the export hashes differ the non-rejection is
+# uninformative with a finding. Flag and ask before changing.
+INTERACTION_SCAN_POWER_STATEMENT: dict = {
+    "cell_type": "astrocyte",
+    "cohort": "cohort_30",
+    "plant": (
+        "a stage ramp on 20 features (10 per block, uniform per replicate) in Male, stage weights 0 / 0.5 / 1, "
+        "random signs, shift e x the pooled within-stage SD"
+    ),
+    "power": {"2.0": 0.692, "3.0": 1.0},
+    "recall": {"2.0": 0.0594, "3.0": 0.525},
+    "replicates": 500,
+    "permutations": 999,
+    "does_not_exclude": (
+        "smaller effects, effects spread thinly over many features (where the scan is weak), and differences of "
+        "any other shape"
+    ),
+    "source": {
+        "motco_tag": "v0.20.0",
+        "report": "docs/reports/interaction-scan-2026-11-09.md",
+        "settings": "results/interaction-scan-2026-11-09/plasmode/settings.json",
+        "settings_sha256": "514381d8b88bddae40bb10ed1fc4a76793f756b90008abdfaab09d24a5e7d117",
+    },
+    "export_files": {
+        "rna.csv": "186198b9c52d057a0aaf36cb65b98baf62807a76511045545805aca7a29d1ca2",
+        "atac.csv": "32ebd055a8f513c498c26146edc809471d24736e667a6405f0849b2ad027b493",
+        "metadata.csv": "e2d8a4127eeee23ee9fc6effa63528fc7dfa5e8eec89ee2e0f8c8d7248a41fb6",
+        "covariates.csv": "7ed4b1bffd195c11fbdb6736576ac444ba6ddc8149a7e15d6b5f56f21ffdc4a3",
+        "manifest.json": "18f2289e0d4c84ed18f4a437ae569052544e9d150ed2726385273694b4a3b0b6",
+    },
+}
 ANALYSIS_STATISTICS = ("delta", "angle", "shape")
 
 _ANALYSIS_INPUTS = ("rna.csv", "atac.csv", "metadata.csv", "covariates.csv", "manifest.json")
@@ -5068,7 +5132,7 @@ def check_motco_version(
     *,
     required: str = ANALYSIS_MOTCO_MIN_VERSION,
     purpose: str = "the analysis needs",
-    feature: str = "covariate-adjusted analyze_trajectories with the split interaction test",
+    feature: str = "covariate-adjusted analyze_trajectories with the per-feature interaction scan",
 ) -> str:
     """Return the installed MOTCO version; raise if it is older than the minimum.
 
@@ -5149,6 +5213,28 @@ def check_motco_split_parts() -> tuple[str, ...]:
             "written over these parts, so a change of either is a change proposal, not a run; nothing was written"
         )
     return SPAN_SPLIT_PARTS
+
+
+def check_motco_scan_alpha() -> float:
+    """Return ``ANALYSIS_ALPHA``; raise if MOTCO's interaction-scan hit level differs.
+
+    Raises
+    ------
+    RuntimeError
+        ``motco.stats.interaction.INTERACTION_SCAN_ALPHA`` (the level MOTCO's
+        record calls a hit at) is not ``ANALYSIS_ALPHA``; the message names
+        both. The policy reads hits at ``ANALYSIS_ALPHA``, so a MOTCO that
+        moved its level stops the run instead of changing what a hit is.
+    """
+    from motco.stats.interaction import INTERACTION_SCAN_ALPHA
+
+    if float(INTERACTION_SCAN_ALPHA) != ANALYSIS_ALPHA:
+        raise RuntimeError(
+            f"MOTCO's interaction-scan hit level (motco.stats.interaction.INTERACTION_SCAN_ALPHA) is "
+            f"{INTERACTION_SCAN_ALPHA} but ANALYSIS_ALPHA is {ANALYSIS_ALPHA}; the scan's hits are read at "
+            "ANALYSIS_ALPHA, so a change of either is a change proposal, not a run; nothing was written"
+        )
+    return ANALYSIS_ALPHA
 
 
 def load_analysis_inputs(cohort_dir: str | Path, *, extra_covariates: pd.DataFrame | None = None) -> dict:
@@ -5389,7 +5475,226 @@ def _split_dependence_findings(ref_record: dict, record: dict, *, label: str, re
     ]
 
 
-def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA) -> str:
+def _record_interaction_scan(record: dict) -> bool:
+    """Whether an analysis record carries the scan (``params.interaction_scan`` and an ``interaction_scan`` block).
+
+    MOTCO omits ``interaction_scan`` from ``params`` while it is false.
+    """
+    return bool(record.get("params", {}).get("interaction_scan")) and isinstance(record.get("interaction_scan"), dict)
+
+
+def _interaction_scan_problem(
+    record: dict,
+    table: pd.DataFrame | None,
+    params,
+    *,
+    n_jobs: int,
+    features: dict[str, list[str]],
+    n_covariates: int,
+) -> str | None:
+    """The first entry of a record's scan or its table that disagrees with the request, or ``None``.
+
+    When ``params.interaction_scan`` is set the record must carry
+    ``params.interaction_scan = true`` and an ``interaction_scan`` block with:
+    per-block feature counts equal to the analysed blocks (``features``, in
+    ``ANALYSIS_BLOCKS`` order) and their sum; ``df_interaction = len(STAGES) − 1``
+    and ``df_residual`` = donors − 2·len(STAGES) − ``n_covariates``; a global
+    p-value and ``hit_alpha = ANALYSIS_ALPHA``; the analysis's permutations,
+    seed and residual correction; ``draws_match_rrpp`` true exactly when
+    ``n_jobs`` is 1. The table (MOTCO's in-memory scan table) must have
+    ``INTERACTION_SCAN_TABLE_COLUMNS`` plus one ``difference[<stage>]`` per
+    stage, one row per analysed feature in block and feature order, the
+    record's maximum, degenerate counts and hits (the non-degenerate rows with
+    adjusted p ≤ ``ANALYSIS_ALPHA``, by F descending, ties by row, with equal
+    F and adjusted p, and the per-block hit counts), a smallest adjusted
+    p-value equal to the global p-value, and a global rejection exactly when
+    there is a hit. When it is not set the record must carry neither the
+    setting nor the block, and there is no table.
+    """
+    requested = bool(getattr(params, "interaction_scan", False))
+    block = record.get("interaction_scan")
+    recorded = bool(record.get("params", {}).get("interaction_scan"))
+    if not requested:
+        if block is not None or recorded or table is not None:
+            return "an interaction_scan block, params.interaction_scan or a scan table although the scan was not requested"
+        return None
+    if not recorded:
+        return "params.interaction_scan (absent or false)"
+    if not isinstance(block, dict):
+        return "the interaction_scan block (absent)"
+    if table is None:
+        return "the interaction scan table (absent)"
+    widths = {name: len(cols) for name, cols in features.items()}
+    recorded_widths = {b["name"]: int(b["n_features"]) for b in record["blocks"]}
+    if recorded_widths != widths:
+        return f"record blocks {recorded_widths} (the analysed blocks are {widths})"
+    per_block = block.get("blocks") or {}
+    if tuple(per_block) != tuple(widths):
+        return f"interaction_scan.blocks {tuple(per_block)} (expected {tuple(widths)})"
+    for name, width in widths.items():
+        if per_block[name].get("n_features") != width:
+            return f"interaction_scan.blocks.{name}.n_features = {per_block[name].get('n_features')} (expected {width})"
+    total = sum(widths.values())
+    if block.get("n_features") != total:
+        return f"interaction_scan.n_features = {block.get('n_features')} (expected {total})"
+    if block.get("df_interaction") != len(STAGES) - 1:
+        return f"interaction_scan.df_interaction = {block.get('df_interaction')} (expected {len(STAGES) - 1})"
+    n_donors = int(record["design"]["n_samples"])
+    df_residual = n_donors - 2 * len(STAGES) - n_covariates
+    if block.get("df_residual") != df_residual:
+        return f"interaction_scan.df_residual = {block.get('df_residual')} (expected {df_residual})"
+    p_global = block.get(INTERACTION_SCAN_STATISTIC)
+    if p_global is None:
+        return f"interaction_scan.{INTERACTION_SCAN_STATISTIC} (null)"
+    if block.get("hit_alpha") != ANALYSIS_ALPHA:
+        return f"interaction_scan.hit_alpha = {block.get('hit_alpha')!r} (ANALYSIS_ALPHA is {ANALYSIS_ALPHA})"
+    for key, want in (
+        ("permutations", params.permutations), ("seed", params.seed),
+        ("residual_correction", getattr(params, "residual_correction", None)),
+    ):
+        if block.get(key) != want:
+            return f"interaction_scan.{key} = {block.get(key)!r} (the analysis's is {want!r})"
+    if block.get("draws_match_rrpp") is not (n_jobs == 1):
+        return f"interaction_scan.draws_match_rrpp = {block.get('draws_match_rrpp')!r} at n_jobs = {n_jobs}"
+    # The table, against the analysed features and the record
+    columns = list(INTERACTION_SCAN_TABLE_COLUMNS) + [f"difference[{st}]" for st in STAGES]
+    if list(table.columns) != columns:
+        return f"the scan table's columns {list(table.columns)} (expected {columns})"
+    if len(table) != total:
+        return f"the scan table's {len(table)} rows (expected {total}, one per analysed feature)"
+    want_blocks = [name for name, cols in features.items() for _ in cols]
+    want_features = [str(f) for cols in features.values() for f in cols]
+    if table["block"].astype(str).tolist() != want_blocks or table["feature"].astype(str).tolist() != want_features:
+        return "the scan table's block and feature order (expected the analysed blocks' columns in order)"
+    f = table["f"].to_numpy(dtype=float)
+    adjusted = table[INTERACTION_SCAN_HIT_STATISTIC].to_numpy(dtype=float)
+    degenerate = table["degenerate"].to_numpy(dtype=bool)
+    if int(degenerate.sum()) != block.get("n_degenerate"):
+        return f"interaction_scan.n_degenerate = {block.get('n_degenerate')} (the table has {int(degenerate.sum())})"
+    valid = np.flatnonzero(~degenerate)
+    top = int(valid[np.argmax(f[valid])])
+    if (want_blocks[top], want_features[top], float(f[top])) != (
+        block.get("max_block"), block.get("max_feature"), block.get("max_f")
+    ):
+        return (
+            f"interaction_scan max {block.get('max_feature')!r} ({block.get('max_block')}, F {block.get('max_f')}) "
+            f"(the table's is {want_features[top]!r} ({want_blocks[top]}, F {float(f[top])}))"
+        )
+    hit_rows = np.flatnonzero(~degenerate & (adjusted <= ANALYSIS_ALPHA))
+    hit_rows = hit_rows[np.lexsort((hit_rows, -f[hit_rows]))]
+    table_hits = [(want_blocks[i], want_features[i], float(f[i]), float(adjusted[i])) for i in hit_rows]
+    record_hits = [(h["block"], h["feature"], h["f"], h["p_value_adjusted"]) for h in block.get("hits", [])]
+    if table_hits != record_hits:
+        return f"interaction_scan.hits ({len(record_hits)}) disagree with the table's hits ({len(table_hits)})"
+    for name in widths:
+        n = sum(1 for h in table_hits if h[0] == name)
+        if per_block[name].get("hits") != n:
+            return f"interaction_scan.blocks.{name}.hits = {per_block[name].get('hits')} (the table has {n})"
+    smallest = float(np.min(adjusted[valid]))
+    if not math.isclose(smallest, float(p_global), rel_tol=1e-12, abs_tol=0.0):
+        return f"interaction_scan.{INTERACTION_SCAN_STATISTIC} = {p_global} (the smallest adjusted p-value is {smallest})"
+    if (float(p_global) <= ANALYSIS_ALPHA) != bool(table_hits):
+        return (
+            f"interaction_scan.{INTERACTION_SCAN_STATISTIC} = {p_global} with {len(table_hits)} hit(s): a global "
+            "rejection must come with a hit and a hit with a global rejection"
+        )
+    return None
+
+
+def _interaction_scan_status(record: dict, *, alpha: float = ANALYSIS_ALPHA) -> dict | None:
+    """The predeclared reading cells of a record's scan, or ``None`` without one.
+
+    ``rejected`` is ``p ≤ alpha`` on the global p-value; ``hits`` the hit count
+    per block (``ANALYSIS_BLOCKS``); ``n_hits`` their sum.
+    """
+    if not _record_interaction_scan(record):
+        return None
+    block = record["interaction_scan"]
+    p = block[INTERACTION_SCAN_STATISTIC]
+    hits = {name: int(b.get("hits", 0)) for name, b in block["blocks"].items()}
+    return {"p": p, "rejected": bool(p <= alpha), "hits": hits, "n_hits": sum(hits.values())}
+
+
+def _scan_dependence_findings(ref_record: dict, record: dict, *, label: str, reference: str, kind: str) -> list[str]:
+    """A finding when the scan status of ``record`` differs from ``ref_record``'s (both carrying the scan).
+
+    ``label`` names the sensitivity analysis, ``reference`` the analysis it is
+    compared with, and ``kind`` the dependence it is read as (preprocessing,
+    covariate-set or cohort dependence of the scan).
+    """
+    a, b = _interaction_scan_status(ref_record), _interaction_scan_status(record)
+    if a is None or b is None or a["rejected"] == b["rejected"]:
+        return []
+    return [
+        f"interaction scan: status in {label} (global p = {_fmt(b['p'], '.4g')}, {b['n_hits']} hit(s)) differs "
+        f"from {reference} (global p = {_fmt(a['p'], '.4g')}, {a['n_hits']} hit(s)); {kind}, not a result of {label}"
+    ]
+
+
+def _render_scan_summary(scan: dict, status: dict, *, stages: list[str], scan_table: pd.DataFrame | None) -> list[str]:
+    """The "Interaction scan" section of ``summary.md`` (``render_analysis_summary``)."""
+    if scan.get("draws_match_rrpp"):
+        draws = "RRPP's permutation sequence at the analysis's seed"
+    else:
+        draws = "not RRPP's permutation sequence (n_jobs ≠ 1)"
+    lines = [
+        "",
+        "## Interaction scan",
+        "",
+        f"Per-feature group × stage interaction F of the {scan['n_features']} analysed features (df "
+        f"{scan['df_interaction']}, {scan['df_residual']}) with the covariate-adjusted trajectory models, combined by "
+        f"the maximum F; Westfall–Young step-down max-T adjusted p-values under {scan['permutations']} Freedman–Lane "
+        f"draws with seed {scan['seed']} and residual correction `{scan['residual_correction']}`. The global p-value is "
+        "confirmatory (p ≤ α, unadjusted); a hit is a feature with adjusted p ≤ "
+        f"{_fmt(scan['hit_alpha'], 'g')} (familywise over the scanned features). The F values, the per-stage "
+        "differences and the null-maximum shares are reported and not read.",
+        "",
+        "| entry | value |",
+        "|---|---|",
+        f"| global p (confirmatory) | {_fmt(status['p'], '.4g')} |",
+        f"| rejected | {'yes' if status['rejected'] else 'no'} |",
+        f"| maximum F | {_fmt(scan['max_f'])} (`{scan['max_feature']}`, {scan['max_block']}) |",
+        f"| features (degenerate) | {scan['n_features']} ({scan['n_degenerate']}) |",
+    ]
+    for name, b in scan["blocks"].items():
+        lines.append(f"| hits, {name} | {b.get('hits')} |")
+    for name, b in scan["blocks"].items():
+        share = b.get("null_max_share")
+        lines.append(
+            f"| null-maximum share, {name} (descriptive, not read; {b['n_features']} of {scan['n_features']} features) "
+            f"| {_fmt(share, '.4g')} |"
+        )
+    hits = scan.get("hits") or []
+    if hits:
+        diff_cols = [f"difference[{st}]" for st in stages]
+        diffs: dict[tuple[str, str], list] = {}
+        if scan_table is not None:
+            keyed = scan_table.set_index(["block", "feature"])
+            for h in hits:
+                row = keyed.loc[(h["block"], h["feature"])]
+                diffs[(h["block"], h["feature"])] = [row[c] for c in diff_cols]
+        header = "| block | feature | F | adjusted p |"
+        rule = "|---|---|---:|---:|"
+        if diffs:
+            header += "".join(f" difference at stage {st} |" for st in stages)
+            rule += "---:|" * len(stages)
+        lines += ["", "Hits (features with adjusted p ≤ α; detections, not drivers; differences are the second group "
+                  "minus the first at the covariate reference row, in standardized units, and are not read):", "",
+                  header, rule]
+        for h in hits:
+            row = f"| {h['block']} | `{h['feature']}` | {_fmt(h['f'])} | {_fmt(h['p_value_adjusted'], '.4g')} |"
+            if diffs:
+                row += "".join(f" {_fmt(v)} |" for v in diffs[(h["block"], h["feature"])])
+            lines.append(row)
+    else:
+        lines += ["", f"No hit (adjusted p ≤ {_fmt(scan['hit_alpha'], 'g')})."]
+    lines += ["", f"- draws: {draws}"]
+    return lines
+
+
+def render_analysis_summary(
+    record: dict, *, cohort: str, alpha: float = ANALYSIS_ALPHA, scan_table: pd.DataFrame | None = None,
+) -> str:
     """Render ``summary.md`` from a MOTCO analysis record (``result.json``).
 
     Parameters
@@ -5400,6 +5705,10 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         Cohort name for the title.
     alpha:
         Significance level; a statistic is rejected when ``p <= alpha``.
+    scan_table:
+        The record's interaction-scan table (``interaction_scan.csv``), for the
+        hits' per-stage differences; without it the hit rows carry F and the
+        adjusted p-value only.
 
     Returns
     -------
@@ -5421,7 +5730,14 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
         statistics (part, role, dimension, pseudo-F, pseudo-F p-value), the
         in-span share labelled as not read and a line on the draws; the
         interaction-SS p-values stay in ``result.json``. Records without one
-        are rendered as before.
+        are rendered as before. A record with an ``interaction_scan`` block
+        (MOTCO ≥ 0.20.0) gets an "Interaction scan" section after it: the
+        global p-value (confirmatory) and status, the maximum F with its
+        feature and block, the features and degrees of freedom, hits and
+        null-maximum shares per block (the shares labelled descriptive), one
+        row per hit (F, adjusted p-value and, with ``scan_table``, the
+        difference at each stage) or "No hit", and a line on the draws.
+        Records without one are rendered as before.
     """
     design = record["design"]
     meas = record["measurement"]
@@ -5517,6 +5833,10 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
             f"- in-span share: {_fmt(split.get('span_share'), '.4g')} (descriptive, not read)",
             f"- draws: {draws}",
         ]
+    scan = record.get("interaction_scan")
+    scan_status = _interaction_scan_status(record, alpha=alpha)
+    if scan is not None and scan_status is not None:
+        lines += _render_scan_summary(scan, scan_status, stages=stages, scan_table=scan_table)
     lines += [
         "",
         "## Cell sizes",
@@ -5589,7 +5909,7 @@ def render_analysis_summary(record: dict, *, cohort: str, alpha: float = ANALYSI
 def _cli_equivalent(
     cohort_dir: Path, metadata_path: Path, params, n_jobs: int, *, covariates: Iterable[str] = ANALYSIS_COVARIATES,
 ) -> dict:
-    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank, optionally latent-adjusted, with the split test when requested)."""
+    """The ``motco analyze`` command that reproduces one analysis directory (CV or forced rank, optionally latent-adjusted, with the split test and the interaction scan when requested)."""
     import shlex
 
     argv = ["motco", "analyze"]
@@ -5617,6 +5937,9 @@ def _cli_equivalent(
     if getattr(params, "span_split_test", False):
         # Adds the record's span_split block only, so CV and forced runs alike
         argv += ["--span-split-test"]
+    if getattr(params, "interaction_scan", False):
+        # Adds the record's interaction_scan block and interaction_scan.csv only, so CV and forced runs alike
+        argv += ["--interaction-scan"]
     if params.forced_components is not None:
         # Cross-validation does not run, so none of its knobs apply
         argv += ["--forced-components", str(params.forced_components)]
@@ -5693,7 +6016,14 @@ def _analyze_cohort(
         manifest's ``measurement.span_split`` (requested, with the policy's
         roles; or not requested, with MOTCO's reason quoted as
         ``not_available`` for a latent-adjusted arm) and
-        ``--span-split-test`` in ``cli_equivalent``.
+        ``--span-split-test`` in ``cli_equivalent``; ``interaction_scan``
+        ``ANALYSIS_INTERACTION_SCAN`` from every caller (``False`` only in the
+        pin-move gate, run by hand), checked against the record's
+        ``interaction_scan`` block and MOTCO's scan table before anything is
+        written (``_interaction_scan_problem``) and recorded as the manifest's
+        ``measurement.interaction_scan`` (the policy's statistic, hit statistic
+        and level, the values not read and the table) and
+        ``--interaction-scan`` in ``cli_equivalent``.
     out_dir:
         The directory is written to ``<out_dir>/<final_name>.tmp/`` and renamed
         to ``<out_dir>/<final_name>`` when complete.
@@ -5742,7 +6072,10 @@ def _analyze_cohort(
         another kind, or present without the setting), or its split test is
         not the one ``params`` asked for (``_span_split_problem``: the block
         absent, present without the request, or disagreeing with the
-        analysis); nothing is written.
+        analysis), or MOTCO's scan hit level is not ``ANALYSIS_ALPHA``
+        (``check_motco_scan_alpha``), or the record's scan or its table is not
+        the one ``params`` asked for (``_interaction_scan_problem``); nothing is
+        written.
     """
     import io
     import shutil
@@ -5753,6 +6086,7 @@ def _analyze_cohort(
     motco_version = check_motco_version()
     check_motco_rank_floor()
     check_motco_split_parts()
+    check_motco_scan_alpha()
     covariates = tuple(covariates)
     blocks = loaded["blocks"]
     export_manifest = loaded["export_manifest"]
@@ -5816,6 +6150,29 @@ def _analyze_cohort(
             f"MOTCO's record for {cohort} does not carry the split interaction test as requested "
             f"(span_split_test = {bool(getattr(params, 'span_split_test', False))}): {problem}; nothing was written"
         )
+    # The record and table must carry the scan exactly when it was requested, made with the analysis's draws
+    scan_table = getattr(result, "interaction_scan", None)
+    problem = _interaction_scan_problem(
+        record, scan_table, params, n_jobs=n_jobs,
+        features={o: [str(c) for c in blocks[o].columns] for o in ANALYSIS_BLOCKS}, n_covariates=len(covariates),
+    )
+    if problem is not None:
+        raise RuntimeError(
+            f"MOTCO's record for {cohort} does not carry the per-feature interaction scan as requested "
+            f"(interaction_scan = {bool(getattr(params, 'interaction_scan', False))}): {problem}; nothing was written"
+        )
+    if getattr(params, "interaction_scan", False):
+        scan_measurement = {
+            "requested": True,
+            "role": "confirmatory",
+            "statistic": INTERACTION_SCAN_STATISTIC,
+            "hit_statistic": INTERACTION_SCAN_HIT_STATISTIC,
+            "hit_alpha": ANALYSIS_ALPHA,
+            "not_read": list(INTERACTION_SCAN_NOT_READ),
+            "table": INTERACTION_SCAN_TABLE,
+        }
+    else:
+        scan_measurement = {"requested": False}
     split_requested = bool(getattr(params, "span_split_test", False))
     if split_requested:
         split_measurement = {
@@ -5871,13 +6228,19 @@ def _analyze_cohort(
             f"rejected {'yes' if status['production_rejected'] else 'no'}: a discordant concordance cell (the span part "
             "trails delta and shape in power), a finding that changes no reading"
         )
+    if scan_table is not None and bool(scan_table["degenerate"].any()):
+        bad = scan_table.loc[scan_table["degenerate"].astype(bool), ["block", "feature"]]
+        findings.append(
+            f"interaction scan: {len(bad)} degenerate feature(s) (zero full-model residual variance; no F, never a "
+            "hit): " + ", ".join(f"{b}:{f}" for b, f in bad.itertuples(index=False))
+        )
 
     tmp = out_dir / f"{final_name}.tmp"
     if tmp.exists():
         shutil.rmtree(tmp)
     written = write_analysis_outputs(result, tmp)
     (tmp / "analysis_metadata.csv").write_text(metadata_csv)
-    (tmp / "summary.md").write_text(render_analysis_summary(record, cohort=cohort))
+    (tmp / "summary.md").write_text(render_analysis_summary(record, cohort=cohort, scan_table=scan_table))
     software = _software_versions()
     software["motco"] = motco_version
     try:
@@ -5959,6 +6322,7 @@ def _analyze_cohort(
             **({"latent_adjustment": latent} if latent is not None else {}),
             "residual_correction": applied,
             "span_split": split_measurement,
+            "interaction_scan": scan_measurement,
             "permutations": params.permutations,
             "seed": params.seed,
             "alpha": ANALYSIS_ALPHA,
@@ -6033,9 +6397,11 @@ def run_analysis(
     default, passed explicitly and checked against it before any input is
     read), ``ANALYSIS_PERMUTATIONS`` RRPP permutations with ``ANALYSIS_SEED``
     under the residual correction ``ANALYSIS_RESIDUAL_CORRECTION``, with the
-    split interaction test ``ANALYSIS_SPAN_SPLIT_TEST`` (both MOTCO's
-    validated opt-ins, passed explicitly and checked in the record before
-    anything is written). The model's metadata table is serialized to
+    split interaction test ``ANALYSIS_SPAN_SPLIT_TEST`` and the per-feature
+    interaction scan ``ANALYSIS_INTERACTION_SCAN`` (MOTCO's validated opt-ins,
+    passed explicitly and checked in the record, and the scan in its table,
+    before anything is written; MOTCO's scan hit level checked against
+    ``ANALYSIS_ALPHA`` before any input is read). The model's metadata table is serialized to
     ``analysis_metadata.csv`` and parsed back exactly as ``motco analyze``
     parses ``--metadata``, so the manifest's ``cli_equivalent`` reproduces the
     run. Each cohort is written to ``<cohort>.tmp/`` and renamed when complete
@@ -6044,6 +6410,7 @@ def run_analysis(
     motco_version = check_motco_version()
     rank_floor = check_motco_rank_floor()
     check_motco_split_parts()
+    check_motco_scan_alpha()
     from motco.analysis import TrajectoryAnalysisParams
 
     cell_type_entry(cell_type)
@@ -6077,6 +6444,7 @@ def run_analysis(
         params = TrajectoryAnalysisParams(
             permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
             residual_correction=ANALYSIS_RESIDUAL_CORRECTION, span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
+            interaction_scan=ANALYSIS_INTERACTION_SCAN,
         )
         results[c] = _analyze_cohort(
             c, cohort_dir, loaded, params, out_dir=out_dir, final_name=c, n_jobs=n_jobs, findings=findings,
@@ -6150,7 +6518,9 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
         correction (``params.residual_correction``, absent meaning none,
         against ``ANALYSIS_RESIDUAL_CORRECTION``), the split test
         (``params.span_split_test`` and the ``span_split`` block, against
-        ``ANALYSIS_SPAN_SPLIT_TEST``) or the component selection recorded by
+        ``ANALYSIS_SPAN_SPLIT_TEST``), the interaction scan
+        (``params.interaction_scan`` and the ``interaction_scan`` block, against
+        ``ANALYSIS_INTERACTION_SCAN``) or the component selection recorded by
         the analysis differs from the sweep's; the message names the file or
         setting.
     """
@@ -6202,6 +6572,12 @@ def _check_reference(cohort_dir: str | Path, analysis_dir: str | Path, inputs: d
         raise ValueError(
             f"{d / 'result.json'} carries no split interaction test (params.span_split_test and the span_split block) "
             f"but the reference must be made with ANALYSIS_SPAN_SPLIT_TEST = {ANALYSIS_SPAN_SPLIT_TEST}; {rerun}"
+        )
+    if ANALYSIS_INTERACTION_SCAN and not _record_interaction_scan(record):
+        raise ValueError(
+            f"{d / 'result.json'} carries no per-feature interaction scan (params.interaction_scan and the "
+            f"interaction_scan block) but the reference must be made with ANALYSIS_INTERACTION_SCAN = "
+            f"{ANALYSIS_INTERACTION_SCAN}; {rerun}"
         )
     selection = record.get("latent", {}).get("component_selection")
     if selection != "cv":
@@ -6281,6 +6657,90 @@ def _render_split_table(rows: list[dict], *, label: str, rank_key: str = "rank",
     return lines
 
 
+def _scan_identity_problem(ref_dir: Path, ref_record: dict, new_dir: Path, record: dict) -> str | None:
+    """The first difference between two analyses' scans (block and ``interaction_scan.csv``), or ``None``.
+
+    The scan reads the features and trajectory models only, so analyses that
+    differ only in the latent space (forced ranks, the latent arms) must give
+    the same block and a byte-identical table.
+    """
+    a, b = ref_record.get("interaction_scan"), record.get("interaction_scan")
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return "an interaction_scan block is missing"
+    for key in sorted(set(a) | set(b)):
+        if a.get(key) != b.get(key):
+            return f"interaction_scan.{key} ({a.get(key)!r} against {b.get(key)!r})"
+    ta = (Path(ref_dir) / INTERACTION_SCAN_TABLE).read_bytes()
+    tb = (Path(new_dir) / INTERACTION_SCAN_TABLE).read_bytes()
+    if ta != tb:
+        la, lb = ta.splitlines(), tb.splitlines()
+        line = next((i for i, (x, y) in enumerate(zip(la, lb)) if x != y), min(len(la), len(lb)))
+        return f"{INTERACTION_SCAN_TABLE} line {line + 1}"
+    return None
+
+
+# The scan columns of every comparison table, after the split columns: the
+# maximum F and its block, the global p-value and its status, and the hits per
+# block. No per-feature value, so no table invites reading one.
+INTERACTION_SCAN_COLUMNS = (
+    "scan_max_f", "scan_max_block", "scan_p", "scan_rejected",
+    *(f"scan_hits_{b}" for b in ANALYSIS_BLOCKS),
+)
+
+
+def _scan_columns(record: dict) -> dict:
+    """The ``INTERACTION_SCAN_COLUMNS`` cells of one record, every cell ``None`` without the scan."""
+    status = _interaction_scan_status(record)
+    if status is None:
+        return {col: None for col in INTERACTION_SCAN_COLUMNS}
+    scan = record["interaction_scan"]
+    cells = {
+        "scan_max_f": scan["max_f"],
+        "scan_max_block": scan["max_block"],
+        "scan_p": status["p"],
+        "scan_rejected": status["rejected"],
+        **{f"scan_hits_{b}": status["hits"][b] for b in ANALYSIS_BLOCKS},
+    }
+    return {col: cells[col] for col in INTERACTION_SCAN_COLUMNS}
+
+
+def _render_scan_table(rows: list[dict], *, label: str, rank_key: str = "rank", note: str = "") -> list[str]:
+    """Markdown lines of the scan columns of comparison rows (one row per analysis).
+
+    ``label`` is the row key naming the analysis; ``note`` is printed under
+    the explanation (the identity of the scan across ranks or latent arms); a
+    row without the scan reads "no scan" in every cell.
+    """
+    lines = [
+        "",
+        "## Interaction scan",
+        "",
+        "MOTCO's per-feature interaction scan: the global p-value of the largest group × stage interaction F over "
+        "the analysed features is read (rejected when p ≤ α, unadjusted); hits are features with step-down max-T "
+        "adjusted p ≤ α (familywise over the scanned features); the maximum F is reported and not read. A scan "
+        "status that differs from the reference row's is dependence of the scan, not a result of that row; a scan "
+        "without hits is uninformative unless power has been shown at the design.",
+    ]
+    if note:
+        lines += ["", note]
+    lines += [
+        "",
+        f"| {label} | rank | global p | rejected | max F (not read) | max block | "
+        + " | ".join(f"hits, {b}" for b in ANALYSIS_BLOCKS) + " |",
+        "|---|---:|---:|:---:|---:|---|" + "---:|" * len(ANALYSIS_BLOCKS),
+    ]
+    for r in rows:
+        if r.get("scan_p") is None:
+            lines.append(f"| {r[label]} | {r[rank_key]} | " + " | ".join(["no scan"] * (4 + len(ANALYSIS_BLOCKS))) + " |")
+            continue
+        lines.append(
+            f"| {r[label]} | {r[rank_key]} | {_fmt(r['scan_p'], '.4g')} | {'yes' if r['scan_rejected'] else 'no'} | "
+            f"{_fmt(r['scan_max_f'])} | {r['scan_max_block']} | "
+            + " | ".join(str(r[f"scan_hits_{b}"]) for b in ANALYSIS_BLOCKS) + " |"
+        )
+    return lines
+
+
 def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, directory: str) -> dict:
     """Flatten one analysis record into a row of the cross-rank table.
 
@@ -6290,7 +6750,9 @@ def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, dir
     ``runtime_seconds`` is rendered in the Markdown and recorded in the
     manifest but left out of the CSV. The split columns
     (``SPAN_SPLIT_COLUMNS``) follow the ``shape`` columns, empty for a
-    record without the split test.
+    record without the split test, and the scan columns
+    (``INTERACTION_SCAN_COLUMNS``) follow them, empty for a record without
+    the scan.
     """
     row = {"cohort": cohort, "component_selection": component_selection, "rank": record["latent"]["selected_lv"]}
     for s in ANALYSIS_STATISTICS:
@@ -6303,6 +6765,7 @@ def _sensitivity_row(record: dict, *, cohort: str, component_selection: str, dir
         row[f"{s}_null_sd"] = null.get("sd")
         row[f"{s}_null_q95"] = null.get("q95")
     row.update(_split_columns(record))
+    row.update(_scan_columns(record))
     row["cv_mean_auroc"] = record["latent"].get("cv_mean_auroc")
     row["runtime_seconds"] = record["measurement"]["runtime_seconds"]
     row["dir"] = directory
@@ -6367,6 +6830,12 @@ def render_rank_sensitivity(
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
     lines += _render_split_table(rows, label="component_selection")
+    lines += _render_scan_table(
+        rows, label="component_selection",
+        note="The scan reads the features and trajectory models only, not the latent space, so it does not depend on "
+        "the latent rank: every forced rank's scan equals the CV-selected analysis's (checked before the table is "
+        "written).",
+    )
     lines += [
         "",
         "## Runs",
@@ -6513,7 +6982,7 @@ def run_rank_sensitivity(
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, forced_components=k,
                 min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
-                span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
+                span_split_test=ANALYSIS_SPAN_SPLIT_TEST, interaction_scan=ANALYSIS_INTERACTION_SCAN,
             )
             runs[k] = _analyze_cohort(
                 c, cohort_dir, loaded, params,
@@ -6525,6 +6994,15 @@ def run_rank_sensitivity(
                 log_prefix="rank-sensitivity",
             )
             rec = runs[k]["record"]
+            # The scan does not read the latent space: every rank's must equal the reference's
+            problem = _scan_identity_problem(reference["dir"], ref_record, runs[k]["dir"], rec)
+            if problem is not None:
+                shutil.rmtree(tmp)
+                raise RuntimeError(
+                    f"the interaction scan at forced rank {k} of {c} differs from the CV-selected analysis's in "
+                    f"{reference['dir']}: {problem}; the scan reads the features and models only, so this is a "
+                    "question for MOTCO before any reading; nothing was published"
+                )
             print(
                 f"[rank-sensitivity] {c}: rank {k}: "
                 + ", ".join(f"{s} {_fmt(rec['statistics'].get(s))} (p {_fmt(rec['p_values'].get(s), '.4g')})"
@@ -7512,6 +7990,7 @@ def render_preprocessing_sensitivity(
                 f"{_fmt(r[f'{s}_null_mean'])} | {_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
     lines += _render_split_table(rows, label="variant")
+    lines += _render_scan_table(rows, label="variant")
 
     show_chrx, show_sets = has("chrx"), has("gene_sets")
     header = ["omic", "export", "input", "after chromosome removal"]
@@ -7946,7 +8425,7 @@ def run_preprocessing_sensitivity(
             params = TrajectoryAnalysisParams(
                 permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs,
                 min_components=ANALYSIS_RANK_FLOOR, residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
-                span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
+                span_split_test=ANALYSIS_SPAN_SPLIT_TEST, interaction_scan=ANALYSIS_INTERACTION_SCAN,
             )
             ana = _analyze_cohort(
                 c, exp["dir"], loaded_v, params,
@@ -8027,6 +8506,10 @@ def run_preprocessing_sensitivity(
             findings += _split_dependence_findings(
                 ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
                 kind="preprocessing dependence of the split test",
+            )
+            findings += _scan_dependence_findings(
+                ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
+                kind="preprocessing dependence of the scan",
             )
             if n_jobs != 1:
                 findings.append(
@@ -9460,6 +9943,12 @@ def render_latent_sensitivity(
             "on the covariate-blind basis), so " + ", ".join(f"`{a}`" for a in unavailable) + " carries no split "
             "cells; its manifest quotes MOTCO's reason under `measurement.span_split.not_available`.",
         ]
+    lines += _render_scan_table(
+        rows, label="arm",
+        note="The scan reads the features and trajectory models only, neither the latent basis nor the bootstrap, so "
+        "it is available with the latent adjustment and the latent_adjusted arm's scan equals the "
+        "extended_covariates arm's (checked before the comparison is written); no dependence is read between them.",
+    )
     lines += [
         "",
         "## Runs",
@@ -9697,6 +10186,8 @@ def run_latent_sensitivity(
             residual_correction=ANALYSIS_RESIDUAL_CORRECTION,
             # MOTCO rejects the split test with a latent adjustment (LATENT_SENSITIVITY_SPLIT_UNAVAILABLE)
             span_split_test=ANALYSIS_SPAN_SPLIT_TEST and spec["latent_adjustment"] is None,
+            # The scan reads neither the latent basis nor the bootstrap, so both arms carry it
+            interaction_scan=ANALYSIS_INTERACTION_SCAN,
         )
         for arm, spec in LATENT_SENSITIVITY_ARMS.items()
     }
@@ -9833,6 +10324,16 @@ def run_latent_sensitivity(
                     f"the arms' covariate blocks differ ({covariate_blocks}); the latent adjustment must change only "
                     "the basis"
                 )
+            # Same covariates, so the scan (features and models only) must be the same in every arm
+            for arm in arms[1:]:
+                problem = _scan_identity_problem(runs[arms[0]]["dir"], runs[arms[0]]["record"], runs[arm]["dir"],
+                                                 runs[arm]["record"])
+                if problem is not None:
+                    raise RuntimeError(
+                        f"the interaction scan of the {arm} arm of {c} differs from the {arms[0]} arm's: {problem}; "
+                        "the scan reads the features and models only, so this is a question for MOTCO before any "
+                        "reading; nothing was written"
+                    )
 
             rows = [_latent_row(
                 reference["record"], arm=LATENT_SENSITIVITY_REFERENCE_LABEL, cohort=c, directory=str(reference["dir"])
@@ -9871,6 +10372,9 @@ def run_latent_sensitivity(
                 rec_a = reference["record"] if a == ref_label else runs[a]["record"]
                 findings += _split_dependence_findings(
                     rec_a, runs[b]["record"], label=b, reference=a, kind=f"{kind} of the split test",
+                )
+                findings += _scan_dependence_findings(
+                    rec_a, runs[b]["record"], label=b, reference=a, kind=f"{kind} of the scan",
                 )
             for _, r in flagged.iterrows():
                 findings.append(
@@ -10122,10 +10626,84 @@ STAGE_DE_SUMMARY = "stage_de_summary.csv"
 STAGE_DE_MARKDOWN = "stage_de.md"
 STAGE_DE_MANIFEST = "stage_de_manifest.json"
 STAGE_DE_TABLE_COLUMNS = ("feature", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "exported")
+# Written before any real-label scan (proposal of mtg-interaction-scan); evaluated
+# per cohort × omic on the rule row of STAGE_DE_CONCORDANCE_RULE. Reads the hits
+# of the analysis read (result.json interaction_scan.hits) and a count, never a
+# p-value magnitude; changes no MOTCO output. A discordance is a finding, never
+# a result. Flag and ask before changing.
+STAGE_DE_SCAN_CONCORDANCE_RULE: dict[str, str] = {
+    "model": STAGE_DE_CONCORDANCE_RULE["model"],
+    "coefficient": STAGE_DE_CONCORDANCE_RULE["coefficient"],
+    "feature_set": STAGE_DE_CONCORDANCE_RULE["feature_set"],
+    "scan_detected": (
+        "the analysis read has at least one interaction-scan hit (step-down max-T adjusted p <= ANALYSIS_ALPHA) in "
+        "the omic's block (result.json interaction_scan.hits)"
+    ),
+    "interaction_detected": STAGE_DE_CONCORDANCE_RULE["interaction_detected"],
+    "overlap": (
+        "scan_hits_significant: the hits with padj <= STAGE_DE_ALPHA on either interaction coefficient of "
+        "factor_interaction; every hit must be an exported feature of the tables"
+    ),
+    "cell": (
+        "concordant when both are true or both are false; discordant otherwise, written as a finding, never a "
+        "result; agreement is not replication (same donors)"
+    ),
+}
+if (STAGE_DE_SCAN_CONCORDANCE_RULE["model"], STAGE_DE_SCAN_CONCORDANCE_RULE["coefficient"],
+        STAGE_DE_SCAN_CONCORDANCE_RULE["feature_set"]) != (
+        STAGE_DE_CONCORDANCE_RULE["model"], STAGE_DE_CONCORDANCE_RULE["coefficient"],
+        STAGE_DE_CONCORDANCE_RULE["feature_set"]):
+    raise AssertionError("STAGE_DE_SCAN_CONCORDANCE_RULE must sit on STAGE_DE_CONCORDANCE_RULE's row")
+# The scan cells, filled on the rule row only (as `concordance`)
+STAGE_DE_SCAN_COLUMNS = ("scan_hits", "scan_hits_significant", "scan_detected", "scan_concordance")
 STAGE_DE_SUMMARY_COLUMNS = (
     "cohort", "omic", "model", "coefficient", "kind", "design_column", "feature_set", "n_tested", "n_padj_missing",
-    "n_significant", "min_padj", "interaction_detected", "delta_rejected", "concordance",
+    "n_significant", "min_padj", "interaction_detected", "delta_rejected", "concordance", *STAGE_DE_SCAN_COLUMNS,
 )
+
+
+def _stage_de_scan_cell(
+    hits: list[str], features: np.ndarray, significant: np.ndarray, detected: bool, *, cohort: str, omic: str,
+) -> dict:
+    """The scan cells of one rule row: hits read, hits also significant, the scan status and the cell.
+
+    ``features`` are the row's features (the exported set) and ``significant``
+    their significance under the row's test; every hit must be one of them.
+    """
+    kept = [str(f) for f in features]
+    known = set(kept)
+    missing = [h for h in hits if h not in known]
+    if missing:
+        raise ValueError(
+            f"the interaction scan of the analysis read names {omic} hit(s) {missing} that are not exported features "
+            f"of the {cohort} tables; the scan and the stage DE must come from the same export"
+        )
+    called = {f for f, sig in zip(kept, significant) if sig}
+    scan_detected = bool(hits)
+    return {
+        "scan_hits": len(hits),
+        "scan_hits_significant": sum(1 for h in hits if h in called),
+        "scan_detected": scan_detected,
+        "scan_concordance": "concordant" if scan_detected == bool(detected) else "discordant",
+    }
+
+
+def _stage_de_summary_frame(rows: list[dict], columns: Iterable[str]) -> pd.DataFrame:
+    """A summary table from its rows, the scan counts as nullable integers (filled on the rule row only)."""
+    frame = pd.DataFrame(rows, columns=list(columns))
+    for col in ("scan_hits", "scan_hits_significant"):
+        frame[col] = frame[col].astype("Int64")
+    return frame
+
+
+def _scan_hits_by_omic(record: dict) -> dict[str, list[str]] | None:
+    """The interaction-scan hits of an analysis record per omic (block), or ``None`` without a scan."""
+    if not _record_interaction_scan(record):
+        return None
+    hits: dict[str, list[str]] = {o: [] for o in ANALYSIS_BLOCKS}
+    for h in record["interaction_scan"].get("hits", []):
+        hits[h["block"]].append(str(h["feature"]))
+    return hits
 _STAGE_DE_OMICS = ("rna", "atac")
 _STAGE_DE_PSEUDOBULK_INPUTS = ("rna_counts.h5ad", "atac_counts.h5ad", "donor_table.csv", "manifest.json")
 _STAGE_DE_EXPORT_INPUTS = (
@@ -10845,9 +11423,12 @@ def _stage_de_prepare(
     )["delta_rejected"]
     if delta_rejected is None:
         raise ValueError(f"{an_dir / 'result.json'} has no delta p-value; rerun `sead-sexdiff analyze`")
+    scan_hits = _scan_hits_by_omic(reference["record"])
     return {
         "paths": paths, "hashes": hashes, "cell_type_findings": cell_type_findings, "loaded": loaded,
         "reference": reference, "delta_rejected": delta_rejected, "donor_exclusion": exclusion,
+        "scan_hits": scan_hits,
+        "scan_p": None if scan_hits is None else reference["record"]["interaction_scan"][INTERACTION_SCAN_STATISTIC],
         "donors": donors, "cells": cells, "k": k, "features": features, "feature_sets": feature_sets,
         "designs": designs, "design_checks": design_checks, "counts": counts, "exported": exported,
         "reproduction": reproduction,
@@ -10924,8 +11505,15 @@ def _stage_de_model_state(omic_dir: Path, model: str, fingerprint: dict) -> str:
     return "complete"
 
 
-def _stage_de_summary_rows(cohort: str, omic: str, tables: dict[str, dict[str, pd.DataFrame]], delta_rejected: bool) -> list[dict]:
-    """Summary rows of one omic: per model × coefficient (and the union of a two-coefficient model) × feature set."""
+def _stage_de_summary_rows(
+    cohort: str, omic: str, tables: dict[str, dict[str, pd.DataFrame]], delta_rejected: bool,
+    scan_hits: list[str] | None = None,
+) -> list[dict]:
+    """Summary rows of one omic: per model × coefficient (and the union of a two-coefficient model) × feature set.
+
+    ``scan_hits`` (the analysis read's interaction-scan hits in this omic)
+    fills the scan cells of the rule row (``STAGE_DE_SCAN_CONCORDANCE_RULE``).
+    """
     rule = STAGE_DE_CONCORDANCE_RULE
     rows = []
     for model, spec in STAGE_DE_MODELS.items():
@@ -10955,12 +11543,17 @@ def _stage_de_summary_rows(cohort: str, omic: str, tables: dict[str, dict[str, p
                     "n_padj_missing": int((~finite).all(axis=1).sum()), "n_significant": int(significant.sum()),
                     "min_padj": float(np.min(p[finite])) if finite.any() else float("nan"),
                     "interaction_detected": None, "delta_rejected": None, "concordance": None,
+                    **{col: None for col in STAGE_DE_SCAN_COLUMNS},
                 }
                 if (model, label, feature_set) == (rule["model"], rule["coefficient"], rule["feature_set"]):
                     detected = row["n_significant"] > 0
                     row["interaction_detected"] = detected
                     row["delta_rejected"] = bool(delta_rejected)
                     row["concordance"] = "concordant" if detected == bool(delta_rejected) else "discordant"
+                    if scan_hits is not None:
+                        row.update(_stage_de_scan_cell(
+                            scan_hits, np.asarray(features)[keep], significant, detected, cohort=cohort, omic=omic,
+                        ))
                 rows.append(row)
     return rows
 
@@ -11030,6 +11623,26 @@ def render_stage_de(summary: pd.DataFrame, manifest: dict) -> str:
             f"| {o} | {'yes' if cell['interaction_detected'] else 'no'} | {cell['n_interaction_exported']} | "
             f"{'yes' if cell['delta_rejected'] else 'no'} | {cell['cell']} |"
         )
+    if any("scan" in cell for cell in manifest["concordance"].values()):
+        scan_rule = manifest.get("scan_concordance_rule", STAGE_DE_SCAN_CONCORDANCE_RULE)
+        lines += [
+            "",
+            "## Scan concordance",
+            "",
+            f"Rule (`STAGE_DE_SCAN_CONCORDANCE_RULE`, predeclared): `scan_detected` = {scan_rule['scan_detected']}; "
+            f"`interaction_detected` as above; {scan_rule['overlap']}; {scan_rule['cell']}.",
+            "",
+            "| omic | scan hits | hits with interaction padj ≤ α | scan detected | interaction detected | cell |",
+            "|---|---:|---:|:---:|:---:|---|",
+        ]
+        for o, cell in manifest["concordance"].items():
+            scan = cell.get("scan")
+            if scan is None:
+                continue
+            lines.append(
+                f"| {o} | {len(scan['hits'])} | {scan['hits_significant']} | {'yes' if scan['detected'] else 'no'} | "
+                f"{'yes' if cell['interaction_detected'] else 'no'} | {scan['cell']} |"
+            )
     for o in manifest["omics"]:
         sub = summary[summary["omic"] == o]
         lines += [
@@ -11414,8 +12027,11 @@ def run_stage_de(
                 }
         rows = []
         for o in included:
-            rows += _stage_de_summary_rows(c, o, tables[o], prep["delta_rejected"])
-        summary = pd.DataFrame(rows, columns=list(STAGE_DE_SUMMARY_COLUMNS))
+            rows += _stage_de_summary_rows(
+                c, o, tables[o], prep["delta_rejected"],
+                scan_hits=None if prep["scan_hits"] is None else prep["scan_hits"][o],
+            )
+        summary = _stage_de_summary_frame(rows, STAGE_DE_SUMMARY_COLUMNS)
         rule = STAGE_DE_CONCORDANCE_RULE
         concordance, findings = {}, list(prep["cell_type_findings"])
         for o in included:
@@ -11429,6 +12045,24 @@ def run_stage_de(
                 "delta_rejected": bool(cell["delta_rejected"]),
                 "cell": str(cell["concordance"]),
             }
+            if prep["scan_hits"] is not None:
+                concordance[o]["scan"] = {
+                    "detected": bool(cell["scan_detected"]),
+                    "hits": list(prep["scan_hits"][o]),
+                    "hits_significant": int(cell["scan_hits_significant"]),
+                    "cell": str(cell["scan_concordance"]),
+                }
+                if concordance[o]["scan"]["cell"] == "discordant":
+                    findings.append(
+                        f"{c} {o}: scan concordance cell discordant: the interaction scan of the analysis read has "
+                        f"{len(prep['scan_hits'][o])} {o} hit(s) ({', '.join(prep['scan_hits'][o]) or 'none'}) and "
+                        f"{concordance[o]['n_interaction_exported']} exported {o} feature(s) have padj <= "
+                        f"{STAGE_DE_ALPHA} on an interaction coefficient of {rule['model']} "
+                        f"({concordance[o]['scan']['hits_significant']} of the hits among them); a finding, never a "
+                        "result: the two ask related, not identical, questions (familywise over the exported "
+                        "z-scored log2-CPM features with a permutation null and both nuclei counts, against BH FDR on "
+                        "raw counts with the omic's own), and agreement would not be replication"
+                    )
             if concordance[o]["cell"] == "discordant":
                 if concordance[o]["interaction_detected"]:
                     what = (
@@ -11508,6 +12142,9 @@ def run_stage_de(
                 "files": reference["files"],
                 "result_sha256": reference["files"]["result.json"]["sha256"],
                 "delta_rejected": prep["delta_rejected"],
+                "interaction_scan": None if prep["scan_hits"] is None else {
+                    "p_value_global": prep["scan_p"], "hits": prep["scan_hits"],
+                },
                 "alpha": ANALYSIS_ALPHA,
                 "rejection_rule": ANALYSIS_REJECTION_RULE,
                 "component_selection": ref_record["latent"]["component_selection"],
@@ -11517,7 +12154,8 @@ def run_stage_de(
                 "permutations": reference["manifest"]["measurement"]["permutations"],
                 "note": (
                     "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection), never rerun "
-                    "or modified; only its delta rejection status enters the concordance rule"
+                    "or modified; only its delta rejection status and its interaction-scan hits enter the "
+                    "concordance rules"
                 ),
             },
             "models": {
@@ -11595,6 +12233,7 @@ def run_stage_de(
             },
             "tables": {o: {m: records[o][m]["tables"] for m in STAGE_DE_MODELS} for o in included},
             "concordance_rule": dict(STAGE_DE_CONCORDANCE_RULE),
+            "scan_concordance_rule": dict(STAGE_DE_SCAN_CONCORDANCE_RULE),
             "concordance": concordance,
             "run": {"omics_fitted": [f"{o}/{m}" for o, m in fitted], "skipped": [f"{o}/{m}" for o, m in skipped],
                     "n_cpus": n_cpus},
@@ -11722,6 +12361,31 @@ if not (
     raise AssertionError(
         "STAGE_DE_LIMMA_CONCORDANCE_RULE must name the factor interaction model's joint test on the exported set"
     )
+# Written before any real-label scan (proposal of mtg-interaction-scan); the
+# scan cell beside the limma delta cell, on STAGE_DE_LIMMA_CONCORDANCE_RULE's
+# row; reported beside the DESeq2 scan cell, a disagreement between the two
+# scan cells a method-dependence finding. Flag and ask before changing.
+STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE: dict[str, str] = {
+    "model": STAGE_DE_LIMMA_CONCORDANCE_RULE["model"],
+    "test": STAGE_DE_LIMMA_CONCORDANCE_RULE["test"],
+    "feature_set": STAGE_DE_LIMMA_CONCORDANCE_RULE["feature_set"],
+    "scan_detected": STAGE_DE_SCAN_CONCORDANCE_RULE["scan_detected"],
+    "interaction_detected": STAGE_DE_LIMMA_CONCORDANCE_RULE["interaction_detected"],
+    "overlap": (
+        "scan_hits_significant: the hits with adj.P.Val <= STAGE_DE_ALPHA on interaction_joint; every hit must be an "
+        "exported feature of the tables"
+    ),
+    "cell": STAGE_DE_SCAN_CONCORDANCE_RULE["cell"],
+    "beside": (
+        "reported beside the DESeq2 scan cell (STAGE_DE_SCAN_CONCORDANCE_RULE); neither replaces the other or the "
+        "delta cells, and a disagreement between the two scan cells is a method-dependence finding"
+    ),
+}
+if (STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE["model"], STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE["test"],
+        STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE["feature_set"]) != (
+        STAGE_DE_LIMMA_CONCORDANCE_RULE["model"], STAGE_DE_LIMMA_CONCORDANCE_RULE["test"],
+        STAGE_DE_LIMMA_CONCORDANCE_RULE["feature_set"]):
+    raise AssertionError("STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE must sit on STAGE_DE_LIMMA_CONCORDANCE_RULE's row")
 # The step's TMM factors (edgeR, in R) against the export manifest's, absolute;
 # the tolerance of scripts/check_tmm_edger.R. Beyond it the cohort stops.
 STAGE_DE_LIMMA_TMM_ATOL = 1e-8
@@ -11744,6 +12408,7 @@ STAGE_DE_LIMMA_COMPARISON_COLUMNS = (
     "n_significant_deseq2", "n_significant_limma", "n_both", "n_only_deseq2", "n_only_limma", "detected_deseq2",
     "detected_limma", "detection_agrees", "spearman_log2fc", "spearman_stat", "n_compared", "delta_rejected",
     "concordance_deseq2", "concordance_limma", "methods_agree",
+    "scan_detected", "scan_concordance_deseq2", "scan_concordance_limma",
 )
 _STAGE_DE_LIMMA_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
 
@@ -12209,8 +12874,11 @@ def _stage_de_limma_deseq2_reference(
     summary = pd.read_csv(d / STAGE_DE_SUMMARY, dtype={"design_column": str}, float_precision="round_trip")
     rows = []
     for o in _STAGE_DE_OMICS:
-        rows += _stage_de_summary_rows(cohort, o, tables[o], prep["delta_rejected"])
-    recomputed = pd.DataFrame(rows, columns=list(STAGE_DE_SUMMARY_COLUMNS))
+        rows += _stage_de_summary_rows(
+            cohort, o, tables[o], prep["delta_rejected"],
+            scan_hits=None if prep["scan_hits"] is None else prep["scan_hits"][o],
+        )
+    recomputed = _stage_de_summary_frame(rows, STAGE_DE_SUMMARY_COLUMNS)
     keys = ["omic", "model", "coefficient", "feature_set"]
     merged = recomputed.merge(summary, on=keys, how="outer", suffixes=("_now", "_file"), indicator=True)
     bad = merged[merged["_merge"] != "both"]
@@ -12242,6 +12910,20 @@ def _stage_de_limma_deseq2_reference(
                 f"{now}; {rerun}"
             )
         cells[o] = {**now, "n_interaction_exported": int(r["n_significant_now"])}
+        if prep["scan_hits"] is not None:
+            scan_now = {"detected": bool(r["scan_detected_now"]), "hits_significant": int(r["scan_hits_significant_now"]),
+                        "cell": str(r["scan_concordance_now"])}
+            scan_file = {"detected": str(r.get("scan_detected_file")) == "True",
+                         "hits_significant": None if pd.isna(r.get("scan_hits_significant_file"))
+                         else int(r["scan_hits_significant_file"]),
+                         "cell": str(r.get("scan_concordance_file"))}
+            recorded_scan = (recorded_cell.get("scan") or {})
+            if scan_now != scan_file or recorded_scan.get("cell") != scan_now["cell"]:
+                raise ValueError(
+                    f"{d / STAGE_DE_SUMMARY} or {manifest_path} gives the {o} scan concordance cell {scan_file} but "
+                    f"the tables and the analysis read give {scan_now}; {rerun}"
+                )
+            cells[o]["scan"] = {**scan_now, "hits": list(prep["scan_hits"][o])}
     return {
         "dir": d, "manifest": manifest, "files": files, "tables": tables, "summary": recomputed, "concordance": cells,
         "manifest_sha256": files[STAGE_DE_MANIFEST], "summary_sha256": files[STAGE_DE_SUMMARY],
@@ -12251,8 +12933,13 @@ def _stage_de_limma_deseq2_reference(
 
 def _stage_de_limma_summary_rows(
     cohort: str, omic: str, tables: dict[str, dict[str, pd.DataFrame]], delta_rejected: bool,
+    scan_hits: list[str] | None = None,
 ) -> list[dict]:
-    """Summary rows of one omic: per model × moderated t, joint F and union × feature set."""
+    """Summary rows of one omic: per model × moderated t, joint F and union × feature set.
+
+    ``scan_hits`` fills the scan cells of the rule row
+    (``STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE``).
+    """
     rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
     rows = []
     for model, spec in STAGE_DE_MODELS.items():
@@ -12286,12 +12973,17 @@ def _stage_de_limma_summary_rows(
                     "n_padj_missing": int((~finite).all(axis=1).sum()), "n_significant": int(significant.sum()),
                     "min_padj": float(np.min(p[finite])) if finite.any() else float("nan"),
                     "interaction_detected": None, "delta_rejected": None, "concordance": None,
+                    **{col: None for col in STAGE_DE_SCAN_COLUMNS},
                 }
                 if (model, label, feature_set) == (rule["model"], rule["test"], rule["feature_set"]):
                     detected = row["n_significant"] > 0
                     row["interaction_detected"] = detected
                     row["delta_rejected"] = bool(delta_rejected)
                     row["concordance"] = "concordant" if detected == bool(delta_rejected) else "discordant"
+                    if scan_hits is not None:
+                        row.update(_stage_de_scan_cell(
+                            scan_hits, np.asarray(features)[keep], significant, detected, cohort=cohort, omic=omic,
+                        ))
                 rows.append(row)
     return rows
 
@@ -12345,6 +13037,7 @@ def _stage_de_limma_comparison_rows(
                     "detected_limma": bool(ls.any()), "detection_agrees": bool(ds.any()) == bool(ls.any()),
                     "spearman_log2fc": None, "spearman_stat": None, "n_compared": None,
                     "delta_rejected": None, "concordance_deseq2": None, "concordance_limma": None, "methods_agree": None,
+                    "scan_detected": None, "scan_concordance_deseq2": None, "scan_concordance_limma": None,
                 }
                 if coef is not None:
                     dt, lt = deseq2[model][coef], limma[model][coef]
@@ -12367,6 +13060,12 @@ def _stage_de_limma_comparison_rows(
                         "concordance_limma": concordance["limma"]["cell"],
                         "methods_agree": concordance["methods_agree"],
                     })
+                    if concordance.get("scan") is not None:
+                        row.update({
+                            "scan_detected": concordance["scan"]["detected"],
+                            "scan_concordance_deseq2": concordance["scan"]["deseq2_cell"],
+                            "scan_concordance_limma": concordance["scan"]["limma_cell"],
+                        })
                 rows.append(row)
     return rows
 
@@ -12440,6 +13139,27 @@ def render_stage_de_limma(summary: pd.DataFrame, comparison: pd.DataFrame, manif
             f"{cell['limma']['n_interaction_exported']} | {cell['limma']['cell']} | "
             f"{'yes' if cell['delta_rejected'] else 'no'} | {'yes' if cell['methods_agree'] else 'no'} |"
         )
+    if any("scan" in cell for cell in manifest["concordance"].values()):
+        scan_rule = manifest.get("scan_concordance_rule", STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE)
+        lines += [
+            "",
+            "## Scan concordance",
+            "",
+            f"Rule (`STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE`, predeclared): `scan_detected` = "
+            f"{scan_rule['scan_detected']}; {scan_rule['overlap']}; {scan_rule['cell']}; {scan_rule['beside']}.",
+            "",
+            "| omic | scan hits | DESeq2: hits with union padj ≤ α | DESeq2 scan cell | limma: hits with "
+            "interaction_joint adj. p ≤ α | limma scan cell | methods agree |",
+            "|---|---:|---:|---|---:|---|:---:|",
+        ]
+        for o, cell in manifest["concordance"].items():
+            scan = cell.get("scan")
+            if scan is None:
+                continue
+            lines.append(
+                f"| {o} | {len(scan['hits'])} | {scan['deseq2_hits_significant']} | {scan['deseq2_cell']} | "
+                f"{scan['limma_hits_significant']} | {scan['limma_cell']} | {'yes' if scan['methods_agree'] else 'no'} |"
+            )
     kind_label = {"moderated_t": "moderated t", "joint_f": "joint F", "union": "union (no joint error rate)"}
     for o in manifest["omics"]:
         sub = summary[summary["omic"] == o]
@@ -12848,8 +13568,11 @@ def run_stage_de_limma(
                     }
             rows = []
             for o in included:
-                rows += _stage_de_limma_summary_rows(c, o, tables[o], prep["delta_rejected"])
-            summary = pd.DataFrame(rows, columns=list(STAGE_DE_LIMMA_SUMMARY_COLUMNS))
+                rows += _stage_de_limma_summary_rows(
+                    c, o, tables[o], prep["delta_rejected"],
+                    scan_hits=None if prep["scan_hits"] is None else prep["scan_hits"][o],
+                )
+            summary = _stage_de_summary_frame(rows, STAGE_DE_LIMMA_SUMMARY_COLUMNS)
             rule = STAGE_DE_LIMMA_CONCORDANCE_RULE
             concordance, findings = {}, list(prep["cell_type_findings"]) + list(prep["deseq2"]["cell_type_findings"])
             for o in included:
@@ -12869,6 +13592,37 @@ def run_stage_de_limma(
                     "limma": limma_cell,
                     "methods_agree": deseq2_cell["interaction_detected"] == limma_cell["interaction_detected"],
                 }
+                if prep["scan_hits"] is not None:
+                    d_scan = deseq2_cell.get("scan")
+                    if d_scan is None:
+                        raise ValueError(
+                            f"the DESeq2 outputs of {c} carry no scan concordance cell for {o} but the analysis read "
+                            "carries the interaction scan; rerun `sead-sexdiff stage-de` on this analysis"
+                        )
+                    scan = {
+                        "detected": bool(cell["scan_detected"]),
+                        "hits": list(prep["scan_hits"][o]),
+                        "deseq2_cell": d_scan["cell"],
+                        "deseq2_hits_significant": d_scan["hits_significant"],
+                        "limma_cell": str(cell["scan_concordance"]),
+                        "limma_hits_significant": int(cell["scan_hits_significant"]),
+                    }
+                    scan["methods_agree"] = scan["deseq2_cell"] == scan["limma_cell"]
+                    concordance[o]["scan"] = scan
+                    if scan["limma_cell"] == "discordant":
+                        findings.append(
+                            f"{c} {o}: limma scan concordance cell discordant: the interaction scan of the analysis "
+                            f"read has {len(scan['hits'])} {o} hit(s) ({', '.join(scan['hits']) or 'none'}) and "
+                            f"{limma_cell['n_interaction_exported']} exported {o} feature(s) have adj. p <= "
+                            f"{STAGE_DE_ALPHA} on {rule['test']} ({scan['limma_hits_significant']} of the hits among "
+                            "them); a finding, never a result"
+                        )
+                    if not scan["methods_agree"]:
+                        findings.append(
+                            f"{c} {o}: method dependence of the scan concordance cells: DESeq2 {scan['deseq2_cell']}, "
+                            f"limma {scan['limma_cell']}; neither cell replaces the other, and the scan, the DESeq2 "
+                            "outputs and the primary analysis are unchanged"
+                        )
                 if limma_cell["cell"] == "discordant":
                     if limma_cell["interaction_detected"]:
                         what = (
@@ -12974,6 +13728,9 @@ def run_stage_de_limma(
                     "files": reference["files"],
                     "result_sha256": reference["files"]["result.json"]["sha256"],
                     "delta_rejected": prep["delta_rejected"],
+                    "interaction_scan": None if prep["scan_hits"] is None else {
+                        "p_value_global": prep["scan_p"], "hits": prep["scan_hits"],
+                    },
                     "alpha": ANALYSIS_ALPHA,
                     "rejection_rule": ANALYSIS_REJECTION_RULE,
                     "component_selection": ref_record["latent"]["component_selection"],
@@ -12983,7 +13740,8 @@ def run_stage_de_limma(
                     "permutations": reference["manifest"]["measurement"]["permutations"],
                     "note": (
                         "read and checked (export hashes, MOTCO version, seed, permutations, rank floor, residual correction, CV selection), never "
-                        "rerun or modified; only its delta rejection status enters the concordance rules"
+                        "rerun or modified; only its delta rejection status and its interaction-scan hits enter "
+                        "the concordance rules"
                     ),
                 },
                 "models": {
@@ -13062,6 +13820,8 @@ def run_stage_de_limma(
                 "tables": {o: {m: records[o][m]["tables"] for m in STAGE_DE_MODELS} for o in included},
                 "concordance_rule": dict(STAGE_DE_LIMMA_CONCORDANCE_RULE),
                 "deseq2_concordance_rule": dict(STAGE_DE_CONCORDANCE_RULE),
+                "scan_concordance_rule": dict(STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE),
+                "deseq2_scan_concordance_rule": dict(STAGE_DE_SCAN_CONCORDANCE_RULE),
                 "concordance": concordance,
                 "run": {"omics_fitted": [f"{o}/{m}" for o, m in fitted], "skipped": [f"{o}/{m}" for o, m in skipped]},
                 "outputs": sorted([STAGE_DE_LIMMA_SUMMARY, STAGE_DE_LIMMA_COMPARISON, STAGE_DE_LIMMA_MARKDOWN,
@@ -14189,6 +14949,7 @@ def render_exclusion_sensitivity(
                 f"{_fmt(r[f'{s}_null_sd'])} | {_fmt(r[f'{s}_null_q95'])} |"
             )
     lines += _render_split_table(rows, label="variant")
+    lines += _render_scan_table(rows, label="variant")
     lines += [
         "",
         "## Runs",
@@ -14394,6 +15155,7 @@ def run_exclusion_sensitivity(
     params = TrajectoryAnalysisParams(
         permutations=ANALYSIS_PERMUTATIONS, seed=ANALYSIS_SEED, n_jobs=n_jobs, min_components=ANALYSIS_RANK_FLOOR,
         residual_correction=ANALYSIS_RESIDUAL_CORRECTION, span_split_test=ANALYSIS_SPAN_SPLIT_TEST,
+        interaction_scan=ANALYSIS_INTERACTION_SCAN,
     )
     print(f"[{log}] MOTCO {motco_version}")
     print(f"[{log}] Cell type: {cell_type}")
@@ -14642,6 +15404,10 @@ def run_exclusion_sensitivity(
                 findings += _split_dependence_findings(
                     ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
                     kind="cohort dependence of the split test",
+                )
+                findings += _scan_dependence_findings(
+                    ref_record, var_record, label=f"the {v} analysis", reference="the primary analysis",
+                    kind="cohort dependence of the scan",
                 )
                 findings.append(
                     f"axis check {'holds' if a['holds'] else 'does not hold'} in {c} ({a['reading']}, role {a['role']}): "
