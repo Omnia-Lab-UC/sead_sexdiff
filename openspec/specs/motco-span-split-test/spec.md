@@ -75,11 +75,15 @@ The tables are `rank_sensitivity.csv`, `sensitivity.csv`, `latent_sensitivity.cs
 - **THEN** the `latent_adjusted` row's split cells are empty and the `extended_covariates` row's are filled
 
 ### Requirement: Complement is the one confirmatory part
-The `complement` part's pseudo-F p-value SHALL be the split test's only confirmatory reading. It is read at `ANALYSIS_ALPHA` under `ANALYSIS_REJECTION_RULE` (p ≤ 0.05), unadjusted. No adjustment SHALL be made across `delta`, `angle`, `shape` and the complement, or across cohorts and cell types. The report SHALL state that each primary carries four tests read at α. This policy is predeclared and SHALL NOT be changed from results.
+The `complement` part's pseudo-F p-value SHALL be the split test's only confirmatory reading. It is read at `ANALYSIS_ALPHA` under `ANALYSIS_REJECTION_RULE` (p ≤ 0.05), unadjusted. No adjustment SHALL be made across `delta`, `angle`, `shape`, the complement and the interaction scan's global p-value (spec `motco-interaction-scan`), or across cohorts and cell types. The report SHALL state that each primary carries five tests read at α. This policy is predeclared and SHALL NOT be changed from results.
 
 #### Scenario: Complement rejected in a primary
 - **WHEN** the `cohort_30` primary of a cell type has a complement pseudo-F p-value ≤ 0.05
 - **THEN** the report gives it as that cell type's split-test result under the reading requirement, whatever `total` and `span` read
+
+#### Scenario: Five tests stated
+- **WHEN** the report gives a primary's results
+- **THEN** it states that the primary carries five tests read at α with no adjustment across them: `delta`, `angle`, `shape`, the complement and the scan
 
 ### Requirement: Span part is a concordance cell
 The `span` part's status (pseudo-F p ≤ α) SHALL be compared with whether any of `delta`, `angle` and `shape` is rejected in the same analysis. The two agree or the cell is discordant. A discordance in either direction SHALL be reported as a finding, never as a result, and SHALL change no reading.
