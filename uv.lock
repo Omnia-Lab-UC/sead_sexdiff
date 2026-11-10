@@ -644,7 +644,7 @@ wheels = [
 
 [[package]]
 name = "motco"
-version = "0.18.0"
+version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
@@ -656,9 +656,9 @@ dependencies = [
     { name = "scipy-stubs" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6c/53/250973a06793ee1c46f896efed84c20c81c38f60df800064fa3e9a9679ff/motco-0.18.0.tar.gz", hash = "sha256:e583b40ae763eec2cadac30dd04e51decc7bf30c266d9a6c4b69afd61fa77088", size = 1669442, upload-time = "2026-11-05T23:20:15.693Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/aa/c82c77f021923dc7b42cc6d4a828f8c360afecc85c196f66e79de54120ee/motco-0.20.0.tar.gz", hash = "sha256:8c2588056c9f5c378f7308d09408f5b2424dfbf8ce5005e53cb4883400c1c472", size = 1675860, upload-time = "2026-11-10T17:56:49.612Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/64/8cabcc2c4c2130fa2bc4fcf027fd307d27e8ede9a7100307922ad6bd4971/motco-0.18.0-py3-none-any.whl", hash = "sha256:b142a095c9fd68331bee69c70d64dbcf2c58e53cf37cf1be50f2bd1c8af951ed", size = 1675030, upload-time = "2026-11-05T23:20:14.054Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/30/b115fb4cbc62c2a921a08a2fd80c7be94097f032883585b56e0e40fe093d/motco-0.20.0-py3-none-any.whl", hash = "sha256:d4248a8e19fd65f86db07e3296a320dac837565889d3db0f94d57b6f4d191823", size = 1681221, upload-time = "2026-11-10T17:56:47.739Z" },
 ]
 
 [[package]]
@@ -1311,7 +1311,7 @@ requires-dist = [
     { name = "decoupler", specifier = ">=2.1.2" },
     { name = "hatchling", specifier = "==1.28.0" },
     { name = "matplotlib", specifier = "==3.10.7" },
-    { name = "motco", specifier = "==0.18.0" },
+    { name = "motco", specifier = "==0.20.0" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pandas-stubs", specifier = "==2.3.3.251201" },

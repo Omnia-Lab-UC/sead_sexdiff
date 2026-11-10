@@ -45,6 +45,7 @@ from .data import (
     ANALYSIS_ALPHA,
     ANALYSIS_BLOCKS,
     ANALYSIS_FORCED_RANKS,
+    ANALYSIS_INTERACTION_SCAN,
     ANALYSIS_PERMUTATIONS,
     ANALYSIS_RANK_FLOOR,
     ANALYSIS_RESIDUAL_CORRECTION,
@@ -62,6 +63,9 @@ from .data import (
     DONOR_EXCLUSION_MANIFEST,
     DONOR_EXCLUSION_VARIANTS,
     EXPORT_COHORTS,
+    INTERACTION_SCAN_POWER_STATEMENT,
+    INTERACTION_SCAN_STATISTIC,
+    INTERACTION_SCAN_TABLE,
     LATENT_SENSITIVITY_ANALYSIS_DIR,
     LATENT_SENSITIVITY_ARMS,
     LATENT_SENSITIVITY_COMPARISON_DIR,
@@ -101,6 +105,7 @@ from .data import (
     TECHNICAL_GENE_SETS,
     TECHNICAL_OUTPUTS,
     _git_revision,
+    _interaction_scan_status,
     _sha256_file,
     _span_split_status,
     cell_type_dirs,
@@ -134,6 +139,8 @@ FIGURE_PREPROCESSING_ROOT = Path("results/motco_sensitivity")
 # Scatter layers with more offsets than this are embedded as images in the
 # PDF and SVG files (at FIGURE_DPI); axes, text, lines and smaller layers stay vector
 FIGURE_RASTER_MIN_POINTS = 500
+# Figure 12 (a): the smallest adjusted p-values drawn per block and primary
+FIGURE_SCAN_TOP_N = 50
 FIGURE_DPI = 200
 FIGURE_FORMATS = ("png", "pdf", "svg")
 FIGURE_SVG_HASHSALT = "sead-sexdiff"
@@ -267,8 +274,9 @@ FIGURE_READING_RULES: dict[str, str] = {
     "span_split": (
         "MOTCO's split interaction test splits the group x stage interaction energy of the analysed features into the "
         "fitted stage-PLS span, its orthogonal complement and all of it. Only the complement is confirmatory: its "
-        "pseudo-F p-value is read at alpha = 0.05, unadjusted (no adjustment across delta, angle, shape and the "
-        "complement, so each primary carries four tests read at alpha), and each cell type's cohort_30 primary gives "
+        "pseudo-F p-value is read at alpha = 0.05, unadjusted (no adjustment across delta, angle, shape, the "
+        "complement and the interaction scan, so each primary carries five tests read at alpha), and each cell type's "
+        "cohort_30 primary gives "
         "the result; a complement status that differs from the primary's elsewhere is rank, preprocessing, "
         "covariate-set or cohort dependence. The span part is a concordance cell against any of delta, angle and "
         "shape rejected in the same analysis, a discordance a finding and never a result; total, the in-span share "
@@ -281,6 +289,26 @@ FIGURE_READING_RULES: dict[str, str] = {
         "this configuration (complement 0.012); for cohort_50, microglia, the eight-covariate arm, the exclusion "
         "variants, the forced ranks and the preprocessing variants it is inferred. The test is not available with a "
         "latent adjustment."
+    ),
+    "interaction_scan": (
+        "MOTCO's per-feature interaction scan tests each analysed feature's group x stage interaction F with the "
+        "covariate-adjusted models, combined by the maximum F. Its global p-value is the one confirmatory reading, "
+        "read at alpha = 0.05, unadjusted (no adjustment across delta, angle, shape, the complement and the scan, so "
+        "each primary carries five tests read at alpha); a hit is a feature with step-down max-T adjusted p <= 0.05 "
+        "(familywise over the scanned features), and a rejection comes with at least one hit. Each cell type's "
+        "cohort_30 primary gives the result; a scan status that differs elsewhere is preprocessing, covariate-set or "
+        "cohort dependence, and the forced ranks and the latent-adjusted arms equal their reference by construction "
+        "(the scan reads neither the latent space nor the bootstrap). A hit names a feature whose covariate-adjusted "
+        "sex difference changes across stages: a detection, not a driver (correlated neighbours can be hits too), with "
+        "no geometry, trajectory or attribution, changing no reading of delta, angle, shape or the complement; the "
+        "per-feature F values, the per-stage differences and the null-maximum shares are reported and not read. A "
+        "non-rejection of the astrocyte cohort_30 primary carries MOTCO's power on that export (a 20-feature ramp in "
+        "one sex detected in 1.000 of replicates at 3 within-stage SDs, 0.692 at 2), which excludes neither smaller "
+        "effects, nor effects spread thinly over many features, nor other shapes; every other non-rejection is "
+        "uninformative. Size was measured on real noise only for the astrocyte cohort_30 export at six covariates "
+        "(global 0.042, familywise 0.042); elsewhere it is inferred. The null maxima lean on ATAC there (0.618 of them "
+        "with half the features), and the F is the plain, unmoderated per-feature F. The scan concordance cells beside "
+        "the stage DE are findings when discordant, never results."
     ),
 }
 
@@ -416,6 +444,8 @@ def _measurement(record: dict) -> dict:
         "seed": params.get("seed"),
         "span_split_test": bool(params.get("span_split_test", False)),
         "span_split_present": isinstance(record.get("span_split"), dict),
+        "interaction_scan": bool(params.get("interaction_scan", False)),
+        "interaction_scan_present": isinstance(record.get("interaction_scan"), dict),
     }
 
 
@@ -625,6 +655,10 @@ def check_consistency(reader: FigureReader) -> dict:
                         if want else "no split test (not available with a latent adjustment)")
             errors.append(f"{path}: params.span_split_test is {m['span_split_test']}, span_split block "
                           f"{'present' if m['span_split_present'] else 'absent'}; expected {expected}")
+        if (m["interaction_scan"], m["interaction_scan_present"]) != (ANALYSIS_INTERACTION_SCAN, ANALYSIS_INTERACTION_SCAN):
+            errors.append(f"{path}: params.interaction_scan is {m['interaction_scan']}, interaction_scan block "
+                          f"{'present' if m['interaction_scan_present'] else 'absent'}; expected the interaction scan "
+                          "(params.interaction_scan = true and an interaction_scan block; ANALYSIS_INTERACTION_SCAN)")
     if errors:
         shown = errors[:40]
         more = f"; ... and {len(errors) - len(shown)} more" if len(errors) > len(shown) else ""
@@ -1849,7 +1883,8 @@ def _draw_span_split(r: FigureReader) -> tuple[Figure, dict]:
                    f"analyses carrying it; only each cell type's {FIGURE_COHORT} primary complement is confirmatory")
     fig.tight_layout(rect=(0, 0.05, 1, 0.965))
     fig.legend(handles=legend, loc="lower center", ncol=len(legend), bbox_to_anchor=(0.5, 0.012))
-    _footnote(fig, "Only the complement is confirmatory (p ≤ α, unadjusted; each primary carries four tests read at α); "
+    _footnote(fig, "Only the complement is confirmatory (p ≤ α, unadjusted; each primary carries five tests read at α, "
+                   "with the interaction scan); "
                    "the span part is a concordance cell against any of delta, angle and shape rejected; total and the "
                    "in-span share are reported and not read; every analysis other than the primaries is sensitivity, a "
                    "differing complement status being rank, preprocessing, covariate-set or cohort dependence; a "
@@ -1899,6 +1934,241 @@ def _caption_span_split(v: dict) -> str:
     parts.append(f"Complement p <= {ANALYSIS_ALPHA}: {'; '.join(v['complement_rejected']) or 'none'}. Discordant span "
                  f"cells: {'; '.join(v['discordant']) or 'none'}. In-span share over the analyses drawn "
                  f"{v['share_range'][0]:.4f}–{v['share_range'][1]:.4f}.")
+    return " ".join(parts)
+
+
+def _scan_reference(a: dict) -> tuple[str, str] | None:
+    """The (family, label) a registered analysis's scan equals by construction, or ``None``.
+
+    A forced rank equals its cell type and cohort's primary (the scan does not
+    read the latent rank); a latent arm with a latent adjustment equals the arm
+    without one (the scan reads neither the latent basis nor the bootstrap).
+    """
+    if a["family"] == "forced rank":
+        return ("primary", "primary")
+    if a["family"] == "latent" and LATENT_SENSITIVITY_ARMS[a["label"]].get("latent_adjustment") is not None:
+        plain = [arm for arm, spec in LATENT_SENSITIVITY_ARMS.items() if spec.get("latent_adjustment") is None]
+        return ("latent", plain[0])
+    return None
+
+
+def _scan_table(r: FigureReader, directory: Path, record: dict) -> pd.DataFrame:
+    """An analysis's ``interaction_scan.csv``, bound to its record (rows and hits) or the run stops."""
+    path = directory / INTERACTION_SCAN_TABLE
+    table = r.csv(path, dtype={"feature": str, "block": str})
+    scan = record["interaction_scan"]
+    hits = table[(~table["degenerate"].astype(bool)) & (table["p_value_adjusted"] <= ANALYSIS_ALPHA)]
+    if len(table) != scan["n_features"] or len(hits) != len(scan.get("hits", [])) or set(
+            zip(hits["block"], hits["feature"])) != {(h["block"], h["feature"]) for h in scan.get("hits", [])}:
+        raise ValueError(f"{path} has {len(table)} rows and {len(hits)} hit(s) but {directory / _RESULT} records "
+                         f"{scan['n_features']} features and {len(scan.get('hits', []))} hit(s); nothing was written")
+    return table
+
+
+def _draw_interaction_scan(r: FigureReader) -> tuple[Figure, dict]:
+    rows, primaries, records, tables = [], [], {}, {}
+    analyses = registered_analyses()
+    for a in analyses:
+        rec = r.result(a["dir"] / _RESULT)
+        man = r.manifest(a["dir"] / _ANALYSIS_MANIFEST, a["cell_type"])
+        status = _interaction_scan_status(rec, alpha=ANALYSIS_ALPHA)
+        if status is None:
+            raise ValueError(f"{a['dir'] / _RESULT} carries no interaction scan; run `sead-sexdiff {a['command']}`")
+        records[(a["cell_type"], a["family"], a["label"], a["cohort"])] = rec
+        rows.append({**{k: a[k] for k in ("cell_type", "family", "label", "cohort")},
+                     "rank": rec["latent"]["selected_lv"], "p": status["p"], "rejected": status["rejected"],
+                     **{f"hits_{b}": status["hits"][b] for b in ANALYSIS_BLOCKS},
+                     "identical_to": _scan_reference(a)})
+        if a["family"] == "primary":
+            primaries.append((f"{a['cell_type']} {a['cohort']}", rec, man))
+            tables[(a["cell_type"], a["cohort"])] = _scan_table(r, a["dir"], rec)
+    # The identities the construction implies, reproduced from the records
+    for row in rows:
+        ref = row["identical_to"]
+        if ref is None:
+            continue
+        a_rec = records[(row["cell_type"], row["family"], row["label"], row["cohort"])]
+        b_rec = records[(row["cell_type"], *ref, row["cohort"])]
+        if a_rec["interaction_scan"] != b_rec["interaction_scan"]:
+            raise ValueError(f"the {row['cell_type']} {row['label']} {row['cohort']} scan differs from its reference "
+                             f"({ref[1]}); the scan reads the features and models only; nothing was written")
+    table = pd.DataFrame(rows)
+    keys = table[["cell_type", "family", "label"]].drop_duplicates().reset_index(drop=True)
+    n = len(keys)
+    fig = Figure(figsize=(12, 0.27 * n + 2.2))
+    gs = fig.add_gridspec(2, 2, width_ratios=(1, 1.2), height_ratios=(1.45, 1))
+    ax_a, ax_c, ax_b = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[:, 1])
+    marker = {b: m for b, m in zip(ANALYSIS_BLOCKS, ("o", "^"))}
+    offsets = {b: (i - (len(ANALYSIS_BLOCKS) - 1) / 2) * 0.3 for i, b in enumerate(ANALYSIS_BLOCKS)}
+
+    # (a) the primaries: the smallest adjusted p-values per block, hits filled
+    prim = table[table["family"] == "primary"].reset_index(drop=True)
+    _split_p_axis(ax_a)
+    smallest = {}
+    for y, t in prim.iterrows():
+        color = _CELL[t["cell_type"]]
+        st = tables[(t["cell_type"], t["cohort"])]
+        st = st[~st["degenerate"].astype(bool)]
+        for b in ANALYSIS_BLOCKS:
+            top = st[st["block"] == b].nsmallest(FIGURE_SCAN_TOP_N, "p_value_adjusted", keep="first")
+            smallest[(t["cell_type"], t["cohort"], b)] = float(top["p_value_adjusted"].min())
+            hit = top["p_value_adjusted"] <= ANALYSIS_ALPHA
+            jitter = np.linspace(-0.08, 0.08, len(top)) if len(top) > 1 else np.zeros(len(top))
+            ax_a.scatter(top.loc[~hit, "p_value_adjusted"], y + offsets[b] + jitter[~hit.to_numpy()], s=14,
+                         marker=marker[b], facecolor="white", edgecolor=color, linewidth=0.9, zorder=3)
+            ax_a.scatter(top.loc[hit, "p_value_adjusted"], y + offsets[b] + jitter[hit.to_numpy()], s=22,
+                         marker=marker[b], color=color, edgecolor="white", linewidth=0.8, zorder=4)
+        ax_a.annotate(f"global p {_p(t['p'])}", (1.0, y), xytext=(8, 0), textcoords="offset points", va="center",
+                      fontsize=6.6, color=_INK2, annotation_clip=False)
+    ax_a.set_ylim(len(prim) - 0.5, -0.5)
+    ax_a.set_yticks(range(len(prim)), [f"{t['cell_type']} · {t['cohort']}" for _, t in prim.iterrows()])
+    ax_a.set_title(f"(a) primaries: {FIGURE_SCAN_TOP_N} smallest adjusted p per block")
+
+    # (b) the global p-value of every registered analysis
+    _split_p_axis(ax_b)
+    for y, key in keys.iterrows():
+        sub = table[(table[["cell_type", "family", "label"]] == key.values).all(axis=1)].set_index("cohort")
+        color = _CELL[key["cell_type"]]
+        for i, cohort in enumerate(EXPORT_COHORTS):
+            t = sub.loc[cohort]
+            yy = y + (i - (len(EXPORT_COHORTS) - 1) / 2) * 0.3
+            if t["identical_to"] is not None:
+                ax_b.scatter(t["p"], yy, s=40, marker="|", color=_MUTED, linewidth=1.4, zorder=3)
+                continue
+            face = color if cohort == EXPORT_COHORTS[0] else "white"
+            ax_b.scatter(t["p"], yy, s=26, marker="o", facecolor=face, edgecolor=color, linewidth=1.3, zorder=3)
+    labels = []
+    for _, key in keys.iterrows():
+        sub = table[(table[["cell_type", "family", "label"]] == key.values).all(axis=1)]
+        ref = sub["identical_to"].iloc[0]
+        suffix = "" if ref is None else f"  (= {ref[1]})"
+        labels.append(f"{key['cell_type']} · {key['label']}{suffix}")
+    ax_b.set_yticks(range(n), labels)
+    ax_b.set_ylim(n - 0.5, -0.5)
+    previous = None
+    for y, key in keys.iterrows():
+        group = (key["cell_type"], key["family"])
+        if previous is not None and group != previous:
+            ax_b.axhline(y - 0.5, color=_AXIS, linewidth=0.6)
+        previous = group
+    ax_b.set_title("(b) global scan p per analysis (grey ticks: equal to their reference by construction)")
+
+    # (c) the null-maximum share per block beside the block's share of features, no threshold
+    shares = {}
+    for y, (label, rec, _) in enumerate(primaries):
+        color = _CELL[rec_cell(label)]
+        scan = rec["interaction_scan"]
+        for b in ANALYSIS_BLOCKS:
+            share = scan["blocks"][b]["null_max_share"]
+            feat = scan["blocks"][b]["n_features"] / scan["n_features"]
+            shares[(label, b)] = (share, feat)
+            ax_c.scatter(share, y + offsets[b], s=30, marker=marker[b], color=color, edgecolor="white", linewidth=0.8,
+                         zorder=3)
+            ax_c.scatter(feat, y + offsets[b], s=40, marker="|", color=_INK2, linewidth=1.2, zorder=2)
+    ax_c.set_xlim(0, 1)
+    ax_c.set_ylim(len(primaries) - 0.5, -0.5)
+    ax_c.set_yticks(range(len(primaries)), [label.replace(" ", " · ", 1) for label, _, _ in primaries])
+    ax_c.set_xlabel("share of the permutation draws' maximum F (marker) and of the features (tick), per block")
+    ax_c.set_title("(c) null-maximum share per block (not read)")
+
+    legend = [
+        *[Line2D([], [], marker=marker[b], linestyle="", color=_INK2, markersize=6, label=f"{b} (a, c)")
+          for b in ANALYSIS_BLOCKS],
+        Line2D([], [], marker="o", linestyle="", markerfacecolor="white", markeredgecolor=_INK2, markersize=6,
+               label="not a hit (a)"),
+        Line2D([], [], marker="o", linestyle="", color=_INK2, markersize=6, label=f"{EXPORT_COHORTS[0]} (b)"),
+        *[Line2D([], [], marker="o", linestyle="", markerfacecolor="white", markeredgecolor=_INK2, markersize=6,
+                 label=f"{c} (b)") for c in EXPORT_COHORTS[1:]],
+        *[Line2D([], [], marker="o", linestyle="", color=_CELL[ct], markersize=6, label=ct) for ct in CELL_TYPES],
+    ]
+    distinct = table[table["identical_to"].isna()]
+    rejected = distinct[distinct["rejected"].astype(bool)]
+    _suptitle(fig, f"Per-feature interaction scan: global p ≤ {ANALYSIS_ALPHA} in {len(rejected)} of {len(distinct)} "
+                   f"distinct analyses ({len(table)} drawn); only each cell type's {FIGURE_COHORT} primary is "
+                   "confirmatory")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.965))
+    fig.legend(handles=legend, loc="lower center", ncol=len(legend), bbox_to_anchor=(0.5, 0.012))
+    power = INTERACTION_SCAN_POWER_STATEMENT
+    _footnote(fig, "The global p-value is confirmatory (p ≤ α, unadjusted; each primary carries five tests read at α); "
+                   "hits are features with step-down max-T adjusted p ≤ α (familywise over the scanned features), "
+                   "detections, not drivers; F values, per-stage differences and null-maximum shares are reported and "
+                   "not read; every analysis other than the primaries is sensitivity, a differing status being "
+                   "preprocessing, covariate-set or cohort dependence. A non-rejection of the "
+                   f"{power['cell_type']} {power['cohort']} primary carries MOTCO's measured power for a 20-feature "
+                   f"ramp in one sex ({power['power']['3.0']:.3f} at 3 SDs, {power['power']['2.0']:.3f} at 2); every "
+                   "other non-rejection is uninformative. Primaries: " + _context(primaries), y=0.0)
+
+    # The scan concordance cells beside the stage DE, read for the caption (each made from the primary drawn)
+    concordance = {}
+    for cell_type in CELL_TYPES:
+        d = cell_type_dirs(cell_type)
+        for cohort in EXPORT_COHORTS:
+            primary_dir = d["motco_analysis"] / cohort
+            de_man_path = d["stage_de"] / cohort / STAGE_DE_MANIFEST
+            de_man = r.manifest(de_man_path, cell_type)
+            _check_made_from(de_man, de_man_path, primary_dir / _RESULT)
+            li_man_path = d["stage_de_limma"] / cohort / STAGE_DE_LIMMA_MANIFEST
+            li_man = r.manifest(li_man_path, cell_type)
+            _check_made_from(li_man, li_man_path, primary_dir / _RESULT)
+            for omic, cell in li_man["concordance"].items():
+                scan = cell.get("scan")
+                if scan is None:
+                    raise ValueError(f"{li_man_path} carries no scan concordance cell for {omic}; run "
+                                     "`sead-sexdiff stage-de-limma`")
+                d_scan = de_man["concordance"][omic].get("scan")
+                if d_scan is None or d_scan["cell"] != scan["deseq2_cell"]:
+                    raise ValueError(f"{de_man_path} and {li_man_path} disagree on the {omic} DESeq2 scan cell")
+                concordance[f"{cell_type} {cohort} {omic}"] = {
+                    "hits": len(scan["hits"]), "deseq2": scan["deseq2_cell"], "limma": scan["limma_cell"],
+                    "deseq2_n": cell["deseq2"]["n_interaction_exported"], "limma_n": cell["limma"]["n_interaction_exported"],
+                }
+    values = {
+        "n_analyses": len(table),
+        "n_distinct": len(distinct),
+        "primaries": {
+            label: {
+                "p": float(rec["interaction_scan"][INTERACTION_SCAN_STATISTIC]),
+                "rejected": bool(rec["interaction_scan"][INTERACTION_SCAN_STATISTIC] <= ANALYSIS_ALPHA),
+                "max_f": float(rec["interaction_scan"]["max_f"]),
+                "max_feature": rec["interaction_scan"]["max_feature"],
+                "max_block": rec["interaction_scan"]["max_block"],
+                "n_features": int(rec["interaction_scan"]["n_features"]),
+                "df": (int(rec["interaction_scan"]["df_interaction"]), int(rec["interaction_scan"]["df_residual"])),
+                "hits": {b: int(rec["interaction_scan"]["blocks"][b]["hits"]) for b in ANALYSIS_BLOCKS},
+                "hit_names": [f"{h['block']}:{h['feature']}" for h in rec["interaction_scan"].get("hits", [])],
+                "shares": {b: float(shares[(label, b)][0]) for b in ANALYSIS_BLOCKS},
+            }
+            for label, rec, _ in primaries
+        },
+        "rejected": [f"{t['cell_type']} {t['label']} {t['cohort']} p {_p(t['p'])}" for _, t in rejected.iterrows()],
+        "concordance": concordance,
+    }
+    return fig, values
+
+
+def rec_cell(label: str) -> str:
+    """The cell type of a ``"<cell type> <cohort>"`` label."""
+    return label.split(" ", 1)[0]
+
+
+def _caption_interaction_scan(v: dict) -> str:
+    parts = [f"{v['n_analyses']} analyses carry the scan, {v['n_distinct']} of them distinct (the forced ranks and the "
+             "latent-adjusted arms equal their reference by construction)."]
+    for name, e in v["primaries"].items():
+        hits = ", ".join(f"{b} {e['hits'][b]}" for b in ANALYSIS_BLOCKS)
+        shares = ", ".join(f"{b} {e['shares'][b]:.4f}" for b in ANALYSIS_BLOCKS)
+        names = f" ({'; '.join(e['hit_names'])})" if e["hit_names"] else ""
+        parts.append(
+            f"{name} ({e['n_features']:,} features, df {e['df'][0]}, {e['df'][1]}): global p {e['p']:.3f}, "
+            f"{'rejected' if e['rejected'] else 'not rejected'}; maximum F {e['max_f']:.4g} ({e['max_feature']}, "
+            f"{e['max_block']}); hits {hits}{names}; null-maximum shares {shares}."
+        )
+    cells = "; ".join(
+        f"{k}: {c['hits']} hit(s), DESeq2 {c['deseq2_n']} ({c['deseq2']}), limma {c['limma_n']} ({c['limma']})"
+        for k, c in v["concordance"].items()
+    )
+    parts.append(f"Global p <= {ANALYSIS_ALPHA}: {'; '.join(v['rejected']) or 'none'}. Scan concordance cells "
+                 f"(scan hits against the exported interaction counts): {cells}.")
     return " ".join(parts)
 
 
@@ -2055,6 +2325,23 @@ FIGURES: dict[str, dict] = {
             "is descriptive, grows with the fitted rank, and is read against no null here."
         ),
         "reading": ("display_only", "span_split", "sensitivity_dependence", "forced_rank"),
+    },
+    "interaction_scan": {
+        "number": 12,
+        "title": "Per-feature interaction scan",
+        "draw": _draw_interaction_scan,
+        "caption": _caption_interaction_scan,
+        "construction": (
+            "MOTCO's per-feature interaction scan from each record's interaction_scan block and each primary's "
+            "interaction_scan.csv: (a) per primary analysis (both cell types and cohorts) the "
+            f"{FIGURE_SCAN_TOP_N} smallest step-down max-T adjusted p-values per block on a log axis with alpha, "
+            "hits filled, the global p-value beside; (b) the global p-value of every registered analysis, enumerated "
+            "as in figure 5 (filled: cohort_30, hollow: cohort_50), the forced ranks and the latent-adjusted arms "
+            "drawn as grey ticks because their scan equals their reference's by construction; (c) per primary, each "
+            "block's share of the permutation draws' maximum F beside its share of the features, with no threshold: "
+            "the shares are descriptive."
+        ),
+        "reading": ("display_only", "interaction_scan", "sensitivity_dependence"),
     },
 }
 for _name, _entry in FIGURES.items():
