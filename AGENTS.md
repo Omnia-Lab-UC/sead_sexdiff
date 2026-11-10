@@ -59,22 +59,26 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    MOTCO change.
 6. `analyze` – from `results/motco_input/` only, per cohort: the
    covariate-adjusted sex × stage trajectory comparison through MOTCO's
-   `analyze_trajectories` (≥ 0.18.0) with CV rank selection at the rank
+   `analyze_trajectories` (≥ 0.20.0) with CV rank selection at the rank
    floor `ANALYSIS_RANK_FLOOR` (2), the RRPP null drawn under the residual
-   correction `ANALYSIS_RESIDUAL_CORRECTION` (`df`) and the split interaction
-   test `ANALYSIS_SPAN_SPLIT_TEST`, writing `results/motco_analysis/<cohort>/`
+   correction `ANALYSIS_RESIDUAL_CORRECTION` (`df`), the split interaction
+   test `ANALYSIS_SPAN_SPLIT_TEST` and the per-feature interaction scan
+   `ANALYSIS_INTERACTION_SCAN`, writing `results/motco_analysis/<cohort>/`
    (MOTCO's `result.json`, `latent_scores.csv`, `pls_loadings.csv`,
-   `stage_means.csv`, plus `analysis_metadata.csv`, `analysis_manifest.json`,
-   `summary.md`). Never assemble it from `motco plsr` + `motco de`.
+   `stage_means.csv`, `interaction_scan.csv`, plus `analysis_metadata.csv`,
+   `analysis_manifest.json`, `summary.md`). Never assemble it from
+   `motco plsr` + `motco de`.
 7. `rank-sensitivity` – from `results/motco_input/` and
    `results/motco_analysis/` only, per cohort: MOTCO's dimensionality
    sensitivity analysis, the same `analyze_trajectories` call with the latent
    rank forced to each value of `ANALYSIS_FORCED_RANKS`, everything else
-   (inputs, covariates, orientation, correction, split test, permutations,
-   seed) equal to `analyze`.
+   (inputs, covariates, orientation, correction, split test, interaction
+   scan, permutations, seed) equal to `analyze`.
    The CV-selected analysis is read and checked (export hashes, MOTCO
    version, seed, permutations, rank floor), never rerun or modified, and is
-   the reference row. Writes `results/motco_rank_sensitivity/<cohort>/`
+   the reference row. Every forced rank's interaction scan (block and
+   `interaction_scan.csv`) must equal the reference's (the scan does not
+   read the latent space), or the sweep stops before publishing. Writes `results/motco_rank_sensitivity/<cohort>/`
    (`rank_<kk>/` analysis directories, `rank_sensitivity.csv`,
    `rank_sensitivity.md`, `rank_sensitivity_manifest.json`).
 8. `preprocessing-sensitivity` – from `results/pseudobulk/` (incl.
@@ -142,7 +146,10 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    `_check_technical_reference`. The predeclared mediator check
    (`mediator_check`: Spearman of each added fraction with stage, all donors
    and per sex, flagged at `DIAGNOSTIC_CORRELATION_THRESHOLD`, no p-value,
-   never a gate) is written before the arms. Writes
+   never a gate) is written before the arms. Both arms carry the
+   interaction scan, and `latent_adjusted`'s (block and
+   `interaction_scan.csv`) must equal `extended_covariates`'s, or the step
+   stops before the comparison is written. Writes
    `<root>/motco_latent_sensitivity/` (`<arm>/motco_analysis/<cohort>/`,
    mirroring the primary layout with the five export files as
    `inputs.files` so `axis-diagnostics --analysis-dir` can read an arm, and
@@ -165,7 +172,11 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    since the export records no count-file hash; the analysis by
    `_check_reference`. The predeclared
    `STAGE_DE_CONCORDANCE_RULE` compares the exported interaction count of
-   `factor_interaction` with the primary `delta` rejection status. Writes
+   `factor_interaction` with the primary `delta` rejection status, and
+   `STAGE_DE_SCAN_CONCORDANCE_RULE` on the same row compares it with the
+   analysis's interaction-scan hits in the omic (`scan_detected`, with the
+   hits also significant counted; a hit outside the exported tables stops
+   the step; a discordance a finding, never a result). Writes
    `results/stage_de/<cohort>/` (`<omic>/<model>__<coefficient>.csv`,
    `<omic>/<model>__fit.json` (the resume record), `stage_de_summary.csv`,
    `stage_de.md`, `stage_de_manifest.json`). It reads sex and stage, so its
@@ -186,8 +197,10 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
    DESeq2 outputs are checked (complete, made from the inputs now on disk,
    tables hashing as recorded, summary equal to a recomputation) and never
    written. The predeclared `STAGE_DE_LIMMA_CONCORDANCE_RULE`
-   (`interaction_joint`) sits beside the DESeq2 cell with `methods_agree`.
-   Writes `results/stage_de_limma/<cohort>/` (`<omic>/<model>__<label>.csv`,
+   (`interaction_joint`) sits beside the DESeq2 cell with `methods_agree`,
+   and `STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE` beside the DESeq2 scan cell
+   (a scan cell that differs between the methods a method-dependence
+   finding). Writes `results/stage_de_limma/<cohort>/` (`<omic>/<model>__<label>.csv`,
    `<omic>/<model>__fit.json` (the resume record), `stage_de_limma_summary.csv`,
    `method_comparison.csv`, `stage_de_limma.md`, `stage_de_limma_manifest.json`).
    It reads sex and stage, so its outputs feed no export, analysis or
@@ -279,7 +292,7 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
 16. `figures` – from the generated outputs of both cell types only (every
    cell type's `cell_type_dirs` plus `results/motco_sensitivity/`; never raw
    objects or `results/superseded/`), in `src/sead_sexdiff/figures.py`: the
-   registry `FIGURES` (eleven figures, `01_cohorts` … `11_span_split`), every
+   registry `FIGURES` (twelve figures, `01_cohorts` … `12_interaction_scan`), every
    family of analyses enumerated from the registries (`ANALYSIS_FORCED_RANKS`,
    `PREPROCESSING_VARIANTS`, `LATENT_SENSITIVITY_ARMS`,
    `DONOR_EXCLUSION_VARIANTS`, `POSITIVE_CONTROL_BASES`, `EXPORT_COHORTS`),
@@ -295,7 +308,9 @@ MTG astrocyte case study (RNA + ATAC, input to MOTCO):
      `ANALYSIS_RANK_FLOOR`, the forced rank under `rank-sensitivity` only,
      `ANALYSIS_PERMUTATIONS`, `ANALYSIS_SEED`, the split test
      `ANALYSIS_SPAN_SPLIT_TEST` with its `span_split` block, except the arms
-     of `LATENT_SENSITIVITY_SPLIT_UNAVAILABLE`, which carry neither).
+     of `LATENT_SENSITIVITY_SPLIT_UNAVAILABLE`, which carry neither, and the
+     interaction scan `ANALYSIS_INTERACTION_SCAN` with its `interaction_scan`
+     block in every analysis).
 
    Per figure:
    - the reproductions (adjusted cell means against `stage_means.csv`,
@@ -358,7 +373,7 @@ when behavior or defaults change.
   sensitivity analysis. Plotting is the one exception (`figures.py`).
 - `src/sead_sexdiff/figures.py` – the `figures` command (step 16): the
   registry `FIGURES`, the display constants, the recording reader, the
-  consistency pre-pass, the eleven figure functions with their caption
+  consistency pre-pass, the twelve figure functions with their caption
   builders, the manifest, the staleness check and the report freeze. It
   imports constants and helpers from `data.py` (`_git_revision`,
   `_sha256_file`, `check_manifest_cell_type`, `cell_type_dirs`, `spearman`,
@@ -392,7 +407,10 @@ when behavior or defaults change.
   deleted) by the change that re-issued them, with their path relative to
   `results/` kept and `MOVED.json` (old / new path, host, time, sha256 per
   file); never an input of any step or a default directory, not cited as
-  results. Now `mtg-span-split-test/` (the MOTCO 0.13.0 `df` outputs
+  results. Now `mtg-interaction-scan/` (the MOTCO 0.18.0 `df` outputs
+  with the split test and without the per-feature interaction scan, both
+  cell types: the same 15 directories as below),
+  `mtg-span-split-test/` (the MOTCO 0.13.0 `df` outputs
   without the split interaction test, both cell types: astrocyte
   `motco_analysis`, `motco_rank_sensitivity`, `motco_diagnostics`,
   `motco_sensitivity`, `motco_latent_sensitivity`, `stage_de`,
@@ -416,7 +434,7 @@ when behavior or defaults change.
   never retyped, and checked against `result.json` before committing. Every
   report committed from `mtg-case-study-figures` on carries the figure set
   frozen by `figures --report <its stem>` after its last output run
-  (`reports/figures/<stem>/`: the eleven SVGs, `figures.md`,
+  (`reports/figures/<stem>/`: the twelve SVGs, `figures.md`,
   `figures_manifest.json`; committed, never regenerated or edited). It embeds
   `figures/<stem>/<nn>_<name>.svg` and pastes each caption verbatim from the
   frozen `figures.md`. Before the commit, its check script verifies:
@@ -444,7 +462,7 @@ when behavior or defaults change.
   byte-identical files. Move it only with `uv add "matplotlib==X.Y.Z"`
   (no other locked package may move). A move changes every figure's bytes
   and fingerprint, and `figures --check` then lists every figure as stale.
-- `motco` is pinned to an exact PyPI version (`motco==0.18.0` in
+- `motco` is pinned to an exact PyPI version (`motco==0.20.0` in
   `pyproject.toml`; `uv.lock` holds the wheel's and sdist's sha256). Move it
   only with `uv add "motco==X.Y.Z"`, and before any run under the new pin
   check that the wheel's `motco/` tree is byte-identical to `src/motco/` at
@@ -625,7 +643,7 @@ when behavior or defaults change.
   `ANALYSIS_MISSING_COVARIATES` (`error`, never impute),
   `ANALYSIS_PERMUTATIONS` (999), `ANALYSIS_SEED` (20261019),
   `ANALYSIS_ALPHA` (0.05) with `ANALYSIS_REJECTION_RULE` (p ≤ α),
-  `ANALYSIS_MOTCO_MIN_VERSION` (0.18.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
+  `ANALYSIS_MOTCO_MIN_VERSION` (0.20.0), `ANALYSIS_RANK_FLOOR` (2, MOTCO's
   validated `min_components` default: passed explicitly in every
   `TrajectoryAnalysisParams` the package builds, checked against MOTCO's
   default before any input is read (`check_motco_rank_floor`; a mismatch
@@ -670,7 +688,32 @@ when behavior or defaults change.
   `cli_equivalent`, printed in `summary.md` (the "Split interaction test"
   table; records without a block render as before), and checked by
   `_check_reference` (`params.span_split_test` and the block), so no step
-  compares against a reference without it). MOTCO's other defaults (net-displacement
+  compares against a reference without it), `ANALYSIS_INTERACTION_SCAN`
+  (`True`: MOTCO's per-feature interaction scan, its verdict
+  `scan_validated` (`interaction-scan-2026-11-09.md`), not its default,
+  never a flag: each analysed feature's group × stage interaction F with
+  the covariate-adjusted models, the global permutation p-value of the
+  maximum F and Westfall–Young step-down max-T adjusted p-values, under
+  RRPP's draws at the analysis's seed and correction; it reads neither the
+  latent space nor the bootstrap, so it only adds the record's
+  `interaction_scan` block and `interaction_scan.csv` and runs in every
+  analysis, the latent-adjusted arms included; MOTCO's
+  `INTERACTION_SCAN_ALPHA` checked against `ANALYSIS_ALPHA` before any input
+  is read (`check_motco_scan_alpha`); checked in the record and the table
+  after each run before anything is written (`_interaction_scan_problem`:
+  the features per block, `df_interaction` = stages − 1, `df_residual` =
+  donors − 6 − covariates, a global p-value, the hit level, the analysis's
+  permutations, seed and correction, `draws_match_rrpp` at `n_jobs = 1`;
+  one table row per analysed feature in order, the table's hits equal to
+  the record's, the smallest adjusted p equal to the global p, a rejection
+  exactly when there is a hit; or the run stops naming the cohort and the
+  entry), recorded as the manifest's `measurement.interaction_scan` and
+  `--interaction-scan` in `cli_equivalent`, printed in `summary.md` (the
+  "Interaction scan" table and the hit rows; records without a block render
+  as before), checked by `_check_reference`, and checked equal across the
+  forced ranks and between the latent arms (`_scan_identity_problem`; a
+  difference stops the step before publishing, a question for MOTCO).
+  MOTCO's other defaults (net-displacement
   orientation, double-CV rank at the floor) are not overridden, and there is
   no unadjusted run. The floored, `df`-corrected analysis is the primary of
   both cell types since `mtg-residual-correction-primary`; the earlier
@@ -679,7 +722,9 @@ when behavior or defaults change.
   records, not a sensitivity arm. The rank-1 and uncorrected code paths stay
   for analyses made by hand (`_analyze_cohort` with `min_components=1` or
   `residual_correction=None`), and so does the path without the split test
-  (`span_split_test=False`, the pin-move gate of `mtg-span-split-test`).
+  (`span_split_test=False`, the pin-move gate of `mtg-span-split-test`) and
+  without the scan (`interaction_scan=False`, the pin-move gate of
+  `mtg-interaction-scan`).
   `--n-jobs` changes MOTCO's RRPP draws (one seed stream per
   worker), so report results from `n_jobs = 1`.
 - Split-test policy constants (flag and ask before changing any of them;
@@ -696,9 +741,10 @@ when behavior or defaults change.
   `SPAN_SPLIT_COLUMNS` (the split columns of every comparison table, after
   the `shape` columns: F and p per part, `span_rejected`, `span_concordant`,
   `complement_rejected`, `span_share`; empty for a row without the test; no
-  `total` status). No adjustment across `delta`, `angle`, `shape` and the
-  complement, or across cohorts and cell types: each primary carries four
-  tests read at α, stated in the report. Reading rules for the report: each
+  `total` status). No adjustment across `delta`, `angle`, `shape`, the
+  complement and the interaction scan, or across cohorts and cell types:
+  each primary carries five tests read at α (four before
+  `mtg-interaction-scan`), stated in the report. Reading rules for the report: each
   cell type's `cohort_30` primary gives its split-test result; `cohort_50`
   and every other analysis are sensitivity, a complement status that differs
   from the primary's being rank, preprocessing, covariate-set or cohort
@@ -724,6 +770,55 @@ when behavior or defaults change.
   arm. Nothing else is re-read: the stage-DE concordance rules (which read
   `delta`), the positive control (no p-value), the adoption, mediator, flag
   and axis checks and the `latent_adjusted` reading are unchanged.
+- Interaction-scan policy constants (flag and ask before changing any of
+  them; predeclared in the proposal of `mtg-interaction-scan`, committed
+  (`67e7cdc`) before any real-label scan ran, never changed from results):
+  `INTERACTION_SCAN_STATISTIC` (`p_value_global`: the scan's one
+  confirmatory reading, at `ANALYSIS_ALPHA` under `ANALYSIS_REJECTION_RULE`,
+  unadjusted; a fifth test per primary), `INTERACTION_SCAN_HIT_STATISTIC`
+  (`p_value_adjusted`: a hit is a feature with step-down max-T adjusted
+  p ≤ α, familywise over the scanned features), `INTERACTION_SCAN_NOT_READ`
+  (`f`, `ss_interaction`, `max_f`, `difference`, `null_max_share`: reported,
+  not read; no per-stage difference tested), `INTERACTION_SCAN_TABLE`,
+  `INTERACTION_SCAN_TABLE_COLUMNS`, `INTERACTION_SCAN_COLUMNS` (the scan
+  columns of every comparison table, after the split columns: `scan_max_f`,
+  `scan_max_block`, `scan_p`, `scan_rejected`, `scan_hits_<block>`; empty
+  for a row without the scan) and `INTERACTION_SCAN_POWER_STATEMENT` (the
+  astrocyte `cohort_30` primary only: MOTCO's plasmode on that export, a
+  20-feature ramp in `Male` (10 per block, stage weights 0 / 0.5 / 1,
+  random signs) detected in 1.000 of replicates at 3 within-stage SDs and
+  0.692 at 2; bound to the five export sha256s MOTCO's plasmode settings
+  record at `v0.20.0`). No adjustment across the five tests, cohorts or cell
+  types. Reading rules for the report: each cell type's `cohort_30` primary
+  gives its scan result; `cohort_50`, the preprocessing variants, the
+  `extended_covariates` arm and the exclusion variants are sensitivity, a
+  differing status being preprocessing, covariate-set or cohort dependence
+  (not a result of that analysis); the forced ranks and `latent_adjusted`
+  equal their reference by construction (checked), so no dependence is read
+  from them; a hit names a feature whose covariate-adjusted sex difference
+  changes across stages, at familywise level α: a detection, not a driver
+  (correlated neighbours can be hits too), with no geometry, trajectory or
+  attribution, changing no reading of `delta`, `angle`, `shape` or the
+  complement, ATAC hits named by peak coordinates only; a non-rejection of
+  the astrocyte `cohort_30` primary reads "no sparse ramp of the plasmode's
+  form detected" with the power above, excluding neither smaller effects,
+  nor effects spread thinly over many features, nor other shapes, and only
+  while the export hashes as the plasmode's (otherwise uninformative, with
+  a finding); every other non-rejection is uninformative. The scan
+  concordance cells beside the stage DE (`STAGE_DE_SCAN_CONCORDANCE_RULE`,
+  `STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE`) are findings when discordant,
+  never results, and agreement is not replication. Carried limitations:
+  size measured on real noise only for the astrocyte `cohort_30` export at
+  six covariates (global 0.042; familywise 0.042 under the plasmode's
+  partial null), inferred for every other analysis; the null maxima lean on
+  ATAC on that export (0.618 of them with half the features), so the
+  familywise threshold leans on ATAC; the plain, unmoderated per-feature F
+  at n = 80; the stylized plant behind the power statement; the scan's
+  weakness for differences spread thinly over many features (magnitude 0.01
+  against `delta`'s 0.21 on the simulated SEA-AD table). Nothing else is
+  re-read: the stage-DE `delta` cells, the positive control, the adoption,
+  mediator, flag and axis checks and the `latent_adjusted` reading are
+  unchanged; the split-test policy changes only from four to five tests.
 - Rank-sensitivity constants (flag and ask before changing any of them):
   `ANALYSIS_FORCED_RANKS` (2, 3, 4, 6, 9, 12: 2 = `n_stages − 1`, 3 the next
   rank, 4/6/9/12 the steps of MOTCO's latent-rank ladder with 4 = 2(K − 1)
@@ -947,7 +1042,14 @@ when behavior or defaults change.
   no LFC shrinkage, no permutation null), `STAGE_DE_CONCORDANCE_RULE`
   (exported `factor_interaction` union count > 0 against the primary `delta`
   rejection status; reads a count and a status, never a p-value magnitude;
-  a discordance is a finding), the reproduction tolerances
+  a discordance is a finding), `STAGE_DE_SCAN_CONCORDANCE_RULE` (on the same
+  row: the analysis's interaction-scan hits in the omic > 0 against the
+  same count, with `scan_hits_significant` beside it and every hit required
+  to be an exported feature of the tables; the columns
+  `STAGE_DE_SCAN_COLUMNS` appended to the summary; predeclared in
+  `mtg-interaction-scan`; a discordance a finding, never a result, the
+  expected direction at equal power being "stage DE detects, scan not"),
+  the reproduction tolerances
   `STAGE_DE_TMM_RTOL` (1e-10) and `STAGE_DE_VALUES_RTOL` (1e-9), the output
   names (`STAGE_DE_*`), and the rule that the primary analysis stays
   primary. `--n-cpus` does not change the tables, but warnings raised in pydeseq2's worker processes are not
@@ -984,7 +1086,12 @@ when behavior or defaults change.
   `interaction_joint` count > 0 against the primary `delta` rejection
   status, tied at import to `STAGE_DE_CONCORDANCE_RULE`'s model and set;
   reported beside the DESeq2 cell with `methods_agree`),
-  `STAGE_DE_LIMMA_TMM_ATOL` (1e-8 absolute, the `check_tmm_edger.R`
+  `STAGE_DE_LIMMA_SCAN_CONCORDANCE_RULE` (the analysis's scan hits in the
+  omic against the exported `interaction_joint` count, beside the DESeq2
+  scan cell, tied at import to `STAGE_DE_LIMMA_CONCORDANCE_RULE`'s row; the
+  scan cells of both methods on `method_comparison.csv`'s `interaction_joint`
+  row; a scan cell that differs between the methods a method-dependence
+  finding), `STAGE_DE_LIMMA_TMM_ATOL` (1e-8 absolute, the `check_tmm_edger.R`
   tolerance), the output names (`STAGE_DE_LIMMA_*`), the R bridge (one
   packaged script through `Rscript`, one BLAS thread; its sha256 and the R /
   limma / edgeR / jsonlite versions in every fingerprint) and the rule that
@@ -1073,7 +1180,17 @@ when behavior or defaults change.
       every registered analysis carrying the test (the `latent_adjusted`
       arms listed as not available), the in-span share against the fitted
       rank with no reference line; not added to figure 05, whose
-      construction stays frozen.
+      construction stays frozen (its footnote and reading rule say five
+      tests since `mtg-interaction-scan`);
+    - figure 12 (`12_interaction_scan`, from `mtg-interaction-scan`): per
+      primary the `FIGURE_SCAN_TOP_N` (50) smallest adjusted p-values per
+      block (hits filled), the global p of every registered analysis (the
+      forced ranks and the `latent_adjusted` arms as grey ticks, equal to
+      their reference by construction, the equality reproduced from the
+      records), and per primary the null-maximum share per block beside its
+      feature share with no threshold; each primary's `interaction_scan.csv`
+      bound to its record; the caption gives the scan concordance cells
+      from both stage-DE manifests, each checked to record the primary drawn.
   - Rendering: `FIGURE_PALETTE` (sex and cell-type pairs validated; the
     aqua is below 3:1 on white, so every cell-type mark has a legend entry
     or a direct label), `FIGURE_DPI` (200), `FIGURE_FORMATS`,
@@ -1086,7 +1203,8 @@ when behavior or defaults change.
     dependence, the forced-rank limitations, `latent_adjusted` not read,
     measurement-space findings, the diagnostic rule, the stage-DE count
     rules, the positive control's bases, the split test's policy and
-    reading, `span_split`). A rule changed here by a later
+    reading, `span_split`, the interaction scan's policy, power statement
+    and reading, `interaction_scan`). A rule changed here by a later
     change changes its text there in the same change.
   - The output names (`FIGURE_*`).
 
